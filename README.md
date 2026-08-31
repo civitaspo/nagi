@@ -8,6 +8,12 @@ Nagi is designed for a single operator on a local macOS host. It polls Linear, s
 
 The repository is in its initial setup phase. The implementation will be added through focused pull requests.
 
+## Project documentation
+
+- [Phase 0 contract spike](docs/phase-zero.md)
+- [ADR-0001: Private Linear OAuth app with PKCE](docs/adr/0001-linear-oauth-pkce.md)
+- [Securefix](docs/securefix.md)
+
 ## License
 
 Nagi is licensed under the Apache License 2.0. See [LICENSE](LICENSE).
