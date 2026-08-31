@@ -14,6 +14,7 @@ use zeroize::{Zeroize, Zeroizing};
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
+#[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -255,15 +256,15 @@ impl BrowserLauncher for MacOsBrowserLauncher {
     }
 }
 
-/// Minimal process boundary used to keep browser timeout behavior testable.
-/// The production implementation below is provided by `std::process::Child`;
-/// tests use a deterministic in-memory child without spawning a process.
+// Process seam is compiled for macOS production and unit tests.
+#[cfg(any(target_os = "macos", test))]
 trait ChildProcess {
     fn try_wait(&mut self) -> io::Result<Option<bool>>;
     fn kill(&mut self) -> io::Result<()>;
     fn wait(&mut self) -> io::Result<bool>;
 }
 
+#[cfg(target_os = "macos")]
 impl ChildProcess for std::process::Child {
     fn try_wait(&mut self) -> io::Result<Option<bool>> {
         std::process::Child::try_wait(self).map(|status| status.map(|status| status.success()))
@@ -278,6 +279,7 @@ impl ChildProcess for std::process::Child {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn wait_for_browser_child(
     child: &mut dyn ChildProcess,
     deadline: Instant,
@@ -291,8 +293,7 @@ fn wait_for_browser_child(
         }
         match child.try_wait() {
             Ok(Some(success)) => {
-                // A process that only becomes observable at or after the
-                // deadline did not satisfy the bounded browser launch.
+                // A process observable at or after the deadline is too late.
                 if clock.now() >= deadline {
                     return Err(BrowserError::LaunchFailed);
                 }
@@ -314,6 +315,7 @@ fn wait_for_browser_child(
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn terminate_and_reap(child: &mut dyn ChildProcess) {
     let _ = child.kill();
     let _ = child.wait();
@@ -741,38 +743,9 @@ struct TokenExchangeRequest {
 }
 
 impl TokenExchangeRequest {
-    /// Returns the fixed OAuth grant type.
-    fn grant_type(&self) -> &'static str {
-        "authorization_code"
-    }
-
-    /// Returns the configured client identifier.
-    #[cfg(test)]
-    fn client_id(&self) -> &str {
-        &self.client_id
-    }
-
-    /// Returns the fixed loopback redirect URI.
-    #[cfg(test)]
-    fn redirect_uri(&self) -> &str {
-        &self.redirect_uri
-    }
-
-    /// Indicates that a non-empty authorization code is present.
-    #[cfg(test)]
-    fn has_code(&self) -> bool {
-        !self.code.as_str().is_empty()
-    }
-
-    /// Indicates that a non-empty PKCE verifier is present.
-    #[cfg(test)]
-    fn has_code_verifier(&self) -> bool {
-        !self.verifier.as_str().is_empty()
-    }
-
     fn form_body(&self) -> Zeroizing<Vec<u8>> {
         let mut form = Serializer::new(String::new());
-        form.append_pair("grant_type", self.grant_type());
+        form.append_pair("grant_type", "authorization_code");
         form.append_pair("client_id", &self.client_id);
         form.append_pair("redirect_uri", &self.redirect_uri);
         form.append_pair("code", self.code.as_str());
@@ -785,7 +758,7 @@ impl fmt::Debug for TokenExchangeRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("TokenExchangeRequest")
-            .field("grant_type", &self.grant_type())
+            .field("grant_type", &"authorization_code")
             .field("client_id", &"[redacted]")
             .field("redirect_uri", &self.redirect_uri)
             .field("code", &"[redacted]")
@@ -820,19 +793,14 @@ impl TokenBundle {
     pub fn expires_in(&self) -> Duration {
         self.expires_in
     }
-
-    /// Indicates whether the bundle contains both required token values.
-    pub fn has_access_and_refresh_tokens(&self) -> bool {
-        !self.access_token.as_str().is_empty() && !self.refresh_token.as_str().is_empty()
-    }
 }
 
 impl fmt::Debug for TokenBundle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("TokenBundle")
-            .field("access_token", &"[redacted]")
-            .field("refresh_token", &"[redacted]")
+            .field("access_token", &self.access_token)
+            .field("refresh_token", &self.refresh_token)
             .field("expires_in", &self.expires_in)
             .field("scope", &REQUESTED_SCOPE)
             .field("requested_actor", &REQUESTED_ACTOR)
@@ -1009,8 +977,7 @@ fn validate_token_response(response: TokenTransportResponse) -> Result<TokenBund
         .refresh_token
         .take()
         .ok_or(OAuthError::InvalidTokenResponse)?;
-    let token_type = raw
-        .token_type
+    raw.token_type
         .as_ref()
         .map(Secret::as_str)
         .filter(|value| value.eq_ignore_ascii_case("Bearer"))
@@ -1019,8 +986,7 @@ fn validate_token_response(response: TokenTransportResponse) -> Result<TokenBund
         .expires_in
         .filter(|value| *value > 0)
         .ok_or(OAuthError::InvalidTokenResponse)?;
-    let scope = raw
-        .scope
+    raw.scope
         .as_ref()
         .map(Secret::as_str)
         .filter(|value| *value == REQUESTED_SCOPE)
@@ -1036,9 +1002,6 @@ fn validate_token_response(response: TokenTransportResponse) -> Result<TokenBund
         return Err(OAuthError::InvalidTokenResponse);
     }
     let expires_in = Duration::from_secs(expires_in);
-    if token_type.is_empty() || scope.is_empty() {
-        return Err(OAuthError::InvalidTokenResponse);
-    }
 
     Ok(TokenBundle {
         access_token,
@@ -1586,7 +1549,6 @@ mod tests {
     struct RecordingTransport {
         calls: Cell<usize>,
         response: Option<TokenTransportResponse>,
-        request_shape: RefCell<Option<BTreeMap<&'static str, bool>>>,
     }
 
     struct FakeChild {
@@ -1637,13 +1599,13 @@ mod tests {
             request: &TokenExchangeRequest,
         ) -> Result<TokenTransportResponse, TokenTransportError> {
             self.calls.set(self.calls.get() + 1);
-            self.request_shape.borrow_mut().replace(BTreeMap::from([
-                ("grant_type", request.grant_type() == "authorization_code"),
-                ("client_id", request.client_id() == CLIENT_ID),
-                ("redirect_uri", request.redirect_uri().contains("127.0.0.1")),
-                ("code", request.has_code()),
-                ("code_verifier", request.has_code_verifier()),
-            ]));
+            assert_eq!(request.client_id, CLIENT_ID);
+            assert_eq!(
+                request.redirect_uri,
+                "http://127.0.0.1:43871/oauth/callback"
+            );
+            assert_eq!(request.code.as_str(), "synthetic-code");
+            assert!(!request.verifier.as_str().is_empty());
             self.response
                 .take()
                 .ok_or(TokenTransportError::RequestFailed)
@@ -1678,7 +1640,6 @@ mod tests {
                 transport: RecordingTransport {
                     calls: Cell::new(0),
                     response: Some(valid_token_response()),
-                    request_shape: RefCell::new(None),
                 },
                 events,
             }
@@ -1926,11 +1887,7 @@ mod tests {
         assert_eq!(result.requested_actor(), "app");
         assert_eq!(result.scope(), "read");
         assert_eq!(result.expires_in(), Duration::from_secs(60));
-        assert!(result.has_access_and_refresh_tokens());
         assert_eq!(harness.transport.calls.get(), 1);
-        let shape = harness.transport.request_shape.borrow();
-        let shape = shape.as_ref().expect("request shape");
-        assert!(shape.values().all(|value| *value));
     }
 
     #[test]
@@ -2190,7 +2147,6 @@ mod tests {
     #[test]
     fn token_response_validation_is_strict_and_redacted() {
         let valid = validate_token_response(valid_token_response()).expect("valid response");
-        assert!(valid.has_access_and_refresh_tokens());
         assert_eq!(valid.requested_actor(), REQUESTED_ACTOR);
         let actor_app = token_response(
             r#"{"access_token":"access","refresh_token":"refresh","token_type":"Bearer","expires_in":1,"scope":"read","actor":"app"}"#,
