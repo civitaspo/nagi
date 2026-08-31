@@ -1,0 +1,19 @@
+# Rust build output
+/target/
+
+# Local Nagi and Temporal state
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+
+# macOS metadata
+.DS_Store
+
+# Editor metadata
+.idea/
+.vscode/
