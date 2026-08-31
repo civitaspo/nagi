@@ -11,6 +11,10 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
   exit 2
 fi
 
-echo "The macOS contract implementation is scheduled for later Phase 0 changes." >&2
-echo "No macOS API, Keychain, or provider operation was attempted." >&2
-exit 1
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "macOS contract layer requires cargo but no cargo executable is available." >&2
+  exit 1
+fi
+
+echo "Running the ignored synthetic macOS Keychain contract; no provider or production locator is used." >&2
+cargo test --workspace --locked --all-features macos_keychain_round_trip_uses_only_a_synthetic_locator -- --ignored --nocapture

@@ -1,0 +1,260 @@
+//! Minimal command-line boundary for local Linear OAuth credentials.
+//!
+//! Argument parsing is intentionally manual and closed: there is no generic
+//! option parser that could accidentally accept a token, secret, or provider
+//! endpoint. The CLI never reads standard input.
+
+use crate::linear::credentials::CredentialError;
+#[cfg(target_os = "macos")]
+use crate::linear::credentials::{CredentialManager, bounded_client_id};
+use std::ffi::OsString;
+use std::fmt;
+
+const CLIENT_ID_ENV: &str = "NAGI_LINEAR_CLIENT_ID";
+const CALLBACK_PORT_ENV: &str = "NAGI_LINEAR_CALLBACK_PORT";
+
+/// Errors from the closed CLI boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CliError {
+    /// The command or option set was not one of the supported forms.
+    Usage,
+    /// Local deployment configuration was absent, malformed, or forbidden.
+    Configuration,
+    /// The credential lifecycle rejected the operation.
+    Credential(CredentialError),
+}
+
+impl fmt::Display for CliError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Usage => formatter
+                .write_str("usage: nagi auth linear login | status | logout --confirm-revoke"),
+            Self::Configuration => {
+                formatter.write_str("Linear OAuth local configuration is invalid")
+            }
+            Self::Credential(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for CliError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Command {
+    Login,
+    Status,
+    Logout,
+}
+
+/// Runs the command using process arguments and environment configuration.
+pub fn run_from_env() -> Result<(), CliError> {
+    run(std::env::args_os())
+}
+
+/// Runs one closed command sequence. The first argument is the executable
+/// name, matching the process-argument iterator.
+pub fn run<I>(arguments: I) -> Result<(), CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let command = parse_arguments(arguments.into_iter().skip(1))?;
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = command;
+        return Err(CliError::Credential(CredentialError::UnsupportedPlatform));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        reject_unknown_linear_configuration()?;
+        match command {
+            Command::Status => {
+                let mut manager =
+                    CredentialManager::production_status().map_err(CliError::Credential)?;
+                println!("{}", manager.status());
+            }
+            Command::Login => {
+                let (client_id, callback_port) = read_login_configuration()?;
+                let mut manager = CredentialManager::production(client_id, callback_port)
+                    .map_err(CliError::Credential)?;
+                manager.login().map_err(CliError::Credential)?;
+                println!("signed_in");
+            }
+            Command::Logout => {
+                let mut manager =
+                    CredentialManager::production_logout().map_err(CliError::Credential)?;
+                manager.logout(true).map_err(CliError::Credential)?;
+                println!("signed_out");
+            }
+        }
+        Ok(())
+    }
+}
+
+fn parse_arguments<I>(mut arguments: I) -> Result<Command, CliError>
+where
+    I: Iterator<Item = OsString>,
+{
+    let Some(first) = arguments.next() else {
+        return Err(CliError::Usage);
+    };
+    if first != "auth" {
+        return Err(CliError::Usage);
+    }
+    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("linear")) {
+        return Err(CliError::Usage);
+    }
+    let Some(operation) = arguments.next() else {
+        return Err(CliError::Usage);
+    };
+    let operation = match operation.to_str() {
+        Some("login") => Command::Login,
+        Some("status") => Command::Status,
+        Some("logout") => Command::Logout,
+        _ => return Err(CliError::Usage),
+    };
+    match operation {
+        Command::Logout => {
+            let Some(flag) = arguments.next() else {
+                return Err(CliError::Usage);
+            };
+            if flag != "--confirm-revoke" || arguments.next().is_some() {
+                return Err(CliError::Usage);
+            }
+        }
+        Command::Login | Command::Status if arguments.next().is_some() => {
+            return Err(CliError::Usage);
+        }
+        Command::Login | Command::Status => {}
+    }
+    Ok(operation)
+}
+
+#[cfg(target_os = "macos")]
+fn reject_unknown_linear_configuration() -> Result<(), CliError> {
+    for (name, _) in std::env::vars_os() {
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if is_forbidden_linear_configuration(name) {
+            return Err(CliError::Configuration);
+        }
+    }
+    Ok(())
+}
+
+fn is_forbidden_linear_configuration(name: &str) -> bool {
+    let Some(key) = name.strip_prefix("NAGI_LINEAR_") else {
+        return false;
+    };
+    if name == CLIENT_ID_ENV || name == CALLBACK_PORT_ENV {
+        return false;
+    }
+    key == "PAT"
+        || key == "API_KEY"
+        || key == "APIKEY"
+        || key == "TOKEN"
+        || key.ends_with("_TOKEN")
+        || key.ends_with("_PAT")
+        || key.ends_with("_SECRET")
+}
+
+#[cfg(target_os = "macos")]
+fn read_login_configuration() -> Result<(String, u16), CliError> {
+    let client_id = std::env::var(CLIENT_ID_ENV).map_err(|_| CliError::Configuration)?;
+    let client_id = bounded_client_id(&client_id).map_err(|_| CliError::Configuration)?;
+    let callback_port = match std::env::var(CALLBACK_PORT_ENV) {
+        Ok(value) => value
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port != 0)
+            .ok_or(CliError::Configuration)?,
+        Err(std::env::VarError::NotPresent) => 43871,
+        Err(std::env::VarError::NotUnicode(_)) => return Err(CliError::Configuration),
+    };
+    Ok((client_id, callback_port))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<OsString> {
+        values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn parser_accepts_only_the_three_linear_operations() {
+        assert_eq!(
+            parse_arguments(args(&["auth", "linear", "login"]).into_iter()),
+            Ok(Command::Login)
+        );
+        assert_eq!(
+            parse_arguments(args(&["auth", "linear", "status"]).into_iter()),
+            Ok(Command::Status)
+        );
+        assert_eq!(
+            parse_arguments(args(&["auth", "linear", "logout", "--confirm-revoke"]).into_iter()),
+            Ok(Command::Logout)
+        );
+    }
+
+    #[test]
+    fn parser_rejects_tokens_secrets_and_unknown_arguments() {
+        for values in [
+            &["auth", "linear", "logout"][..],
+            &["auth", "linear", "logout", "--confirm-revoke", "extra"][..],
+            &["auth", "linear", "login", "--token", "secret"][..],
+            &["auth", "linear", "status", "--client-secret", "secret"][..],
+            &["auth", "linear", "login", "--callback-port", "43872"][..],
+            &["auth", "linear", "unknown"][..],
+        ] {
+            assert_eq!(
+                parse_arguments(values.iter().map(OsString::from)),
+                Err(CliError::Usage)
+            );
+        }
+    }
+
+    #[test]
+    fn configuration_filter_rejects_credential_values_but_preserves_future_names() {
+        for name in [
+            "NAGI_LINEAR_CLIENT_SECRET",
+            "NAGI_LINEAR_PAT",
+            "NAGI_LINEAR_API_TOKEN",
+            "NAGI_LINEAR_ACCESS_TOKEN",
+            "NAGI_LINEAR_REFRESH_TOKEN",
+            "NAGI_LINEAR_API_KEY",
+        ] {
+            assert!(is_forbidden_linear_configuration(name), "{name}");
+        }
+        for name in [
+            CLIENT_ID_ENV,
+            CALLBACK_PORT_ENV,
+            "NAGI_LINEAR_TEAM_ID",
+            "NAGI_LINEAR_SETUP_ISSUE_ID",
+            "NAGI_LINEAR_REDIRECT_URI",
+            "NAGI_LINEAR_TOKEN_ENDPOINT",
+        ] {
+            assert!(!is_forbidden_linear_configuration(name), "{name}");
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn run_reports_unsupported_before_reading_linear_environment() {
+        for operation in ["login", "status", "logout"] {
+            let mut values = vec![OsString::from("nagi"), OsString::from("auth")];
+            values.push(OsString::from("linear"));
+            values.push(OsString::from(operation));
+            if operation == "logout" {
+                values.push(OsString::from("--confirm-revoke"));
+            }
+            assert_eq!(
+                run(values),
+                Err(CliError::Credential(CredentialError::UnsupportedPlatform))
+            );
+        }
+    }
+}
