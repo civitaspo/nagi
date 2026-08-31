@@ -31,7 +31,9 @@ P0-04 adds the closed commands `nagi auth linear login`, `status`, and
 It writes one bounded, versioned envelope containing the access token, refresh
 token, expiration, revision, and lifecycle metadata. Persisted lifecycle
 timestamps and deadlines are Unix epoch milliseconds. Tokens are never accepted
-from arguments, standard input, or environment variables.
+from arguments, standard input, or environment variables. Login refuses to
+replace any existing local envelope, including expired or reauthorization-
+required state; confirmed logout and local deletion must finish first.
 
 On macOS the envelope is stored as one generic-password item selected by the
 fixed service `dev.nagi.linear.oauth.v1` and account `default`. The
@@ -63,8 +65,11 @@ persists revoke-pending, then sends the documented
 `POST https://api.linear.app/oauth/revoke` request with `token` and
 `token_type_hint=refresh_token`. Only HTTP 200 is treated as provider
 confirmation. A confirmed result is persisted as a delete-pending tombstone
-before exact deletion and absence verification; uncertain revoke outcomes are
-retained and are never automatically retried.
+before exact deletion and absence verification. If that tombstone write
+definitively proves that the exact prior revoke-pending bytes remain after an
+HTTP 200, the manager may finish deletion after an exact reread; any storage
+uncertainty retains the record and remains blocked. Uncertain revoke outcomes
+are never automatically retried.
 
 The implementation follows Linear's [OAuth 2.0 authentication documentation](https://linear.app/developers/oauth-2-0-authentication)
 and [OAuth actor authorization documentation](https://linear.app/developers/oauth-actor-authorization).

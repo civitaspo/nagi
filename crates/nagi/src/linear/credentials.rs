@@ -442,7 +442,9 @@ impl fmt::Debug for ProviderResponse {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProviderTransportError {
+    #[cfg(target_os = "macos")]
     ClientConfiguration,
+    #[cfg(any(test, target_os = "macos"))]
     NoResponse,
     #[cfg(target_os = "macos")]
     ResponseTooLarge,
@@ -573,6 +575,7 @@ fn read_provider_response(response: Response) -> Result<ProviderResponse, Provid
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StoreError {
+    #[cfg(any(test, target_os = "macos"))]
     Unavailable,
     #[cfg(test)]
     Uncertain,
@@ -860,34 +863,6 @@ impl AuthorizationProvider for ProductionAuthorization {
     }
 }
 
-#[cfg(target_os = "macos")]
-struct UnavailableAuthorization;
-
-#[cfg(target_os = "macos")]
-impl AuthorizationProvider for UnavailableAuthorization {
-    fn authorize(&mut self) -> Result<TokenBundle, OAuthError> {
-        Err(OAuthError::InvalidTokenResponse)
-    }
-}
-
-#[cfg(target_os = "macos")]
-struct UnavailableTransport;
-
-#[cfg(target_os = "macos")]
-impl ProviderTransport for UnavailableTransport {
-    fn refresh(
-        &mut self,
-        _client_id: &str,
-        _refresh_token: &str,
-    ) -> Result<ProviderResponse, ProviderTransportError> {
-        Err(ProviderTransportError::ClientConfiguration)
-    }
-
-    fn revoke(&mut self, _refresh_token: &str) -> Result<ProviderResponse, ProviderTransportError> {
-        Err(ProviderTransportError::ClientConfiguration)
-    }
-}
-
 struct LoadedRecord {
     envelope: CredentialEnvelope,
     bytes: Zeroizing<Vec<u8>>,
@@ -904,10 +879,10 @@ pub struct CredentialManager {
     )]
     client_id: String,
     store: Box<dyn CredentialStore>,
-    transport: Box<dyn ProviderTransport>,
+    transport: Option<Box<dyn ProviderTransport>>,
     clock: Box<dyn WallClock>,
     critical_section: Box<dyn CriticalSection>,
-    authorizer: Box<dyn AuthorizationProvider>,
+    authorizer: Option<Box<dyn AuthorizationProvider>>,
 }
 
 impl fmt::Debug for CredentialManager {
@@ -938,10 +913,10 @@ impl CredentialManager {
             Ok(Self {
                 client_id,
                 store: Box::new(KeychainStore::production()),
-                transport: Box::new(transport),
+                transport: Some(Box::new(transport)),
                 clock: Box::new(SystemWallClock),
                 critical_section: Box::new(SystemCriticalSection),
-                authorizer: Box::new(ProductionAuthorization { config }),
+                authorizer: Some(Box::new(ProductionAuthorization { config })),
             })
         }
         #[cfg(not(target_os = "macos"))]
@@ -960,10 +935,10 @@ impl CredentialManager {
             Ok(Self {
                 client_id: String::new(),
                 store: Box::new(KeychainStore::production()),
-                transport: Box::new(UnavailableTransport),
+                transport: None,
                 clock: Box::new(SystemWallClock),
                 critical_section: Box::new(SystemCriticalSection),
-                authorizer: Box::new(UnavailableAuthorization),
+                authorizer: None,
             })
         }
         #[cfg(not(target_os = "macos"))]
@@ -982,10 +957,10 @@ impl CredentialManager {
             Ok(Self {
                 client_id: String::new(),
                 store: Box::new(KeychainStore::production()),
-                transport: Box::new(transport),
+                transport: Some(Box::new(transport)),
                 clock: Box::new(SystemWallClock),
                 critical_section: Box::new(SystemCriticalSection),
-                authorizer: Box::new(UnavailableAuthorization),
+                authorizer: None,
             })
         }
         #[cfg(not(target_os = "macos"))]
@@ -1006,10 +981,10 @@ impl CredentialManager {
         Self {
             client_id: client_id.to_owned(),
             store,
-            transport,
+            transport: Some(transport),
             clock,
             critical_section,
-            authorizer,
+            authorizer: Some(authorizer),
         }
     }
 
@@ -1017,18 +992,13 @@ impl CredentialManager {
     pub fn login(&mut self) -> Result<(), CredentialError> {
         let _guard = self.critical_section.lock()?;
         let previous = self.load_record()?;
-        if previous.as_ref().is_some_and(|record| {
-            matches!(
-                record.envelope.state,
-                LifecycleState::ReplayPending
-                    | LifecycleState::RevokePending
-                    | LifecycleState::RevokedDeletePending
-            )
-        }) {
+        if previous.is_some() {
             return Err(CredentialError::PendingLifecycle);
         }
         let bundle = self
             .authorizer
+            .as_mut()
+            .ok_or(CredentialError::Authorization)?
             .authorize()
             .map_err(|_| CredentialError::Authorization)?;
         let (access, refresh, lifetime) = bundle.into_credential_parts();
@@ -1036,13 +1006,8 @@ impl CredentialManager {
         let expires_at_ms = now
             .checked_add(duration_millis(lifetime)?)
             .ok_or(CredentialError::Configuration)?;
-        let revision = previous
-            .as_ref()
-            .map(|record| next_revision(&record.envelope))
-            .transpose()?
-            .unwrap_or(1);
-        let envelope = CredentialEnvelope::ready(revision, access, refresh, expires_at_ms)?;
-        self.write_record(&envelope, previous.as_ref().map(|record| &record.bytes))
+        let envelope = CredentialEnvelope::ready(1, access, refresh, expires_at_ms)?;
+        self.write_record(&envelope, None)
     }
 
     /// Reads and classifies only local state.  It never refreshes, revokes,
@@ -1147,7 +1112,12 @@ impl CredentialManager {
         });
         self.write_record(&pending, Some(&record.bytes))?;
 
-        let response = match self.transport.revoke(pending.refresh_token.as_str()) {
+        let response = match self
+            .transport
+            .as_mut()
+            .ok_or(CredentialError::RevokeUnconfirmed)?
+            .revoke(pending.refresh_token.as_str())
+        {
             Ok(response) => response,
             Err(_) => return Err(CredentialError::RevokeUnconfirmed),
         };
@@ -1168,11 +1138,31 @@ impl CredentialManager {
             .ok_or(CredentialError::InvalidEnvelope)?
             .confirmed_at_ms = Some(confirmed_at_ms);
         let pending_bytes = self.load_record()?.map(|record| record.bytes);
-        self.write_record(&tombstone, pending_bytes.as_ref())?;
-        let record = self
-            .load_record()?
-            .ok_or(CredentialError::StorageUncertain)?;
-        self.finish_local_delete(record)
+        match self.write_record(&tombstone, pending_bytes.as_ref()) {
+            Ok(()) => {
+                let record = self
+                    .load_record()?
+                    .ok_or(CredentialError::StorageUncertain)?;
+                self.finish_local_delete(record)
+            }
+            Err(CredentialError::Storage) => {
+                // A definitive tombstone-write failure means the exact prior
+                // bytes were observed. Re-read that same record before the
+                // terminal delete; uncertainty never takes this path.
+                let record = match self.load_record() {
+                    Ok(Some(record)) => record,
+                    Ok(None) | Err(_) => return Err(CredentialError::StorageUncertain),
+                };
+                let Some(expected) = pending_bytes.as_ref() else {
+                    return Err(CredentialError::StorageUncertain);
+                };
+                if record.bytes.as_slice() != expected.as_slice() {
+                    return Err(CredentialError::StorageUncertain);
+                }
+                self.finish_local_delete(record)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn load_record(&mut self) -> Result<Option<LoadedRecord>, CredentialError> {
@@ -1239,16 +1229,21 @@ impl CredentialManager {
             replay_consumed: false,
         });
         self.write_record(&pending, Some(&record.bytes))?;
-        let response = match self.transport.refresh(
-            pending
-                .refresh
-                .as_ref()
-                .ok_or(CredentialError::InvalidEnvelope)?
-                .client_id
-                .as_str(),
-            pending.refresh_token.as_str(),
-        ) {
+        let response = match self
+            .transport
+            .as_mut()
+            .ok_or(CredentialError::ReauthorizationRequired)?
+            .refresh(
+                pending
+                    .refresh
+                    .as_ref()
+                    .ok_or(CredentialError::InvalidEnvelope)?
+                    .client_id
+                    .as_str(),
+                pending.refresh_token.as_str(),
+            ) {
             Ok(response) => response,
+            #[cfg(any(test, target_os = "macos"))]
             Err(ProviderTransportError::NoResponse) => {
                 return Err(CredentialError::RefreshAmbiguous);
             }
@@ -1302,6 +1297,8 @@ impl CredentialManager {
             .ok_or(CredentialError::InvalidEnvelope)?;
         let response = match self
             .transport
+            .as_mut()
+            .ok_or(CredentialError::ReauthorizationRequired)?
             .refresh(intent.client_id.as_str(), intent.refresh_token.as_str())
         {
             Ok(response) => response,
@@ -1454,6 +1451,7 @@ fn replay_is_eligible(intent: &RefreshIntent, now: i64) -> bool {
 
 fn map_store_error(error: StoreError) -> CredentialError {
     match error {
+        #[cfg(any(test, target_os = "macos"))]
         StoreError::Unavailable => CredentialError::Storage,
         #[cfg(test)]
         StoreError::Uncertain => CredentialError::StorageUncertain,
@@ -1562,7 +1560,9 @@ mod tests {
     struct MemoryStore {
         value: Option<Zeroizing<Vec<u8>>>,
         fail_read: bool,
+        fail_read_after_write: Option<usize>,
         fail_write: bool,
+        fail_write_on: Option<usize>,
         write_error_after_commit: bool,
         read_after_write: ReadAfterWrite,
         fail_verify: bool,
@@ -1584,6 +1584,12 @@ mod tests {
             if self.fail_read {
                 return Err(StoreError::Unavailable);
             }
+            if self
+                .fail_read_after_write
+                .is_some_and(|write| self.writes.get() >= write)
+            {
+                return Err(StoreError::Uncertain);
+            }
             if self.writes.get() > 0 {
                 match &self.read_after_write {
                     ReadAfterWrite::Current => {}
@@ -1598,7 +1604,7 @@ mod tests {
 
         fn write(&mut self, bytes: &[u8]) -> Result<(), StoreError> {
             self.writes.set(self.writes.get() + 1);
-            if self.fail_write {
+            if self.fail_write || self.fail_write_on == Some(self.writes.get()) {
                 return Err(StoreError::Unavailable);
             }
             self.value = Some(Zeroizing::new(bytes.to_vec()));
@@ -1737,16 +1743,17 @@ mod tests {
     }
 
     fn ready_bytes(revision: u64, expires_at_ms: i64) -> Zeroizing<Vec<u8>> {
-        serialize_envelope(
-            &CredentialEnvelope::ready(
-                revision,
-                Zeroizing::new(ACCESS.to_owned()),
-                Zeroizing::new(REFRESH.to_owned()),
-                expires_at_ms,
-            )
-            .expect("envelope"),
+        serialize_envelope(&ready_envelope(revision, expires_at_ms)).expect("bytes")
+    }
+
+    fn ready_envelope(revision: u64, expires_at_ms: i64) -> CredentialEnvelope {
+        CredentialEnvelope::ready(
+            revision,
+            Zeroizing::new(ACCESS.to_owned()),
+            Zeroizing::new(REFRESH.to_owned()),
+            expires_at_ms,
         )
-        .expect("bytes")
+        .expect("envelope")
     }
 
     fn replay_pending_bytes(
@@ -1953,14 +1960,55 @@ mod tests {
     }
 
     #[test]
-    fn login_preserves_existing_record_when_authorization_or_write_fails() {
+    fn login_requires_confirmed_logout_before_replacing_any_record() {
         let initial = ready_bytes(1, READY_AT_MS);
-        let mut store = MemoryStore {
-            value: Some(initial.clone()),
-            ..MemoryStore::default()
-        };
         let mut manager = fake_manager(
-            store,
+            MemoryStore {
+                value: Some(initial.clone()),
+                ..MemoryStore::default()
+            },
+            FakeTransport::new([]),
+            NOW_MS,
+            authorizer(),
+        );
+        assert_eq!(manager.login(), Err(CredentialError::PendingLifecycle));
+        let loaded = manager.load_record().expect("read").expect("record");
+        assert_eq!(loaded.bytes.as_slice(), initial.as_slice());
+
+        let mut reauthorization = CredentialEnvelope::ready(
+            2,
+            Zeroizing::new(ACCESS.to_owned()),
+            Zeroizing::new(REFRESH.to_owned()),
+            EXPIRED_AT_MS,
+        )
+        .expect("ready");
+        reauthorization.state = LifecycleState::ReauthorizationRequired;
+        let reauthorization = serialize_envelope(&reauthorization).expect("record");
+        let mut manager = fake_manager(
+            MemoryStore {
+                value: Some(reauthorization.clone()),
+                ..MemoryStore::default()
+            },
+            FakeTransport::new([]),
+            NOW_MS,
+            authorizer(),
+        );
+        assert_eq!(manager.login(), Err(CredentialError::PendingLifecycle));
+        assert_eq!(
+            manager
+                .load_record()
+                .expect("read")
+                .expect("record")
+                .bytes
+                .as_slice(),
+            reauthorization.as_slice()
+        );
+    }
+
+    #[test]
+    fn login_preserves_absence_when_authorization_or_write_fails() {
+        let mut manager = fake_manager(
+            MemoryStore::default(),
             FakeTransport::new([]),
             NOW_MS,
             FakeAuthorizer {
@@ -1971,12 +2019,10 @@ mod tests {
             },
         );
         assert_eq!(manager.login(), Err(CredentialError::Authorization));
-        let loaded = manager.load_record().expect("read").expect("record");
-        assert_eq!(loaded.bytes.as_slice(), initial.as_slice());
+        assert!(manager.load_record().expect("read").is_none());
 
         let mut manager = fake_manager(
             MemoryStore {
-                value: Some(initial.clone()),
                 fail_write: true,
                 ..MemoryStore::default()
             },
@@ -1985,31 +2031,23 @@ mod tests {
             authorizer(),
         );
         assert_eq!(manager.login(), Err(CredentialError::Storage));
-        assert_eq!(
-            manager
-                .load_record()
-                .expect("read")
-                .expect("record")
-                .bytes
-                .as_slice(),
-            initial.as_slice()
-        );
-        store = MemoryStore::default();
-        let _ = store;
+        assert!(manager.load_record().expect("read").is_none());
     }
 
     #[test]
     fn write_error_after_commit_is_confirmed_without_compensation() {
+        let old_bytes = ready_bytes(1, READY_AT_MS);
         let store = MemoryStore {
-            value: Some(ready_bytes(1, READY_AT_MS)),
+            value: Some(old_bytes.clone()),
             write_error_after_commit: true,
             ..MemoryStore::default()
         };
         let writes = Rc::clone(&store.writes);
         let deletes = Rc::clone(&store.deletes);
         let mut manager = fake_manager(store, FakeTransport::new([]), NOW_MS, authorizer());
+        let replacement = ready_envelope(2, READY_AT_MS);
 
-        assert_eq!(manager.login(), Ok(()));
+        assert_eq!(manager.write_record(&replacement, Some(&old_bytes)), Ok(()));
         assert_eq!(writes.get(), 1);
         assert_eq!(deletes.get(), 0);
         assert_eq!(manager.status(), CredentialStatus::Ready);
@@ -2026,7 +2064,11 @@ mod tests {
         let old_deletes = Rc::clone(&old_store.deletes);
         let old_bytes = old_store.value.clone().expect("old record");
         let mut manager = fake_manager(old_store, FakeTransport::new([]), NOW_MS, authorizer());
-        assert_eq!(manager.login(), Err(CredentialError::Storage));
+        let replacement = ready_envelope(2, READY_AT_MS);
+        assert_eq!(
+            manager.write_record(&replacement, Some(&old_bytes)),
+            Err(CredentialError::Storage)
+        );
         assert_eq!(old_writes.get(), 1);
         assert_eq!(old_deletes.get(), 0);
         assert_eq!(
@@ -2041,7 +2083,10 @@ mod tests {
         let absent_writes = Rc::clone(&absent_store.writes);
         let absent_deletes = Rc::clone(&absent_store.deletes);
         let mut manager = fake_manager(absent_store, FakeTransport::new([]), NOW_MS, authorizer());
-        assert_eq!(manager.login(), Err(CredentialError::Storage));
+        assert_eq!(
+            manager.write_record(&replacement, None),
+            Err(CredentialError::Storage)
+        );
         assert_eq!(absent_writes.get(), 1);
         assert_eq!(absent_deletes.get(), 0);
         assert!(manager.load_record().expect("read").is_none());
@@ -2058,8 +2103,13 @@ mod tests {
             let writes = Rc::clone(&store.writes);
             let deletes = Rc::clone(&store.deletes);
             let mut manager = fake_manager(store, FakeTransport::new([]), NOW_MS, authorizer());
+            let old_bytes = ready_bytes(1, READY_AT_MS);
+            let replacement = ready_envelope(2, READY_AT_MS);
 
-            assert_eq!(manager.login(), Err(CredentialError::StorageUncertain));
+            assert_eq!(
+                manager.write_record(&replacement, Some(&old_bytes)),
+                Err(CredentialError::StorageUncertain)
+            );
             assert_eq!(writes.get(), 1);
             assert_eq!(deletes.get(), 0);
         }
@@ -2527,6 +2577,51 @@ mod tests {
         );
         assert_eq!(manager.logout(true), Ok(()));
         assert_eq!(manager.status(), CredentialStatus::SignedOut);
+    }
+
+    #[test]
+    fn definitive_tombstone_write_failure_deletes_only_exact_retained_record() {
+        let mut transport = FakeTransport::new([]);
+        transport.revoke_outcomes.push_back(FakeOutcome::Response(
+            ProviderResponse::synthetic(200, b"").expect("response"),
+        ));
+        let calls = Rc::clone(&transport.revokes);
+        let initial_store = MemoryStore {
+            value: Some(ready_bytes(1, READY_AT_MS)),
+            fail_write_on: Some(2),
+            ..MemoryStore::default()
+        };
+        let writes = Rc::clone(&initial_store.writes);
+        let deletes = Rc::clone(&initial_store.deletes);
+        let mut manager = fake_manager(initial_store, transport, NOW_MS, authorizer());
+
+        assert_eq!(manager.logout(true), Ok(()));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(writes.get(), 2);
+        assert_eq!(deletes.get(), 1);
+        assert_eq!(manager.status(), CredentialStatus::SignedOut);
+    }
+
+    #[test]
+    fn uncertain_tombstone_write_never_deletes_or_retries_revoke() {
+        let mut transport = FakeTransport::new([]);
+        transport.revoke_outcomes.push_back(FakeOutcome::Response(
+            ProviderResponse::synthetic(200, b"").expect("response"),
+        ));
+        let calls = Rc::clone(&transport.revokes);
+        let initial_store = MemoryStore {
+            value: Some(ready_bytes(1, READY_AT_MS)),
+            fail_read_after_write: Some(2),
+            ..MemoryStore::default()
+        };
+        let writes = Rc::clone(&initial_store.writes);
+        let deletes = Rc::clone(&initial_store.deletes);
+        let mut manager = fake_manager(initial_store, transport, NOW_MS, authorizer());
+
+        assert_eq!(manager.logout(true), Err(CredentialError::StorageUncertain));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(writes.get(), 2);
+        assert_eq!(deletes.get(), 0);
     }
 
     #[test]

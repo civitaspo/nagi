@@ -10,7 +10,9 @@ use crate::linear::credentials::{CredentialManager, bounded_client_id};
 use std::ffi::OsString;
 use std::fmt;
 
+#[cfg(any(test, target_os = "macos"))]
 const CLIENT_ID_ENV: &str = "NAGI_LINEAR_CLIENT_ID";
+#[cfg(any(test, target_os = "macos"))]
 const CALLBACK_PORT_ENV: &str = "NAGI_LINEAR_CALLBACK_PORT";
 
 /// Errors from the closed CLI boundary.
@@ -62,7 +64,7 @@ where
     #[cfg(not(target_os = "macos"))]
     {
         let _ = command;
-        return Err(CliError::Credential(CredentialError::UnsupportedPlatform));
+        Err(CliError::Credential(CredentialError::UnsupportedPlatform))
     }
 
     #[cfg(target_os = "macos")]
@@ -144,6 +146,7 @@ fn reject_unknown_linear_configuration() -> Result<(), CliError> {
     Ok(())
 }
 
+#[cfg(any(test, target_os = "macos"))]
 fn is_forbidden_linear_configuration(name: &str) -> bool {
     let Some(key) = name.strip_prefix("NAGI_LINEAR_") else {
         return false;
