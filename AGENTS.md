@@ -39,6 +39,12 @@ mise run build
 
 The Rust tasks skip project commands until `Cargo.toml` exists. This keeps the foundation usable before implementation starts.
 
+## Contract harness know-how
+
+- Keep the Phase 0 tool revisions in `contracts/versions.toml` and platform artifact URLs/checksums in `mise.lock`; use the explicit `aqua:temporalio/cli` tool name because the shorter `temporal` alias refers to a different upstream.
+- When the Temporal Rust SDK is introduced, use the exact crates.io `temporalio-sdk = "=0.7.0"` dependency and commit the resulting `Cargo.lock`; do not add an unused Git dependency.
+- The Aqua Codex pin is only for the contract toolchain. The managed `CODEX_HOME` login and App Server layout are separate decisions for later pull requests.
+
 ## GitHub Actions and credentials
 
 - Pin every GitHub Action to an immutable commit SHA and keep `persist-credentials: false` on checkout steps.

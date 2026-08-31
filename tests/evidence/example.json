@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "layer": "hermetic",
+  "gate": "harness",
+  "result": "pass",
+  "revision": "0000000000000000000000000000000000000000",
+  "fixture": "synthetic.phase-zero.v1",
+  "versions": {
+    "rust": "1.98.0",
+    "temporalCli": "1.8.2",
+    "temporalRustSdk": "0.7.0",
+    "codex": "0.151.0"
+  },
+  "checks": [
+    {
+      "name": "fixture-provenance",
+      "result": "pass"
+    },
+    {
+      "name": "version-pins",
+      "result": "pass"
+    },
+    {
+      "name": "redaction",
+      "result": "pass"
+    }
+  ]
+}
