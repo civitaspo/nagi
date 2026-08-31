@@ -13,6 +13,14 @@ Nagi is a local-first work execution system for Linear and Codex. The repository
 - Keep changes focused and do not add implementation code to setup-only changes.
 - Use the Apache License 2.0 for this repository.
 
+## Worktrees and pull requests
+
+- Give every pull request one dedicated worktree and one focused concern. Do not share a worktree between concurrent pull requests, and do not mix unrelated changes into the worktree.
+- Before editing, check the worktree branch and status. Preserve unrelated user changes and keep the pull request branch based on an explicit base commit.
+- Require both a current-SHA adversarial review and a current-SHA ponytail review against the same SHA, and record that exact reviewed and checked commit SHA in the evidence. A branch change invalidates both reviews and checks; make a new signed commit and never amend or rewrite the reviewed or shared commit.
+- A release pull request must state its base and release SHAs and must not duplicate an active implementation pull request. If the release pull request overlaps an active change, pause it, reconcile it with the current base, and rerun checks and both reviews before merging.
+- After a pull request is merged or closed, clean up only its exact worktree and temporary artifacts after confirming the path, branch, status, and preserved evidence. Never use broad globs or a repository/home root for cleanup, and never remove credentials, shared state, or review evidence as part of cleanup.
+
 ## Local tooling
 
 Install the pinned tools with:
