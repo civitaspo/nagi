@@ -52,14 +52,21 @@ contract uses `POST https://api.linear.app/oauth/token` with only
 keeps the old bundle on an ambiguous response and permits one byte-for-byte
 replay only while `now_ms < first_send_at_ms + 1,800,000`; the exact deadline
 is excluded. Replay consumption is durable before the replay send. Any consumed
-replay, expired grace, malformed response, definitive rejection, or clock
-rollback requires reauthorization.
+replay, expired grace, malformed response, or clock rollback retains the exact
+replay-pending bytes; no failure path rewrites that record into a destructive or
+force-delete state. A first non-success or invalid response, including an
+unrepresentable expiry, returns `RefreshAmbiguous` while retaining the
+unconsumed intent so its one replay remains available. A failed or invalid
+replay retains the consumed intent and requires reauthorization.
 
 `status` is local classification only and never refreshes, revokes, launches a
 browser, deletes data, or prints secret-bearing values. A replay-pending record
 is reported as such only while the current clock is within its strict replay
 window and the replay is unconsumed; an expired or consumed replay is reported
 as reauthorization-required, while clock failure or rollback is unavailable.
+Once a replay is consumed or its deadline expires without a durably verified
+ready bundle, P0-04 has no destructive local recovery: out-of-band provider or
+local remediation is required, and there is no force-delete fallback.
 Confirmed logout first
 persists revoke-pending, then sends the documented
 `POST https://api.linear.app/oauth/revoke` request with `token` and

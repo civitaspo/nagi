@@ -92,7 +92,7 @@ pub enum CredentialError {
     PendingLifecycle,
     /// The retained credential requires a new authorization.
     ReauthorizationRequired,
-    /// A refresh request was sent but no response was observed.
+    /// A first refresh attempt failed or was not fully classified; one replay remains.
     RefreshAmbiguous,
     /// A refresh replay is outside its strict grace deadline.
     ReplayExpired,
@@ -244,7 +244,6 @@ impl fmt::Debug for SecretText {
 enum LifecycleState {
     Ready,
     ReplayPending,
-    ReauthorizationRequired,
     RevokePending,
     RevokedDeletePending,
 }
@@ -331,7 +330,7 @@ impl CredentialEnvelope {
             return Err(CredentialError::InvalidEnvelope);
         }
         match self.state {
-            LifecycleState::Ready | LifecycleState::ReauthorizationRequired => {
+            LifecycleState::Ready => {
                 if self.refresh.is_some() || self.revoke.is_some() {
                     return Err(CredentialError::InvalidEnvelope);
                 }
@@ -1034,7 +1033,6 @@ impl CredentialManager {
                     Err(_) => CredentialStatus::Unavailable,
                 }
             }
-            LifecycleState::ReauthorizationRequired => CredentialStatus::ReauthorizationRequired,
             LifecycleState::RevokePending => CredentialStatus::RevokePending,
             LifecycleState::RevokedDeletePending => CredentialStatus::RevokedDeletePending,
             LifecycleState::Ready => match self.clock.now() {
@@ -1076,9 +1074,9 @@ impl CredentialManager {
                 let record = self.replay_record(record, now)?;
                 Ok(callback(record.envelope.access_token.as_str()))
             }
-            LifecycleState::ReauthorizationRequired
-            | LifecycleState::RevokePending
-            | LifecycleState::RevokedDeletePending => Err(CredentialError::NotReady),
+            LifecycleState::RevokePending | LifecycleState::RevokedDeletePending => {
+                Err(CredentialError::NotReady)
+            }
         }
     }
 
@@ -1232,7 +1230,7 @@ impl CredentialManager {
         let response = match self
             .transport
             .as_mut()
-            .ok_or(CredentialError::ReauthorizationRequired)?
+            .ok_or_else(|| refresh_failure_error(&pending))?
             .refresh(
                 pending
                     .refresh
@@ -1245,9 +1243,13 @@ impl CredentialManager {
             Ok(response) => response,
             #[cfg(any(test, target_os = "macos"))]
             Err(ProviderTransportError::NoResponse) => {
-                return Err(CredentialError::RefreshAmbiguous);
+                return Err(refresh_failure_error(&pending));
             }
-            Err(_) => return self.transition_refresh_failure(pending),
+            #[cfg(target_os = "macos")]
+            Err(
+                ProviderTransportError::ClientConfiguration
+                | ProviderTransportError::ResponseTooLarge,
+            ) => return Err(refresh_failure_error(&pending)),
         };
         self.accept_refresh_response(pending, response, now)
     }
@@ -1271,12 +1273,12 @@ impl CredentialManager {
             .ok_or(CredentialError::InvalidEnvelope)?;
         if !replay_is_eligible(intent, now) {
             if now < intent.first_send_at_ms {
-                return self.transition_and_report(record.envelope, CredentialError::ClockRollback);
+                return Err(CredentialError::ClockRollback);
             }
             if now >= intent.replay_deadline_ms {
-                return self.transition_and_report(record.envelope, CredentialError::ReplayExpired);
+                return Err(CredentialError::ReplayExpired);
             }
-            return self.transition_and_report(record.envelope, CredentialError::ReplayConsumed);
+            return Err(CredentialError::ReplayConsumed);
         }
         let mut replay = record.envelope.clone();
         replay.revision = next_revision(&replay)?;
@@ -1298,11 +1300,11 @@ impl CredentialManager {
         let response = match self
             .transport
             .as_mut()
-            .ok_or(CredentialError::ReauthorizationRequired)?
+            .ok_or_else(|| refresh_failure_error(&replay))?
             .refresh(intent.client_id.as_str(), intent.refresh_token.as_str())
         {
             Ok(response) => response,
-            Err(_) => return self.transition_refresh_failure(replay),
+            Err(_) => return Err(refresh_failure_error(&replay)),
         };
         self.accept_refresh_response(replay, response, now)
     }
@@ -1321,23 +1323,20 @@ impl CredentialManager {
         original_now: i64,
     ) -> Result<LoadedRecord, CredentialError> {
         if response.status != 200 {
-            return self.transition_refresh_failure(pending);
+            return Err(refresh_failure_error(&pending));
         }
         let bundle = match parse_refresh_response(response) {
             Ok(bundle) => bundle,
-            Err(_) => return self.transition_refresh_failure(pending),
+            Err(_) => return Err(refresh_failure_error(&pending)),
         };
-        let now = match self.clock.now() {
-            Ok(now) => now,
-            Err(error) => return self.transition_and_report(pending, error),
-        };
+        let now = self.clock.now()?;
         let first_send_at_ms = pending
             .refresh
             .as_ref()
             .ok_or(CredentialError::InvalidEnvelope)?
             .first_send_at_ms;
         if now < first_send_at_ms || now < original_now {
-            return self.transition_refresh_failure(pending);
+            return Err(CredentialError::ClockRollback);
         }
         let (access, refresh, lifetime) = bundle.into_credential_parts();
         let expires_at_ms = match duration_millis(lifetime)
@@ -1345,55 +1344,13 @@ impl CredentialManager {
             .and_then(|lifetime| now.checked_add(lifetime))
         {
             Some(expires_at) => expires_at,
-            None => {
-                return self
-                    .transition_and_report(pending, CredentialError::ReauthorizationRequired);
-            }
+            None => return Err(refresh_failure_error(&pending)),
         };
         let ready =
             CredentialEnvelope::ready(next_revision(&pending)?, access, refresh, expires_at_ms)?;
         let pending_bytes = self.load_record()?.map(|record| record.bytes);
         self.write_record(&ready, pending_bytes.as_ref())?;
         self.load_record()?.ok_or(CredentialError::StorageUncertain)
-    }
-
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "P0-05 provider operations will consume this private access-token lease"
-        )
-    )]
-    fn transition_refresh_failure(
-        &mut self,
-        mut pending: CredentialEnvelope,
-    ) -> Result<LoadedRecord, CredentialError> {
-        pending.revision = next_revision(&pending)?;
-        pending.state = LifecycleState::ReauthorizationRequired;
-        pending.refresh = None;
-        pending.revoke = None;
-        let previous = self.load_record()?.map(|record| record.bytes);
-        self.write_record(&pending, previous.as_ref())?;
-        Err(CredentialError::ReauthorizationRequired)
-    }
-
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "P0-05 provider operations will consume this private access-token lease"
-        )
-    )]
-    fn transition_and_report(
-        &mut self,
-        envelope: CredentialEnvelope,
-        lifecycle_error: CredentialError,
-    ) -> Result<LoadedRecord, CredentialError> {
-        match self.transition_refresh_failure(envelope) {
-            Err(CredentialError::ReauthorizationRequired) => Err(lifecycle_error),
-            Err(error) => Err(error),
-            Ok(_) => Err(lifecycle_error),
-        }
     }
 
     fn finish_local_delete(&mut self, record: LoadedRecord) -> Result<(), CredentialError> {
@@ -1447,6 +1404,18 @@ fn replay_is_eligible(intent: &RefreshIntent, now: i64) -> bool {
         && now < intent.replay_deadline_ms
         && !intent.replay_consumed
         && intent.attempt_count == 1
+}
+
+fn refresh_failure_error(envelope: &CredentialEnvelope) -> CredentialError {
+    if envelope
+        .refresh
+        .as_ref()
+        .is_some_and(|intent| intent.attempt_count == 2 && intent.replay_consumed)
+    {
+        CredentialError::ReauthorizationRequired
+    } else {
+        CredentialError::RefreshAmbiguous
+    }
 }
 
 fn map_store_error(error: StoreError) -> CredentialError {
@@ -1536,6 +1505,23 @@ mod tests {
     impl WallClock for FakeClock {
         fn now(&self) -> Result<i64, CredentialError> {
             Ok(self.now.get())
+        }
+    }
+
+    struct FailAfterFirstClock {
+        now: i64,
+        calls: Rc<Cell<usize>>,
+    }
+
+    impl WallClock for FailAfterFirstClock {
+        fn now(&self) -> Result<i64, CredentialError> {
+            let calls = self.calls.get();
+            self.calls.set(calls + 1);
+            if calls == 0 {
+                Ok(self.now)
+            } else {
+                Err(CredentialError::ClockRollback)
+            }
         }
     }
 
@@ -1761,11 +1747,36 @@ mod tests {
         attempt_count: u8,
         replay_consumed: bool,
     ) -> Zeroizing<Vec<u8>> {
+        replay_pending_bytes_with_revision(1, first_send_at_ms, attempt_count, replay_consumed)
+    }
+
+    fn replay_pending_bytes_with_revision(
+        revision: u64,
+        first_send_at_ms: i64,
+        attempt_count: u8,
+        replay_consumed: bool,
+    ) -> Zeroizing<Vec<u8>> {
+        replay_pending_bytes_with_revision_and_expiry(
+            revision,
+            first_send_at_ms,
+            attempt_count,
+            replay_consumed,
+            READY_AT_MS,
+        )
+    }
+
+    fn replay_pending_bytes_with_revision_and_expiry(
+        revision: u64,
+        first_send_at_ms: i64,
+        attempt_count: u8,
+        replay_consumed: bool,
+        access_expires_at_ms: i64,
+    ) -> Zeroizing<Vec<u8>> {
         let mut envelope = CredentialEnvelope::ready(
-            1,
+            revision,
             Zeroizing::new(ACCESS.to_owned()),
             Zeroizing::new(REFRESH.to_owned()),
-            READY_AT_MS,
+            access_expires_at_ms,
         )
         .expect("ready");
         envelope.state = LifecycleState::ReplayPending;
@@ -1975,18 +1986,10 @@ mod tests {
         let loaded = manager.load_record().expect("read").expect("record");
         assert_eq!(loaded.bytes.as_slice(), initial.as_slice());
 
-        let mut reauthorization = CredentialEnvelope::ready(
-            2,
-            Zeroizing::new(ACCESS.to_owned()),
-            Zeroizing::new(REFRESH.to_owned()),
-            EXPIRED_AT_MS,
-        )
-        .expect("ready");
-        reauthorization.state = LifecycleState::ReauthorizationRequired;
-        let reauthorization = serialize_envelope(&reauthorization).expect("record");
+        let replay_pending = replay_pending_bytes(NOW_MS, 1, false);
         let mut manager = fake_manager(
             MemoryStore {
-                value: Some(reauthorization.clone()),
+                value: Some(replay_pending.clone()),
                 ..MemoryStore::default()
             },
             FakeTransport::new([]),
@@ -2001,7 +2004,7 @@ mod tests {
                 .expect("record")
                 .bytes
                 .as_slice(),
-            reauthorization.as_slice()
+            replay_pending.as_slice()
         );
     }
 
@@ -2148,134 +2151,55 @@ mod tests {
     }
 
     #[test]
-    fn status_reports_replay_pending_just_before_strict_deadline() {
-        let initial = replay_pending_bytes(NOW_MS, 1, false);
-        let clock = Rc::new(Cell::new(REPLAY_DEADLINE_MS - 1));
-        let store = MemoryStore {
-            value: Some(initial.clone()),
-            ..MemoryStore::default()
-        };
-        let writes = Rc::clone(&store.writes);
-        let deletes = Rc::clone(&store.deletes);
-        let mut manager = fake_manager_with_clock(
-            store,
-            FakeTransport::new([]),
-            Rc::clone(&clock),
-            authorizer(),
-        );
+    fn status_classifies_replay_states_without_mutation() {
+        for (attempt_count, replay_consumed, clock_ms, expected) in [
+            (
+                1,
+                false,
+                Some(REPLAY_DEADLINE_MS - 1),
+                CredentialStatus::ReplayPending,
+            ),
+            (
+                1,
+                false,
+                Some(REPLAY_DEADLINE_MS),
+                CredentialStatus::ReauthorizationRequired,
+            ),
+            (
+                2,
+                true,
+                Some(NOW_MS + 1),
+                CredentialStatus::ReauthorizationRequired,
+            ),
+            (1, false, Some(NOW_MS - 1), CredentialStatus::Unavailable),
+            (1, false, None, CredentialStatus::Unavailable),
+        ] {
+            let initial = replay_pending_bytes(NOW_MS, attempt_count, replay_consumed);
+            let store = MemoryStore {
+                value: Some(initial.clone()),
+                ..MemoryStore::default()
+            };
+            let writes = Rc::clone(&store.writes);
+            let deletes = Rc::clone(&store.deletes);
+            let mut manager = match clock_ms {
+                Some(clock_ms) => fake_manager_with_clock(
+                    store,
+                    FakeTransport::new([]),
+                    Rc::new(Cell::new(clock_ms)),
+                    authorizer(),
+                ),
+                None => CredentialManager::with_dependencies(
+                    CLIENT_ID,
+                    Box::new(store),
+                    Box::new(FakeTransport::new([])),
+                    Box::new(FailingClock),
+                    Box::new(FakeLock),
+                    Box::new(authorizer()),
+                ),
+            };
 
-        assert_status_without_mutation(
-            &mut manager,
-            CredentialStatus::ReplayPending,
-            &initial,
-            &writes,
-            &deletes,
-        );
-    }
-
-    #[test]
-    fn status_reports_reauthorization_at_exact_replay_deadline_without_mutation() {
-        let initial = replay_pending_bytes(NOW_MS, 1, false);
-        let clock = Rc::new(Cell::new(REPLAY_DEADLINE_MS));
-        let store = MemoryStore {
-            value: Some(initial.clone()),
-            ..MemoryStore::default()
-        };
-        let writes = Rc::clone(&store.writes);
-        let deletes = Rc::clone(&store.deletes);
-        let mut manager = fake_manager_with_clock(
-            store,
-            FakeTransport::new([]),
-            Rc::clone(&clock),
-            authorizer(),
-        );
-
-        assert_status_without_mutation(
-            &mut manager,
-            CredentialStatus::ReauthorizationRequired,
-            &initial,
-            &writes,
-            &deletes,
-        );
-    }
-
-    #[test]
-    fn status_reports_reauthorization_for_consumed_replay_without_mutation() {
-        let initial = replay_pending_bytes(NOW_MS, 2, true);
-        let clock = Rc::new(Cell::new(NOW_MS + 1));
-        let store = MemoryStore {
-            value: Some(initial.clone()),
-            ..MemoryStore::default()
-        };
-        let writes = Rc::clone(&store.writes);
-        let deletes = Rc::clone(&store.deletes);
-        let mut manager = fake_manager_with_clock(
-            store,
-            FakeTransport::new([]),
-            Rc::clone(&clock),
-            authorizer(),
-        );
-
-        assert_status_without_mutation(
-            &mut manager,
-            CredentialStatus::ReauthorizationRequired,
-            &initial,
-            &writes,
-            &deletes,
-        );
-    }
-
-    #[test]
-    fn status_reports_unavailable_for_replay_clock_rollback_without_mutation() {
-        let initial = replay_pending_bytes(NOW_MS, 1, false);
-        let clock = Rc::new(Cell::new(NOW_MS - 1));
-        let store = MemoryStore {
-            value: Some(initial.clone()),
-            ..MemoryStore::default()
-        };
-        let writes = Rc::clone(&store.writes);
-        let deletes = Rc::clone(&store.deletes);
-        let mut manager = fake_manager_with_clock(
-            store,
-            FakeTransport::new([]),
-            Rc::clone(&clock),
-            authorizer(),
-        );
-
-        assert_status_without_mutation(
-            &mut manager,
-            CredentialStatus::Unavailable,
-            &initial,
-            &writes,
-            &deletes,
-        );
-    }
-
-    #[test]
-    fn status_reports_unavailable_when_replay_clock_fails_without_mutation() {
-        let initial = replay_pending_bytes(NOW_MS, 1, false);
-        let store = MemoryStore {
-            value: Some(initial.clone()),
-            ..MemoryStore::default()
-        };
-        let writes = Rc::clone(&store.writes);
-        let deletes = Rc::clone(&store.deletes);
-        let mut manager = CredentialManager::with_dependencies(
-            CLIENT_ID,
-            Box::new(store),
-            Box::new(FakeTransport::new([])),
-            Box::new(FailingClock),
-            Box::new(FakeLock),
-            Box::new(authorizer()),
-        );
-
-        assert_status_without_mutation(
-            &mut manager,
-            CredentialStatus::Unavailable,
-            &initial,
-            &writes,
-            &deletes,
-        );
+            assert_status_without_mutation(&mut manager, expected, &initial, &writes, &deletes);
+        }
     }
 
     #[test]
@@ -2302,22 +2226,76 @@ mod tests {
     }
 
     #[test]
+    fn first_refresh_clock_failure_retains_unconsumed_replay() {
+        let pending =
+            replay_pending_bytes_with_revision_and_expiry(2, NOW_MS, 1, false, EXPIRED_AT_MS);
+        let store = MemoryStore {
+            value: Some(ready_bytes(1, EXPIRED_AT_MS)),
+            ..MemoryStore::default()
+        };
+        let deletes = Rc::clone(&store.deletes);
+        let transport = FakeTransport::new([FakeOutcome::Response(token_response(
+            NEW_ACCESS,
+            NEW_REFRESH,
+            60,
+        ))]);
+        let revokes = Rc::clone(&transport.revokes);
+        let mut manager = CredentialManager::with_dependencies(
+            CLIENT_ID,
+            Box::new(store),
+            Box::new(transport),
+            Box::new(FailAfterFirstClock {
+                now: NOW_MS,
+                calls: Rc::new(Cell::new(0)),
+            }),
+            Box::new(FakeLock),
+            Box::new(authorizer()),
+        );
+
+        assert_eq!(
+            manager.with_access_token(|_| ()),
+            Err(CredentialError::ClockRollback)
+        );
+        assert_eq!(
+            manager
+                .load_record()
+                .expect("record")
+                .expect("record")
+                .bytes,
+            pending
+        );
+        assert_eq!(manager.logout(true), Err(CredentialError::PendingLifecycle));
+        assert_eq!(revokes.get(), 0);
+        assert_eq!(deletes.get(), 0);
+    }
+
+    #[test]
     fn no_response_retains_replay_pending_and_never_serves_old_access() {
         let initial = ready_bytes(1, EXPIRED_AT_MS);
-        let mut manager = fake_manager(
-            MemoryStore {
-                value: Some(initial),
-                ..MemoryStore::default()
-            },
-            FakeTransport::new([FakeOutcome::NoResponse]),
-            NOW_MS,
-            authorizer(),
-        );
+        let store = MemoryStore {
+            value: Some(initial),
+            ..MemoryStore::default()
+        };
+        let deletes = Rc::clone(&store.deletes);
+        let transport = FakeTransport::new([FakeOutcome::NoResponse]);
+        let revokes = Rc::clone(&transport.revokes);
+        let mut manager = fake_manager(store, transport, NOW_MS, authorizer());
         assert_eq!(
             manager.with_access_token(|_| ()),
             Err(CredentialError::RefreshAmbiguous)
         );
         assert_eq!(manager.status(), CredentialStatus::ReplayPending);
+        assert_eq!(
+            manager
+                .load_record()
+                .expect("record")
+                .expect("record")
+                .bytes,
+            replay_pending_bytes_with_revision_and_expiry(2, NOW_MS, 1, false, EXPIRED_AT_MS)
+        );
+        assert_eq!(manager.logout(true), Err(CredentialError::PendingLifecycle));
+        assert_eq!(revokes.get(), 0);
+        assert_eq!(deletes.get(), 0);
     }
 
     #[test]
@@ -2362,15 +2340,14 @@ mod tests {
         let clock = Rc::new(Cell::new(NOW_MS));
         let transport = FakeTransport::new([FakeOutcome::NoResponse, FakeOutcome::NoResponse]);
         let calls = Rc::clone(&transport.refreshes);
-        let mut manager = fake_manager_with_clock(
-            MemoryStore {
-                value: Some(ready_bytes(1, EXPIRED_AT_MS)),
-                ..MemoryStore::default()
-            },
-            transport,
-            Rc::clone(&clock),
-            authorizer(),
-        );
+        let revokes = Rc::clone(&transport.revokes);
+        let store = MemoryStore {
+            value: Some(ready_bytes(1, EXPIRED_AT_MS)),
+            ..MemoryStore::default()
+        };
+        let deletes = Rc::clone(&store.deletes);
+        let mut manager =
+            fake_manager_with_clock(store, transport, Rc::clone(&clock), authorizer());
         assert_eq!(
             manager.with_access_token(|_| ()),
             Err(CredentialError::RefreshAmbiguous)
@@ -2382,62 +2359,147 @@ mod tests {
         );
         assert_eq!(calls.get(), 2);
         assert_eq!(
+            manager
+                .load_record()
+                .expect("record")
+                .expect("record")
+                .bytes,
+            replay_pending_bytes_with_revision_and_expiry(3, NOW_MS, 2, true, EXPIRED_AT_MS)
+        );
+        assert_eq!(
             manager.with_access_token(|_| ()),
-            Err(CredentialError::NotReady)
+            Err(CredentialError::ReplayConsumed)
         );
         assert_eq!(calls.get(), 2);
+        assert_eq!(manager.logout(true), Err(CredentialError::PendingLifecycle));
+        assert_eq!(revokes.get(), 0);
+        assert_eq!(deletes.get(), 0);
         assert_eq!(manager.status(), CredentialStatus::ReauthorizationRequired);
     }
 
     #[test]
-    fn clock_rollback_transitions_to_reauthorization_without_a_replay_send() {
+    fn clock_rollback_retains_replay_pending_without_a_replay_send() {
         let clock = Rc::new(Cell::new(NOW_MS));
         let transport = FakeTransport::new([FakeOutcome::NoResponse]);
         let calls = Rc::clone(&transport.refreshes);
-        let mut manager = fake_manager_with_clock(
-            MemoryStore {
-                value: Some(ready_bytes(1, EXPIRED_AT_MS)),
-                ..MemoryStore::default()
-            },
-            transport,
-            Rc::clone(&clock),
-            authorizer(),
-        );
+        let revokes = Rc::clone(&transport.revokes);
+        let store = MemoryStore {
+            value: Some(ready_bytes(1, EXPIRED_AT_MS)),
+            ..MemoryStore::default()
+        };
+        let deletes = Rc::clone(&store.deletes);
+        let mut manager =
+            fake_manager_with_clock(store, transport, Rc::clone(&clock), authorizer());
         assert_eq!(
             manager.with_access_token(|_| ()),
             Err(CredentialError::RefreshAmbiguous)
         );
+        let pending =
+            replay_pending_bytes_with_revision_and_expiry(2, NOW_MS, 1, false, EXPIRED_AT_MS);
         clock.set(NOW_MS - 1);
         assert_eq!(
             manager.with_access_token(|_| ()),
             Err(CredentialError::ClockRollback)
         );
         assert_eq!(calls.get(), 1);
+        assert_eq!(
+            manager
+                .load_record()
+                .expect("record")
+                .expect("record")
+                .bytes,
+            pending
+        );
+        assert_eq!(manager.status(), CredentialStatus::Unavailable);
+        assert_eq!(manager.logout(true), Err(CredentialError::PendingLifecycle));
+        assert_eq!(revokes.get(), 0);
+        assert_eq!(deletes.get(), 0);
+    }
+
+    #[test]
+    fn expired_replay_retains_exact_pending_bytes_without_side_effects() {
+        let pending = replay_pending_bytes_with_revision(2, NOW_MS, 1, false);
+        let store = MemoryStore {
+            value: Some(pending.clone()),
+            ..MemoryStore::default()
+        };
+        let deletes = Rc::clone(&store.deletes);
+        let transport = FakeTransport::new([]);
+        let revokes = Rc::clone(&transport.revokes);
+        let mut manager = fake_manager_with_clock(
+            store,
+            transport,
+            Rc::new(Cell::new(REPLAY_DEADLINE_MS)),
+            authorizer(),
+        );
+
+        assert_eq!(
+            manager.with_access_token(|_| ()),
+            Err(CredentialError::ReplayExpired)
+        );
+        assert_eq!(
+            manager
+                .load_record()
+                .expect("record")
+                .expect("record")
+                .bytes,
+            pending
+        );
+        assert_eq!(manager.logout(true), Err(CredentialError::PendingLifecycle));
+        assert_eq!(revokes.get(), 0);
+        assert_eq!(deletes.get(), 0);
         assert_eq!(manager.status(), CredentialStatus::ReauthorizationRequired);
     }
 
     #[test]
-    fn definitive_or_malformed_refresh_response_requires_reauthorization() {
+    fn invalid_first_refresh_response_retains_one_replay_and_can_recover() {
         for outcome in [
             FakeOutcome::Response(ProviderResponse::synthetic(400, b"{}").expect("response")),
             FakeOutcome::Response(
                 ProviderResponse::synthetic(200, br#"{"unexpected":true}"#).expect("response"),
             ),
+            FakeOutcome::Response(token_response(NEW_ACCESS, NEW_REFRESH, u64::MAX)),
         ] {
-            let mut manager = fake_manager(
-                MemoryStore {
-                    value: Some(ready_bytes(1, EXPIRED_AT_MS)),
-                    ..MemoryStore::default()
-                },
-                FakeTransport::new([outcome]),
-                NOW_MS,
-                authorizer(),
-            );
+            let store = MemoryStore {
+                value: Some(ready_bytes(1, EXPIRED_AT_MS)),
+                ..MemoryStore::default()
+            };
+            let deletes = Rc::clone(&store.deletes);
+            let transport = FakeTransport::new([
+                outcome,
+                FakeOutcome::Response(token_response(NEW_ACCESS, NEW_REFRESH, 60)),
+            ]);
+            let refreshes = Rc::clone(&transport.refreshes);
+            let revokes = Rc::clone(&transport.revokes);
+            let clock = Rc::new(Cell::new(NOW_MS));
+            let mut manager =
+                fake_manager_with_clock(store, transport, Rc::clone(&clock), authorizer());
             assert_eq!(
                 manager.with_access_token(|_| ()),
-                Err(CredentialError::ReauthorizationRequired)
+                Err(CredentialError::RefreshAmbiguous)
             );
-            assert_eq!(manager.status(), CredentialStatus::ReauthorizationRequired);
+            assert_eq!(manager.status(), CredentialStatus::ReplayPending);
+            assert_eq!(
+                manager
+                    .load_record()
+                    .expect("record")
+                    .expect("record")
+                    .bytes,
+                replay_pending_bytes_with_revision_and_expiry(2, NOW_MS, 1, false, EXPIRED_AT_MS)
+            );
+            assert_eq!(manager.logout(true), Err(CredentialError::PendingLifecycle));
+            assert_eq!(revokes.get(), 0);
+            assert_eq!(deletes.get(), 0);
+
+            clock.set(NOW_MS + 1);
+            assert_eq!(
+                manager.with_access_token(|token| token.to_owned()),
+                Ok(NEW_ACCESS.to_owned())
+            );
+            assert_eq!(refreshes.get(), 2);
+            assert_eq!(manager.status(), CredentialStatus::Ready);
+            assert_eq!(revokes.get(), 0);
+            assert_eq!(deletes.get(), 0);
         }
     }
 
