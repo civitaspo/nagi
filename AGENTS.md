@@ -45,6 +45,12 @@ The Rust tasks skip project commands until `Cargo.toml` exists. This keeps the f
 - When the Temporal Rust SDK is introduced, use the exact crates.io `temporalio-sdk = "=0.7.0"` dependency and commit the resulting `Cargo.lock`; do not add an unused Git dependency.
 - The Aqua Codex pin is only for the contract toolchain. The managed `CODEX_HOME` login and App Server layout are separate decisions for later pull requests.
 
+## Linear OAuth boundary
+
+- The P0-03 OAuth implementation is the library operation in `nagi::linear::oauth`; it returns a validated in-memory token bundle and is not a CLI persistence or refresh flow.
+- Keep the Linear OAuth endpoints, `actor=app`, `scope=read`, PKCE S256, and loopback callback shape fixed. Only the client identifier and numeric callback port may come from local configuration; never add a client secret, PAT fallback, or provider-data call to this boundary.
+- Browser, clock, callback listener, entropy, and token transport effects remain injectable so tests stay hermetic. Keychain persistence and later token or actor operations belong to their separately scoped implementation changes.
+
 ## GitHub Actions and credentials
 
 - Pin every GitHub Action to an immutable commit SHA and keep `persist-credentials: false` on checkout steps.
