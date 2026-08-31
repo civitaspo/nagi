@@ -38,7 +38,3 @@ The app has a stable, explicit actor identity for later provider-facing operatio
 - **Public OAuth app or embedded client secret:** rejected because Phase 0 must use a private app without distributing a secret.
 - **Silent user-actor fallback:** rejected because an authorization success with the wrong actor is not equivalent to the requested security boundary.
 - **Public callback or relay:** rejected because it expands the trust boundary and is unnecessary for a local operator.
-
-## Acceptance checks
-
-The Phase 0 authentication gate must demonstrate, with sanitized evidence, successful S256 authorization, state and verifier validation, callback expiry and replay rejection, read-only scope enforcement, Keychain-only token handling, app-actor confirmation, and fail-closed behavior for actor mismatch. The evidence must reference the exact revision tested and must contain none of the prohibited identifiers, credentials, client IDs, or raw provider payloads described in [Phase 0](../phase-zero.md).

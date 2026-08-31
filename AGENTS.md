@@ -19,7 +19,7 @@ Nagi is a local-first work execution system for Linear and Codex. The repository
 - Before editing, check the worktree branch and status. Preserve unrelated user changes and keep the pull request branch based on an explicit base commit.
 - Review evidence, check results, comments, and workflow messages must be in English. Evidence must identify the exact commit SHA that was reviewed and checked.
 - Require both a current-SHA adversarial review and a current-SHA ponytail review against the same SHA. Treat either review as stale when the branch changes; rerun both reviews and the required checks for the new SHA.
-- Use this lifecycle: create a signed commit, run the required checks on that commit, complete both current-SHA reviews, verify that the reviewed SHA is still current, and merge only through the protected pull-request flow with a signed source commit and verified merge record. Do not amend or rewrite a commit after it has been reviewed or shared.
+- Changes after review require a new signed commit and fresh checks; never amend or rewrite the reviewed or shared commit.
 - A release pull request must state its base and release SHAs and must not duplicate an active implementation pull request. If the release pull request overlaps an active change, pause it, reconcile it with the current base, and rerun checks and both reviews before merging.
 - After a pull request is merged or closed, clean up only its exact worktree and temporary artifacts after confirming the path, branch, status, and preserved evidence. Never use broad globs or a repository/home root for cleanup, and never remove credentials, shared state, or review evidence as part of cleanup.
 
