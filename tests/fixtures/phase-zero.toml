@@ -1,0 +1,6 @@
+schema_version = 1
+fixture = "synthetic.phase-zero.v1"
+provenance = "synthetic"
+sensitivity = "non-company"
+purpose = "contract-boundary"
+layers = ["hermetic", "macos-preflight", "live-preflight"]

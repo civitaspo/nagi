@@ -38,15 +38,15 @@ jobs:
 
       - name: Run Clippy
         if: hashFiles('Cargo.toml') != ''
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Build
         if: hashFiles('Cargo.toml') != ''
-        run: cargo build --workspace
+        run: cargo build --workspace --locked
 
       - name: Test
         if: hashFiles('Cargo.toml') != ''
-        run: cargo test --workspace
+        run: mise run test
 
       - name: Skip until Rust manifest exists
         if: hashFiles('Cargo.toml') == ''
