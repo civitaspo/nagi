@@ -4,18 +4,16 @@ Phase 0 is a time-boxed contract spike. It validates the external and security-s
 
 ## Scope
 
-Phase 0 does not require a separate test workspace. It runs in an explicitly approved scope of the operator-specified target Linear workspace and team, using a dedicated, pre-created synthetic setup issue. Live access uses exact locally supplied IDs only and is limited to exact-ID reads of that issue plus bounded pagination over its synthetic comments and fixture graph. The spike must not enumerate or poll workspace/team issue collections, discover identifiers, read existing issue bodies, or access existing provider records. The setup issue and every other touched record must be synthetic and non-sensitive; company data and production credentials remain outside Phase 0.
-
 The spike covers:
 
-- Linear access through the OAuth decision in [ADR-0001](adr/0001-linear-oauth-pkce.md). Live reads are limited to the approved synthetic setup issue addressed by exact supplied IDs and bounded pagination over its synthetic comments and fixture graph. The only allowed returned fields are opaque IDs, update timestamps, `pageInfo`, and redacted content presence or digests; raw content is never included in public evidence. Workspace/team issue collection polling, inclusive watermark and overlap, archive/not-found behavior, broad pagination, rate limits, malformed responses, and cancellation are hermetic synthetic-provider tests only, never enumeration of existing provider records.
+- Linear access through the OAuth decision in [ADR-0001](adr/0001-linear-oauth-pkce.md). A separate test workspace is not required: live access runs only in an explicitly approved scope of the operator-specified target Linear workspace and team, using a dedicated, pre-created synthetic setup issue addressed by exact locally supplied IDs. Live reads are limited to that issue and bounded pagination over its synthetic comments and fixture graph. The only allowed returned fields are opaque IDs, update timestamps, `pageInfo`, and redacted content presence or digests; raw content is never included in public evidence. Workspace/team issue collection polling, identifier discovery, existing issue-body reads, inclusive watermark and overlap, archive/not-found behavior, broad pagination, rate limits, malformed responses, and cancellation are hermetic synthetic-provider tests only, never enumeration of existing provider records. The setup issue, all touched records, and the fixture repository must be synthetic and non-sensitive; company data, existing records, and production credentials remain outside Phase 0.
 - Temporal behavior required by the workflow design: replay, Signal-With-Start, Update validation and handling, Query, heartbeat, cancellation, Continue-As-New, process-kill recovery, history persistence, and separation of Temporal and Nagi state.
 - Codex App Server behavior: thread start and resume, status events, notification gaps, interruption, approval requests, output schemas, restart behavior, and the runner/process boundary.
 - `nagi watch` as the operator surface: initial snapshot, live updates, stale-state display, interruption, and reconnect. Operation must remain possible without a native Codex Desktop sidebar.
 - Crash and boundary behavior: guardian liveness, safe shutdown, duplicate-open prevention, validator and App Server process isolation, and rejection of filesystem, network, credential, or sandbox escapes.
 - Release trust controls: signed manifest, nested code signing, notarization, Keychain access control, and encrypted input snapshots, using test material only.
 
-No provider write, production dispatch, Git push, or company-data execution is part of this spike. If a setup issue is needed, it is provisioned out of band; the spike itself does not create or modify it. Any write-enabled or broader-scope experiment requires a later, separately approved decision.
+No provider domain-data mutation, production dispatch, Git push, or company-data execution is part of this spike. OAuth authorization, app installation, token issuance, token refresh, and token revocation are the only permitted provider control-plane mutations in Phase 0; Issue, Comment, and all other domain-data writes remain forbidden. If a setup issue is needed, it is provisioned out of band; the spike itself does not create or modify it. Any broader-scope experiment requires a later, separately approved decision.
 
 ## Go/no-go gates
 
@@ -28,12 +26,10 @@ Each gate produces a short, reproducible, sanitized evidence record tied to the 
 | Temporal contract | The required workflow operations replay and recover after interruption or process termination without losing durable state or crossing database boundaries. | No-go for workflow implementation. |
 | Codex contract | App Server start/resume, events, gaps, interruption, approvals, output validation, restart, and sandbox boundaries meet the pinned contract. | No-go for Codex execution. |
 | Operator surface | `nagi watch` can observe and control the test run, recover a stale view, and reconnect without relying on Desktop. | No-go for operator workflow. |
-| Safety and privacy | Fault injection leaves no unverified external write and exposes no secret in argv, environment, logs, crash reports, Temporal payloads, prompts, worktrees, or evidence. Access and refresh tokens may exist only in bounded in-process memory and TLS-protected typed-adapter requests, then are zeroized and dropped; no escape to disallowed resources is permitted. | No-go; retain only redacted evidence. |
+| Safety and privacy | Fault injection leaves no unverified external write and proves no secret reaches argv, environment, logs, crash reports, Temporal payloads, prompts, worktrees, or evidence. Access and refresh tokens have bounded in-process lifetimes; application-owned secret buffers are zeroized where supported. Tests prove tokens never reach those observable channels; the contract does not claim zeroization of HTTP/TLS/OS copies outside application control. No escape to disallowed resources is permitted. | No-go; retain only redacted evidence. |
 | Release trust | Signing, Keychain access control, encrypted snapshots, and release-manifest checks pass on the supported test host. | No-go for a trusted release. |
 
 All mandatory gates must pass on the same current revision for **go**. A failed, missing, or ambiguous gate is **no-go**. No-go means implementation and company-data access remain blocked; the failure is corrected and the entire affected gate set is rerun against the new current SHA.
-
-Native Codex Desktop sidebar integration is optional while `nagi watch` is sufficient. If the sidebar becomes a non-negotiable requirement, it becomes an additional mandatory gate and must pass before implementation starts.
 
 ## Public repository and evidence handling
 
