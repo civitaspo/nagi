@@ -204,21 +204,14 @@ impl GraphqlRequest {
         setup_issue_id: &str,
         after: Option<&str>,
     ) -> Result<Self, ReadContractError> {
-        Self::new(
-            READ_QUERY,
-            serde_json::json!({
+        let body = serde_json::to_vec(&serde_json::json!({
+            "query": READ_QUERY,
+            "variables": {
                 "teamId": team_id,
                 "issueId": setup_issue_id,
                 "commentFirst": COMMENT_PAGE_SIZE,
                 "commentAfter": after,
-            }),
-        )
-    }
-
-    fn new(query: &str, variables: serde_json::Value) -> Result<Self, ReadContractError> {
-        let body = serde_json::to_vec(&serde_json::json!({
-            "query": query,
-            "variables": variables,
+            },
         }))
         .map_err(|_| ReadContractError::Configuration)?;
         Ok(Self {
@@ -518,7 +511,6 @@ impl<'de> Deserialize<'de> for GraphqlErrorsPresence {
 struct GraphqlEnvelope<T> {
     data: Option<T>,
     #[serde(default)]
-    #[serde(rename = "errors")]
     errors: GraphqlErrorsPresence,
     /// GraphQL permits implementation-specific top-level extensions. They
     /// are intentionally ignored after the closed data shape is parsed.
