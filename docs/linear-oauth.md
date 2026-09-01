@@ -129,8 +129,9 @@ are still included when Linear represents them with a null `parentId`; no
 `quotedText` field is retained or needed. Each edge is checked for its cursor,
 comment ID, issue ID, update timestamp, and top-level `parentId`. Pagination
 stops only on a verified `hasNextPage=false` page after observing a bounded
-cursor transition; final-page cursor inconsistencies and any cursor rewind or
-cycle fail closed. The documented global request and complexity rate-limit
+cursor transition; a missing end cursor is invalid only when `hasNextPage=true`,
+while final-page cursor inconsistencies and any cursor rewind or cycle fail
+closed. The documented global request and complexity rate-limit
 headers must be present exactly once and contain bounded unsigned values.
 Descriptions and comment bodies are reduced to non-whitespace presence bits and
 are not returned, logged, or persisted.

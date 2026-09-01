@@ -704,7 +704,6 @@ fn verify_read(
         if !page.has_next_page {
             if after.is_none()
                 || page.last_edge_cursor.is_none()
-                || page.end_cursor.is_none()
                 || seen_cursors.len() < 2
                 || seen_comment_ids.len() < 2
             {
@@ -1357,6 +1356,58 @@ mod tests {
         assert!(!first.contains("issues"));
         assert!(!first.contains("mutation"));
         assert!(!first.contains(ACCESS));
+    }
+
+    #[test]
+    fn verifier_accepts_null_end_cursor_on_non_empty_terminal_page() {
+        let mut transport = FakeTransport::new([
+            response(scope_response_with_comment_id(
+                "synthetic-app",
+                true,
+                true,
+                ISSUE,
+                TEAM,
+                WORKSPACE,
+                TEAM,
+                WORKSPACE,
+                true,
+                "cursor-one",
+                Some("cursor-one"),
+                "synthetic-comment-one",
+            )),
+            response(scope_response_with_comment_id(
+                "synthetic-app",
+                true,
+                true,
+                ISSUE,
+                TEAM,
+                WORKSPACE,
+                TEAM,
+                WORKSPACE,
+                true,
+                "cursor-two",
+                Some("cursor-two"),
+                "synthetic-comment-two",
+            )),
+            response(scope_response_with_comment_id(
+                "synthetic-app",
+                true,
+                true,
+                ISSUE,
+                TEAM,
+                WORKSPACE,
+                TEAM,
+                WORKSPACE,
+                false,
+                "cursor-three",
+                None,
+                "synthetic-comment-three",
+            )),
+        ]);
+        verify_read(&mut transport, ACCESS, &config()).expect("contract");
+        assert_eq!(transport.requests.len(), 3);
+        let third = String::from_utf8_lossy(&transport.requests[2]);
+        assert!(third.contains("\"commentAfter\":\"cursor-two\""));
     }
 
     #[test]
