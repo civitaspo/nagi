@@ -50,6 +50,7 @@ The Rust tasks skip project commands until `Cargo.toml` exists. This keeps the f
 - The P0-03 OAuth implementation is the library operation in `nagi::linear::oauth`; it returns a validated in-memory token bundle and is not a CLI persistence or refresh flow.
 - Keep the Linear OAuth endpoints, `actor=app`, `scope=read`, PKCE S256, and loopback callback shape fixed. Only the client identifier and numeric callback port may come from local configuration; never add a client secret, PAT fallback, or provider-data call to this boundary.
 - Browser, clock, callback listener, entropy, and token transport effects remain injectable so tests stay hermetic. Keychain persistence and later token or actor operations belong to their separately scoped implementation changes.
+- P0-04 credential state is one strict bounded envelope in the macOS data-protection Keychain at fixed generic-password service/account selectors, with `kSecAttrSynchronizable=false` and no access group. Persisted lifecycle timestamps use Unix epoch milliseconds. Refresh/revoke intent transitions are persisted and verified while holding the process/advisory lock; uncertain outcomes remain blocked and are never silently retried. The Keychain is selector-based rather than transactional CAS, and Security.framework copies cannot be promised zeroized. Linux returns a typed unsupported result without touching local state.
 
 ## GitHub Actions and credentials
 

@@ -793,6 +793,50 @@ impl TokenBundle {
     pub fn expires_in(&self) -> Duration {
         self.expires_in
     }
+
+    /// Consumes the validated bundle for the credential manager.
+    ///
+    /// This is intentionally crate-private: the persistence boundary may move
+    /// the zeroizing buffers into its own envelope, while callers outside the
+    /// crate never receive raw token strings.
+    pub(crate) fn into_credential_parts(self) -> (Zeroizing<String>, Zeroizing<String>, Duration) {
+        let Self {
+            access_token,
+            refresh_token,
+            expires_in,
+        } = self;
+        (access_token.0, refresh_token.0, expires_in)
+    }
+
+    /// Constructs a bundle after a crate-internal response validator has
+    /// checked both token values and the positive lifetime.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the credential refresh response parser is the future token-lease consumer"
+        )
+    )]
+    pub(crate) fn from_credential_parts(
+        access_token: Zeroizing<String>,
+        refresh_token: Zeroizing<String>,
+        expires_in: Duration,
+    ) -> Self {
+        Self {
+            access_token: Secret::new(access_token.to_string()),
+            refresh_token: Secret::new(refresh_token.to_string()),
+            expires_in,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn synthetic(
+        access_token: Zeroizing<String>,
+        refresh_token: Zeroizing<String>,
+        expires_in: Duration,
+    ) -> Self {
+        Self::from_credential_parts(access_token, refresh_token, expires_in)
+    }
 }
 
 impl fmt::Debug for TokenBundle {
