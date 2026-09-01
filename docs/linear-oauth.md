@@ -37,15 +37,22 @@ required state; confirmed logout and local deletion must finish first.
 
 On macOS the envelope is stored as one generic-password item selected by the
 fixed service `dev.nagi.linear.oauth.v1` and account `default`. The
-Security.framework password options explicitly select the data-protection
-Keychain and `kSecAttrSynchronizable=false`; no access group is supplied. The
-implementation does not use the convenience APIs that default to the legacy
-file Keychain. Linux returns a typed unsupported-platform result without
-touching a store or path.
+implementation uses `SecItemAdd`, `SecItemCopyMatching`, `SecItemUpdate`, and
+`SecItemDelete` through the Security.framework item API. It pins each
+operation to the user's default file-based Keychain (normally the login
+Keychain), while omitting the data-protection selector, synchronizable
+attribute, and access-group attributes. Pinning each query to a file-based
+Keychain excludes synchronized items, so an explicit false synchronizable
+selector is unnecessary. This is compatible with one pure
+standalone executable: there is no `.app` wrapper, provisioning-profile
+dependency, restricted entitlement, or memory-only persistence fallback. The
+same selectors are reread after a restart, so the envelope remains durable in
+the selected Keychain. Linux returns a typed unsupported-platform result
+without touching a store or path.
 
 Access acquisition holds an in-process mutex and a mode-0600 advisory lock in
-the mode-0700 `~/Library/Application Support/Nagi` directory across reread,
-state transition, provider request, and post-write verification. A refresh
+a mode-0700 user-owned application-support directory across reread, state
+transition, provider request, and post-write verification. A refresh
 intent is durable before its first possible send. Linear's documented refresh
 contract uses `POST https://api.linear.app/oauth/token` with only
 `grant_type=refresh_token`, `refresh_token`, and `client_id`. The manager
@@ -85,9 +92,18 @@ so `actor=app` is treated as authorization-request metadata; the bundle does
 not claim a verified actor identity. Identity lookup belongs to a later provider
 operation.
 
-The Keychain implementation follows Apple's [TN3137: On Mac Keychains](https://developer.apple.com/documentation/technotes/tn3137-on-mac-keychains),
-[generic-password item contract](https://developer.apple.com/documentation/security/ksecclassgenericpassword),
-and [data-protection Keychain selector](https://developer.apple.com/documentation/security/ksecusedataprotectionkeychain).
+The Keychain implementation follows Apple's [TN3137: On Mac Keychains](https://developer.apple.com/documentation/technotes/tn3137-on-mac-keychains)
+and [generic-password item contract](https://developer.apple.com/documentation/security/ksecclassgenericpassword).
+The code-signing and provisioning terminology follows [TN3125: Inside Code Signing: Provisioning Profiles](https://developer.apple.com/library/archive/technotes/tn3125/_index.html),
+but this standalone phase does not require a provisioning profile.
+The older file-based Keychain uses its ACL/shim model rather than an explicit
+application access group and is an older macOS-only path on the road to
+deprecation. A creating caller is generally trusted under that model; there
+is therefore no claim of app-group isolation in this phase. Persistence
+across restart assumes the same default Keychain remains selected. Release
+updates and noninteractive access can depend on a stable code-signing
+designated requirement and an unlocked Keychain; a changed or unrecognized
+identity may prompt or fail. Stronger identity and ACL proof is a later gate.
 Security.framework copies data into and out of process memory; the zeroizing
 buffers reduce lifetime in application-owned buffers but cannot promise
 zeroization of framework copies. The Keychain update/delete operations are
@@ -97,14 +113,15 @@ cooperating Nagi processes only; a non-cooperating process can still change the
 Keychain item.
 
 The default test suite is credential-free, browser-free, provider-free, and
-Keychain-free. An ignored Darwin-only test uses a unique synthetic locator and
-is available through the opt-in `scripts/contracts/macos.sh` contract command.
-If the host has no usable data-protection Keychain, the opt-in test reports a
-visible `SKIP` with only a nonsecret OSStatus; that result is not proof of a
-round trip. Whenever its synthetic write completes, it requires exact deletion
-followed by an absence check. The current unsigned/ad-hoc Cargo test binary
-reports a missing-signing-boundary `SKIP` before any Keychain mutation; signed
-entitlement proof is owned by P0-18/P0-19.
+Keychain-free. An ignored Darwin-only test uses a unique synthetic locator,
+spawns fresh test processes for write/read, and then requires exact deletion
+followed by an absence check. It is available through the opt-in
+`scripts/contracts/macos.sh` contract command. If the host has no usable
+default file-based Keychain, an explicit request fails closed; only an unset
+contract layer is allowed to skip. The contract does not inspect signing
+entitlements or require a provisioning profile. No access or refresh token is
+written to logs, SQLite, prompts,
+worktrees, or public evidence; diagnostics remain coarse and redacted.
 
 ## Deliberate residuals and later boundaries
 
@@ -114,7 +131,10 @@ that was never durably recorded. An ambiguous revoke remains blocked because
 Linear does not document an idempotent or already-revoked success signal, so
 the lifecycle performs neither automatic retry nor destructive recovery.
 
-ACL and designated-requirement validation are intentionally gated by P0-19.
-Sandbox and same-UID containment are intentionally gated by P0-17. P0-04
-coordinates cooperating same-UID processes with its advisory lock, but makes
-no claim that those later boundaries are complete.
+There is no automatic migration from a data-protection item to the file-based
+Keychain in this correction. The earlier selector was not deployed for a real
+credential, so no production record is silently moved or revoked. ACL and
+designated-requirement validation are intentionally gated by a later release
+trust decision. Sandbox and same-UID containment are intentionally gated by a
+later boundary. P0-04 coordinates cooperating same-UID processes with its
+advisory lock, but makes no claim that those later boundaries are complete.
