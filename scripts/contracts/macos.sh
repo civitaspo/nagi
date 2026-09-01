@@ -16,5 +16,5 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "Running the ignored synthetic macOS Keychain contract; no provider or production locator is used." >&2
-cargo test --workspace --locked --all-features macos_keychain_round_trip_uses_only_a_synthetic_locator -- --ignored --nocapture
+echo "Running the ignored synthetic standalone-executable Keychain contract; fresh nagi processes verify restart persistence and no provider or production locator is used." >&2
+cargo test -p nagi --locked --features macos-keychain-contract --test macos_keychain_contract macos_keychain_round_trip_uses_only_a_synthetic_locator -- --ignored --nocapture

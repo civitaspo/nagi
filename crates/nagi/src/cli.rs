@@ -7,6 +7,8 @@
 use crate::linear::credentials::CredentialError;
 #[cfg(target_os = "macos")]
 use crate::linear::credentials::{CredentialManager, bounded_client_id};
+#[cfg(all(target_os = "macos", feature = "macos-keychain-contract"))]
+use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fmt;
 
@@ -50,7 +52,36 @@ enum Command {
 
 /// Runs the command using process arguments and environment configuration.
 pub fn run_from_env() -> Result<(), CliError> {
+    #[cfg(all(target_os = "macos", feature = "macos-keychain-contract"))]
+    {
+        let mut arguments = std::env::args_os();
+        let _executable = arguments.next();
+        if arguments.next().as_deref() == Some(OsStr::new("__contract")) {
+            return run_macos_keychain_contract(arguments);
+        }
+    }
     run(std::env::args_os())
+}
+
+#[cfg(all(target_os = "macos", feature = "macos-keychain-contract"))]
+fn run_macos_keychain_contract<I>(mut arguments: I) -> Result<(), CliError>
+where
+    I: Iterator<Item = OsString>,
+{
+    if arguments.next().as_deref() != Some(OsStr::new("macos-keychain"))
+        || arguments.next().is_some()
+    {
+        return Err(CliError::Usage);
+    }
+    if std::env::var("NAGI_CONTRACT_MACOS").as_deref() != Ok("1") {
+        return Err(CliError::Configuration);
+    }
+    let service =
+        std::env::var("NAGI_KEYCHAIN_CONTRACT_SERVICE").map_err(|_| CliError::Configuration)?;
+    let phase =
+        std::env::var("NAGI_KEYCHAIN_CONTRACT_PHASE").map_err(|_| CliError::Configuration)?;
+    crate::linear::credentials::run_macos_keychain_contract_phase(&service, &phase)
+        .map_err(CliError::Credential)
 }
 
 /// Runs one closed command sequence. The first argument is the executable

@@ -448,14 +448,23 @@ fn macos_preflight_is_opt_in_and_platform_gated() {
     assert_eq!(skip.status.code(), Some(0));
     assert!(bytes_contain(&skip.stdout, b"SKIP"));
 
-    let explicit = command_output(MACOS_SCRIPT, &[("NAGI_CONTRACT_MACOS", "1")]);
+    if !cfg!(target_os = "macos") {
+        let explicit = command_output(MACOS_SCRIPT, &[("NAGI_CONTRACT_MACOS", "1")]);
+        assert_eq!(explicit.status.code(), Some(2));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn standalone_binary_is_a_single_plain_executable() {
+    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_nagi"));
+    assert!(executable.is_file());
+    let executable_text = executable.to_string_lossy().to_ascii_lowercase();
+    assert!(!executable_text.contains(".app"));
+    assert!(!executable_text.contains("/contents/"));
     assert_eq!(
-        explicit.status.code(),
-        if cfg!(target_os = "macos") {
-            Some(1)
-        } else {
-            Some(2)
-        }
+        executable.file_name().and_then(|name| name.to_str()),
+        Some("nagi")
     );
 }
 
