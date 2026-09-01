@@ -59,8 +59,8 @@ transition to a ready bundle only after an exact reread of those retained
 bytes; a replacement or read ambiguity returns `StorageUncertain` without
 adopting, overwriting, or deleting the replacement. Linear's documented
 refresh contract uses `POST https://api.linear.app/oauth/token` with only
-`grant_type=refresh_token`, `refresh_token`, and `client_id`. The manager
-keeps the old bundle on an ambiguous response and permits one byte-for-byte
+`grant_type=refresh_token`, `refresh_token`, and `client_id`. The manager keeps
+the old bundle on an ambiguous response and permits one byte-for-byte
 replay only while `now_ms < first_send_at_ms + 1,800,000`; the exact deadline
 is excluded. Replay consumption is durable before the replay send. Any consumed
 replay, expired grace, malformed response, or clock rollback retains the exact
@@ -69,6 +69,8 @@ force-delete state. A first non-success or invalid response, including an
 unrepresentable expiry, returns `RefreshAmbiguous` while retaining the
 unconsumed intent so its one replay remains available. A failed or invalid
 replay retains the consumed intent and requires reauthorization.
+The verified ready write returns that exact record to the caller; no later
+unconstrained read selects the token-bearing record.
 
 `status` is local classification only and never refreshes, revokes, launches a
 browser, deletes data, or prints secret-bearing values. A replay-pending record
@@ -91,6 +93,9 @@ definitively unsuccessful while those exact bytes remain, the manager may
 finish deletion after another exact reread; any other storage uncertainty
 retains the record and remains blocked. Uncertain revoke outcomes are never
 automatically retried.
+
+The verified tombstone record is passed directly to final deletion, whose
+last read must still match it exactly.
 
 The implementation follows Linear's [OAuth 2.0 authentication documentation](https://linear.app/developers/oauth-2-0-authentication)
 and [OAuth actor authorization documentation](https://linear.app/developers/oauth-actor-authorization).

@@ -213,13 +213,11 @@ fn macos_keychain_round_trip_uses_only_a_synthetic_locator() {
     let cleanup_delete_empty = cwd.is_empty();
     let cleanup_absent = run_phase(&cwd.path, &service, "absent");
     let cleanup_absent_empty = cwd.is_empty();
-    let cleanup_empty = cwd.is_empty();
     if sequence.is_err()
         || cleanup_delete.is_err()
         || cleanup_absent.is_err()
         || cleanup_delete_empty != Ok(true)
         || cleanup_absent_empty != Ok(true)
-        || cleanup_empty != Ok(true)
     {
         panic!("synthetic macOS Keychain contract failed closed");
     }
