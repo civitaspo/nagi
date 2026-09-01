@@ -535,22 +535,10 @@ fn parse_rate_limit_value(
 struct GraphqlEnvelope<T> {
     data: Option<T>,
     #[serde(default)]
-    errors: Option<Vec<GraphqlError>>,
+    errors: Option<Vec<serde::de::IgnoredAny>>,
     /// GraphQL permits implementation-specific top-level extensions. They
     /// are intentionally ignored after the closed data shape is parsed.
     #[allow(dead_code)]
-    #[serde(default)]
-    extensions: Option<serde::de::IgnoredAny>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct GraphqlError {
-    message: serde::de::IgnoredAny,
-    #[serde(default)]
-    path: Option<serde::de::IgnoredAny>,
-    #[serde(default)]
-    locations: Option<serde::de::IgnoredAny>,
     #[serde(default)]
     extensions: Option<serde::de::IgnoredAny>,
 }
@@ -693,105 +681,84 @@ fn decode<T: for<'de> Deserialize<'de>>(response: ReadResponse) -> Result<T, Rea
     }
     let envelope: GraphqlEnvelope<T> =
         serde_json::from_slice(&response.body).map_err(|_| ReadContractError::GraphqlResponse)?;
-    if let Some(errors) = envelope.errors
-        && !errors.is_empty()
-    {
-        for error in errors {
-            let GraphqlError {
-                message,
-                path,
-                locations,
-                extensions,
-            } = error;
-            let _ = (message, path, locations, extensions);
-        }
+    if envelope.errors.is_some_and(|errors| !errors.is_empty()) {
         return Err(ReadContractError::GraphqlResponse);
     }
     envelope.data.ok_or(ReadContractError::GraphqlResponse)
 }
 
-struct ReadVerifier<'a> {
-    transport: &'a mut dyn ReadTransport,
-}
-
-impl<'a> ReadVerifier<'a> {
-    fn new(transport: &'a mut dyn ReadTransport) -> Self {
-        Self { transport }
+fn verify_read(
+    transport: &mut dyn ReadTransport,
+    access_token: &str,
+    config: &ReadContractConfig,
+) -> Result<VerifiedReadOutcome, ReadContractError> {
+    if access_token.is_empty()
+        || access_token.len() > MAX_ACCESS_TOKEN_BYTES
+        || access_token.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(ReadContractError::Configuration);
     }
 
-    fn run(
-        &mut self,
-        access_token: &str,
-        config: &ReadContractConfig,
-    ) -> Result<VerifiedReadOutcome, ReadContractError> {
-        if access_token.is_empty()
-            || access_token.len() > MAX_ACCESS_TOKEN_BYTES
-            || access_token.bytes().any(|byte| byte.is_ascii_control())
+    let mut after = None;
+    let mut app_actor_id = None;
+    let mut seen_cursors = Vec::new();
+    let mut seen_comment_ids = Vec::new();
+    let mut redaction_verified = false;
+    for _ in 0..MAX_COMMENT_PAGES {
+        let previous_cursor_count = seen_cursors.len();
+        let request = GraphqlRequest::issue(
+            config.team_id.as_str(),
+            config.setup_issue_id.as_str(),
+            after.as_deref(),
+        )?;
+        let response = transport.execute(access_token, &request)?;
+        let scope: ScopeData = decode(response)?;
+        let page = validate_scope(
+            &scope,
+            config,
+            &mut app_actor_id,
+            &mut seen_cursors,
+            &mut seen_comment_ids,
+        )?;
+        redaction_verified |= page.redaction_verified;
+        if page
+            .last_edge_cursor
+            .as_deref()
+            .is_some_and(|cursor| after.as_deref() == Some(cursor))
         {
-            return Err(ReadContractError::Configuration);
+            return Err(ReadContractError::PaginationInvalid);
         }
-
-        let mut after = None;
-        let mut app_actor_id = None;
-        let mut seen_cursors = Vec::new();
-        let mut seen_comment_ids = Vec::new();
-        let mut redaction_verified = false;
-        for _ in 0..MAX_COMMENT_PAGES {
-            let previous_cursor_count = seen_cursors.len();
-            let request = GraphqlRequest::issue(
-                config.team_id.as_str(),
-                config.setup_issue_id.as_str(),
-                after.as_deref(),
-            )?;
-            let response = self.transport.execute(access_token, &request)?;
-            let scope: ScopeData = decode(response)?;
-            let page = validate_scope(
-                &scope,
-                config,
-                &mut app_actor_id,
-                &mut seen_cursors,
-                &mut seen_comment_ids,
-            )?;
-            redaction_verified |= page.redaction_verified;
-            if page
-                .last_edge_cursor
-                .as_deref()
-                .is_some_and(|cursor| after.as_deref() == Some(cursor))
+        if !page.has_next_page {
+            if after.is_none()
+                || page.last_edge_cursor.is_none()
+                || page.end_cursor.is_none()
+                || seen_cursors.len() < 2
+                || seen_comment_ids.len() < 2
             {
                 return Err(ReadContractError::PaginationInvalid);
             }
-            if !page.has_next_page {
-                if after.is_none()
-                    || page.last_edge_cursor.is_none()
-                    || page.end_cursor.is_none()
-                    || seen_cursors.len() < 2
-                    || seen_comment_ids.len() < 2
-                {
-                    return Err(ReadContractError::PaginationInvalid);
-                }
-                if !redaction_verified {
-                    return Err(ReadContractError::ReadFieldsInvalid);
-                }
-                let report = ReadContractReport { redaction_verified };
-                let viewer_id = app_actor_id
-                    .take()
-                    .ok_or(ReadContractError::ActorIdentityMismatch)?;
-                return Ok(VerifiedReadOutcome::new(report, viewer_id));
+            if !redaction_verified {
+                return Err(ReadContractError::ReadFieldsInvalid);
             }
-            let next = page
-                .end_cursor
-                .ok_or(ReadContractError::PaginationInvalid)?;
-            if after.as_deref() == Some(next.as_str())
-                || seen_cursors[..previous_cursor_count]
-                    .iter()
-                    .any(|cursor| cursor == &next)
-            {
-                return Err(ReadContractError::PaginationInvalid);
-            }
-            after = Some(next);
+            let report = ReadContractReport { redaction_verified };
+            let viewer_id = app_actor_id
+                .take()
+                .ok_or(ReadContractError::ActorIdentityMismatch)?;
+            return Ok(VerifiedReadOutcome::new(report, viewer_id));
         }
-        Err(ReadContractError::PaginationInvalid)
+        let next = page
+            .end_cursor
+            .ok_or(ReadContractError::PaginationInvalid)?;
+        if after.as_deref() == Some(next.as_str())
+            || seen_cursors[..previous_cursor_count]
+                .iter()
+                .any(|cursor| cursor == &next)
+        {
+            return Err(ReadContractError::PaginationInvalid);
+        }
+        after = Some(next);
     }
+    Err(ReadContractError::PaginationInvalid)
 }
 
 fn validate_scope(
@@ -1062,9 +1029,7 @@ pub(crate) fn run_live(
     config: &ReadContractConfig,
 ) -> Result<ReadContractReport, ReadContractError> {
     let mut transport = HttpsReadTransport::new()?;
-    manager.with_verified_read(|access_token| {
-        ReadVerifier::new(&mut transport).run(access_token, config)
-    })
+    manager.with_verified_read(|access_token| verify_read(&mut transport, access_token, config))
 }
 
 #[cfg(test)]
@@ -1416,7 +1381,7 @@ mod tests {
             serde_json::to_vec(&invalid_issue_timestamp).expect("response JSON"),
         )]);
         assert_eq!(
-            ReadVerifier::new(&mut transport).run(ACCESS, &config()),
+            verify_read(&mut transport, ACCESS, &config()),
             Err(ReadContractError::ReadFieldsInvalid)
         );
     }
@@ -1453,9 +1418,7 @@ mod tests {
                 "synthetic-comment-two",
             )),
         ]);
-        let report = ReadVerifier::new(&mut transport)
-            .run(ACCESS, &config())
-            .expect("contract");
+        let report = verify_read(&mut transport, ACCESS, &config()).expect("contract");
         assert!(report.redaction_verified());
         assert_eq!(transport.requests.len(), 2);
         let first = String::from_utf8_lossy(&transport.requests[0]);
@@ -1505,7 +1468,7 @@ mod tests {
             )),
         ]);
         assert_eq!(
-            ReadVerifier::new(&mut transport).run(ACCESS, &config()),
+            verify_read(&mut transport, ACCESS, &config()),
             Err(ReadContractError::ReadFieldsInvalid)
         );
     }
@@ -1526,7 +1489,7 @@ mod tests {
             Some("only-cursor"),
         ))]);
         assert_eq!(
-            ReadVerifier::new(&mut transport).run(ACCESS, &config()),
+            verify_read(&mut transport, ACCESS, &config()),
             Err(ReadContractError::PaginationInvalid)
         );
     }
@@ -1547,7 +1510,7 @@ mod tests {
             Some("cursor"),
         ))]);
         assert_eq!(
-            ReadVerifier::new(&mut wrong_actor).run(ACCESS, &config()),
+            verify_read(&mut wrong_actor, ACCESS, &config()),
             Err(ReadContractError::ActorIdentityMismatch)
         );
 
@@ -1565,7 +1528,7 @@ mod tests {
             Some("cursor"),
         ))]);
         assert_eq!(
-            ReadVerifier::new(&mut whitespace_actor).run(ACCESS, &config()),
+            verify_read(&mut whitespace_actor, ACCESS, &config()),
             Err(ReadContractError::ActorIdentityMismatch)
         );
 
@@ -1583,7 +1546,7 @@ mod tests {
             Some("cursor"),
         ))]);
         assert_eq!(
-            ReadVerifier::new(&mut wrong_issue).run(ACCESS, &config()),
+            verify_read(&mut wrong_issue, ACCESS, &config()),
             Err(ReadContractError::RelationshipMismatch)
         );
 
@@ -1601,7 +1564,7 @@ mod tests {
             Some("cursor"),
         ))]);
         assert_eq!(
-            ReadVerifier::new(&mut wrong_team).run(ACCESS, &config()),
+            verify_read(&mut wrong_team, ACCESS, &config()),
             Err(ReadContractError::RelationshipMismatch)
         );
 
@@ -1626,7 +1589,7 @@ mod tests {
             serde_json::to_vec(&wrong_viewer_workspace).expect("response JSON"),
         )]);
         assert_eq!(
-            ReadVerifier::new(&mut wrong_viewer_workspace).run(ACCESS, &config()),
+            verify_read(&mut wrong_viewer_workspace, ACCESS, &config()),
             Err(ReadContractError::RelationshipMismatch)
         );
 
@@ -1650,7 +1613,7 @@ mod tests {
             serde_json::to_vec(&wrong_team_workspace).expect("response JSON"),
         )]);
         assert_eq!(
-            ReadVerifier::new(&mut wrong_team_workspace).run(ACCESS, &config()),
+            verify_read(&mut wrong_team_workspace, ACCESS, &config()),
             Err(ReadContractError::RelationshipMismatch)
         );
 
@@ -1674,7 +1637,7 @@ mod tests {
             serde_json::to_vec(&wrong_issue_workspace).expect("response JSON"),
         )]);
         assert_eq!(
-            ReadVerifier::new(&mut wrong_issue_workspace).run(ACCESS, &config()),
+            verify_read(&mut wrong_issue_workspace, ACCESS, &config()),
             Err(ReadContractError::RelationshipMismatch)
         );
 
@@ -1709,7 +1672,7 @@ mod tests {
             )),
         ]);
         assert_eq!(
-            ReadVerifier::new(&mut changing_actor).run(ACCESS, &config()),
+            verify_read(&mut changing_actor, ACCESS, &config()),
             Err(ReadContractError::ActorIdentityMismatch)
         );
     }
@@ -1732,7 +1695,7 @@ mod tests {
             "synthetic comment body",
         ))]);
         assert_eq!(
-            ReadVerifier::new(&mut empty_issue_body).run(ACCESS, &config()),
+            verify_read(&mut empty_issue_body, ACCESS, &config()),
             Err(ReadContractError::ReadFieldsInvalid)
         );
 
@@ -1752,7 +1715,7 @@ mod tests {
             " \n\t",
         ))]);
         assert_eq!(
-            ReadVerifier::new(&mut empty_comment_body).run(ACCESS, &config()),
+            verify_read(&mut empty_comment_body, ACCESS, &config()),
             Err(ReadContractError::ReadFieldsInvalid)
         );
     }
@@ -1779,7 +1742,7 @@ mod tests {
             serde_json::to_vec(&explicit_null_description).expect("response JSON"),
         )]);
         assert_eq!(
-            ReadVerifier::new(&mut transport).run(ACCESS, &config()),
+            verify_read(&mut transport, ACCESS, &config()),
             Err(ReadContractError::ReadFieldsInvalid)
         );
 
@@ -1805,7 +1768,7 @@ mod tests {
             serde_json::to_vec(&omitted_description).expect("response JSON"),
         )]);
         assert_eq!(
-            ReadVerifier::new(&mut transport).run(ACCESS, &config()),
+            verify_read(&mut transport, ACCESS, &config()),
             Err(ReadContractError::GraphqlResponse)
         );
 
@@ -1831,7 +1794,7 @@ mod tests {
             serde_json::to_vec(&omitted_parent).expect("response JSON"),
         )]);
         assert_eq!(
-            ReadVerifier::new(&mut transport).run(ACCESS, &config()),
+            verify_read(&mut transport, ACCESS, &config()),
             Err(ReadContractError::GraphqlResponse)
         );
     }
@@ -1841,7 +1804,7 @@ mod tests {
         let graphql_error = response(br#"{"errors":[{"message":"synthetic"}]}"#);
         let mut transport = FakeTransport::new([graphql_error]);
         assert_eq!(
-            ReadVerifier::new(&mut transport).run(ACCESS, &config()),
+            verify_read(&mut transport, ACCESS, &config()),
             Err(ReadContractError::GraphqlResponse)
         );
 
@@ -1865,7 +1828,7 @@ mod tests {
         .expect("response");
         let mut transport = FakeTransport::new([missing_headers]);
         assert_eq!(
-            ReadVerifier::new(&mut transport).run(ACCESS, &config()),
+            verify_read(&mut transport, ACCESS, &config()),
             Err(ReadContractError::RateLimitHeaders)
         );
 
@@ -1890,7 +1853,7 @@ mod tests {
         .expect("response");
         let mut transport = FakeTransport::new([invalid_content_type]);
         assert_eq!(
-            ReadVerifier::new(&mut transport).run(ACCESS, &config()),
+            verify_read(&mut transport, ACCESS, &config()),
             Err(ReadContractError::ContentType)
         );
     }
@@ -1929,9 +1892,7 @@ mod tests {
                 "synthetic-comment-two",
             )),
         ]);
-        let report = ReadVerifier::new(&mut transport)
-            .run(ACCESS, &config())
-            .expect("contract");
+        let report = verify_read(&mut transport, ACCESS, &config()).expect("contract");
         assert!(report.redaction_verified());
     }
 
@@ -1951,7 +1912,7 @@ mod tests {
             None,
         ))]);
         assert_eq!(
-            ReadVerifier::new(&mut missing_cursor).run(ACCESS, &config()),
+            verify_read(&mut missing_cursor, ACCESS, &config()),
             Err(ReadContractError::PaginationInvalid)
         );
 
@@ -1986,7 +1947,7 @@ mod tests {
             )),
         ]);
         assert_eq!(
-            ReadVerifier::new(&mut repeated_cursor).run(ACCESS, &config()),
+            verify_read(&mut repeated_cursor, ACCESS, &config()),
             Err(ReadContractError::PaginationInvalid)
         );
 
@@ -2049,7 +2010,7 @@ mod tests {
             )),
         ]);
         assert_eq!(
-            ReadVerifier::new(&mut unbounded).run(ACCESS, &config()),
+            verify_read(&mut unbounded, ACCESS, &config()),
             Err(ReadContractError::PaginationInvalid)
         );
 
@@ -2098,7 +2059,7 @@ mod tests {
             )),
         ]);
         assert_eq!(
-            ReadVerifier::new(&mut non_adjacent_cycle).run(ACCESS, &config()),
+            verify_read(&mut non_adjacent_cycle, ACCESS, &config()),
             Err(ReadContractError::PaginationInvalid)
         );
 
@@ -2133,7 +2094,7 @@ mod tests {
             )),
         ]);
         assert_eq!(
-            ReadVerifier::new(&mut inconsistent_final_cursor).run(ACCESS, &config()),
+            verify_read(&mut inconsistent_final_cursor, ACCESS, &config()),
             Err(ReadContractError::PaginationInvalid)
         );
 
@@ -2170,7 +2131,7 @@ mod tests {
             response(serde_json::to_vec(&empty_final_page).expect("response JSON")),
         ]);
         assert_eq!(
-            ReadVerifier::new(&mut empty_final).run(ACCESS, &config()),
+            verify_read(&mut empty_final, ACCESS, &config()),
             Err(ReadContractError::PaginationInvalid)
         );
     }
@@ -2207,9 +2168,7 @@ mod tests {
                 "synthetic-comment-two",
             )),
         ]);
-        let report = ReadVerifier::new(&mut transport)
-            .run(ACCESS, &config())
-            .expect("contract");
+        let report = verify_read(&mut transport, ACCESS, &config()).expect("contract");
         let debug = format!("{report:?}");
         assert!(!debug.contains(ACCESS));
         assert!(!debug.contains("synthetic-app"));
