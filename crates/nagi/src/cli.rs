@@ -21,19 +21,19 @@ use std::fmt;
 const CLIENT_ID_ENV: &str = "NAGI_LINEAR_CLIENT_ID";
 #[cfg(any(test, target_os = "macos"))]
 const CALLBACK_PORT_ENV: &str = "NAGI_LINEAR_CALLBACK_PORT";
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(target_os = "macos")]
 const WORKSPACE_ID_ENV: &str = "NAGI_LINEAR_WORKSPACE_ID";
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(target_os = "macos")]
 const TEAM_ID_ENV: &str = "NAGI_LINEAR_TEAM_ID";
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(target_os = "macos")]
 const SETUP_ISSUE_ID_ENV: &str = "NAGI_LINEAR_SETUP_ISSUE_ID";
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(target_os = "macos")]
 const REDIRECT_URI_ENV: &str = "NAGI_LINEAR_REDIRECT_URI";
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(target_os = "macos")]
 const ADMIN_CONSENT_ENV: &str = "NAGI_LINEAR_ADMIN_CONSENT";
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(target_os = "macos")]
 const CONTRACT_LIVE_ENV: &str = "NAGI_CONTRACT_LIVE";
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(target_os = "macos")]
 const CONTRACT_REVISION_ENV: &str = "NAGI_CONTRACT_REVISION";
 #[cfg(target_os = "macos")]
 const CONTRACT_BUILD_REVISION: Option<&str> = option_env!("NAGI_CONTRACT_BUILD_REVISION");
@@ -278,26 +278,12 @@ fn run_read_contract() -> Result<(), CliError> {
         read::run_live(&mut manager, &config)
     })();
     match result {
-        Ok(report) if report.passed() => {
-            println!(
-                "{}",
-                render_read_contract_evidence(&revision, Some(&report), None)
-            );
+        Ok(report) => {
+            println!("{}", render_read_contract_evidence(&revision, Ok(&report)));
             Ok(())
         }
-        Ok(report) => {
-            let error = ReadContractError::ReadFieldsInvalid;
-            println!(
-                "{}",
-                render_read_contract_evidence(&revision, Some(&report), Some(error))
-            );
-            Err(CliError::ReadContract(error))
-        }
         Err(error) => {
-            println!(
-                "{}",
-                render_read_contract_evidence(&revision, None, Some(error))
-            );
+            println!("{}", render_read_contract_evidence(&revision, Err(error)));
             Err(CliError::ReadContract(error))
         }
     }
@@ -398,10 +384,9 @@ struct EvidenceFailure {
 #[cfg(target_os = "macos")]
 fn render_read_contract_evidence(
     revision: &str,
-    report: Option<&read::ReadContractReport>,
-    error: Option<ReadContractError>,
+    result: Result<&read::ReadContractReport, ReadContractError>,
 ) -> String {
-    let passed = error.is_none() && report.is_some_and(read::ReadContractReport::passed);
+    let passed = result.is_ok();
     let evidence = ReadContractEvidence {
         schema_version: 1,
         layer: "live-provider",
@@ -430,16 +415,21 @@ fn render_read_contract_evidence(
             },
             EvidenceCheck {
                 name: "redaction",
-                result: report
-                    .filter(|report| report.redaction_verified())
-                    .map_or("fail", |_| "pass"),
+                result: if result
+                    .as_ref()
+                    .is_ok_and(|report| report.redaction_verified())
+                {
+                    "pass"
+                } else {
+                    "fail"
+                },
             },
             EvidenceCheck {
                 name: "preflight",
                 result: "pass",
             },
         ],
-        failure: error.map(|_| EvidenceFailure {
+        failure: result.err().map(|_| EvidenceFailure {
             code: "contract-failed",
         }),
     };
@@ -497,11 +487,8 @@ mod tests {
     #[test]
     fn read_contract_evidence_is_closed_and_reflects_report_outcome() {
         let revision = "0123456789abcdef0123456789abcdef01234567";
-        let passing = render_read_contract_evidence(
-            revision,
-            Some(&read::ReadContractReport::for_test(true, true)),
-            None,
-        );
+        let passing_report = read::ReadContractReport::for_test();
+        let passing = render_read_contract_evidence(revision, Ok(&passing_report));
         let passing: serde_json::Value = serde_json::from_str(&passing).expect("evidence JSON");
         let passing_object = passing.as_object().expect("evidence object");
         assert_eq!(
@@ -528,11 +515,8 @@ mod tests {
         assert!(!passing.to_string().contains("synthetic-setup-issue"));
         assert!(!passing.to_string().contains("synthetic comment body"));
 
-        let failing = render_read_contract_evidence(
-            revision,
-            Some(&read::ReadContractReport::for_test(false, false)),
-            Some(ReadContractError::ReadFieldsInvalid),
-        );
+        let failing =
+            render_read_contract_evidence(revision, Err(ReadContractError::ReadFieldsInvalid));
         let failing: serde_json::Value = serde_json::from_str(&failing).expect("evidence JSON");
         let failing_object = failing.as_object().expect("evidence object");
         assert_eq!(
@@ -546,18 +530,6 @@ mod tests {
         assert!(!failing.to_string().contains("synthetic-app"));
         assert!(!failing.to_string().contains("synthetic-setup-issue"));
         assert!(!failing.to_string().contains("synthetic comment body"));
-
-        let contradictory = render_read_contract_evidence(
-            revision,
-            Some(&read::ReadContractReport::for_test(true, true)),
-            Some(ReadContractError::ReadFieldsInvalid),
-        );
-        let contradictory: serde_json::Value =
-            serde_json::from_str(&contradictory).expect("contradictory evidence JSON");
-        assert_eq!(
-            contradictory.get("result"),
-            Some(&serde_json::json!("fail"))
-        );
     }
 
     #[test]

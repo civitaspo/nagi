@@ -12,6 +12,7 @@ use std::fmt;
 use std::time::Duration;
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::linear::ReadContractError;
 #[cfg(target_os = "macos")]
 use crate::linear::credentials::CredentialManager;
 
@@ -121,102 +122,22 @@ impl fmt::Debug for ReadContractConfig {
     }
 }
 
-/// Coarse failures for the Linear read verifier. No provider response or
-/// deployment-local value is retained in an error.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ReadContractError {
-    /// The live provider operation is available only on the supported host.
-    UnsupportedPlatform,
-    /// The local binding or access lease was invalid.
-    Configuration,
-    /// The P0-04 credential lease could not be acquired or refreshed.
-    Credential(crate::linear::credentials::CredentialError),
-    /// The bounded HTTPS client could not be configured.
-    ClientConfiguration,
-    /// The request failed before a response was received.
-    RequestFailed,
-    /// The provider response exceeded the parser bound.
-    ResponseTooLarge,
-    /// The response did not contain exactly one application/json media type.
-    ContentType,
-    /// The response omitted or malformed one of the required rate headers.
-    RateLimitHeaders,
-    /// The HTTP status was not a successful GraphQL response.
-    HttpStatus,
-    /// The GraphQL response contained an error or invalid JSON shape.
-    GraphqlResponse,
-    /// The authenticated viewer did not satisfy the required app-actor fields.
-    ActorIdentityMismatch,
-    /// The exact setup issue/team/workspace relationship did not match.
-    RelationshipMismatch,
-    /// The Issue or Comment read fields were malformed or incomplete.
-    ReadFieldsInvalid,
-    /// The Relay pageInfo contract was malformed or exceeded its bound.
-    PaginationInvalid,
-}
-
-impl fmt::Display for ReadContractError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let message = match self {
-            Self::UnsupportedPlatform => "Linear read contract is unsupported on this host",
-            Self::Configuration => "Linear read contract configuration is invalid",
-            Self::Credential(error) => return error.fmt(formatter),
-            Self::ClientConfiguration => "Linear read transport is unavailable",
-            Self::RequestFailed => "Linear read request failed",
-            Self::ResponseTooLarge => "Linear read response is too large",
-            Self::ContentType => "Linear read response content type is invalid",
-            Self::RateLimitHeaders => "Linear read rate-limit headers are invalid",
-            Self::HttpStatus => "Linear read HTTP response is invalid",
-            Self::GraphqlResponse => "Linear read GraphQL response is invalid",
-            Self::ActorIdentityMismatch => "Linear app actor identity is invalid",
-            Self::RelationshipMismatch => "Linear synthetic issue relationship is invalid",
-            Self::ReadFieldsInvalid => "Linear Issue or Comment read fields are invalid",
-            Self::PaginationInvalid => "Linear read pagination is invalid",
-        };
-        formatter.write_str(message)
-    }
-}
-
-impl std::error::Error for ReadContractError {}
-
-/// Boolean-only result of a successful read-contract verification.
+/// Redaction state retained after a successful read-contract verification.
 ///
-/// No IDs, timestamps, content, page counts, rate-limit counts, or provider
+/// All other contract checks are represented by the surrounding `Result`; no
+/// IDs, timestamps, content, page counts, rate-limit counts, or provider
 /// payloads are retained in this value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ReadContractReport {
-    actor_identity_verified: bool,
-    relationships_verified: bool,
-    issue_read_verified: bool,
-    comment_read_verified: bool,
-    pagination_verified: bool,
-    rate_limit_headers_verified: bool,
     redaction_verified: bool,
 }
 
 impl ReadContractReport {
     #[cfg(test)]
-    pub(crate) fn for_test(passed: bool, redaction_verified: bool) -> Self {
+    pub(crate) fn for_test() -> Self {
         Self {
-            actor_identity_verified: passed,
-            relationships_verified: passed,
-            issue_read_verified: passed,
-            comment_read_verified: passed,
-            pagination_verified: passed,
-            rate_limit_headers_verified: passed,
-            redaction_verified,
+            redaction_verified: true,
         }
-    }
-
-    /// Returns whether all required read-contract checks passed.
-    pub(crate) fn passed(&self) -> bool {
-        self.actor_identity_verified
-            && self.relationships_verified
-            && self.issue_read_verified
-            && self.comment_read_verified
-            && self.pagination_verified
-            && self.rate_limit_headers_verified
-            && self.redaction_verified
     }
 
     /// Returns whether content was reduced to presence-only state.
@@ -226,7 +147,7 @@ impl ReadContractReport {
 }
 
 /// Internal result of a fully verified read. The viewer ID is kept separate
-/// from the boolean-only report and is zeroized as soon as credential binding
+/// from the redaction-only report and is zeroized as soon as credential binding
 /// consumes it.
 #[derive(Eq, PartialEq)]
 pub(crate) struct VerifiedReadOutcome {
@@ -240,9 +161,9 @@ impl VerifiedReadOutcome {
     }
 
     #[cfg(test)]
-    pub(crate) fn for_test(viewer_id: &str, passed: bool) -> Self {
+    pub(crate) fn for_test(viewer_id: &str) -> Self {
         Self::new(
-            ReadContractReport::for_test(passed, passed),
+            ReadContractReport::for_test(),
             Zeroizing::new(viewer_id.to_owned()),
         )
     }
@@ -300,15 +221,9 @@ fn bounded_cursor(value: String) -> Result<String, ReadContractError> {
     Ok(value)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum QueryKind {
-    Read,
-}
-
 /// A bounded GraphQL request. Its body is dropped with a zeroizing buffer and
 /// its debug representation never includes IDs or query variables.
 struct GraphqlRequest {
-    kind: QueryKind,
     body: Zeroizing<Vec<u8>>,
 }
 
@@ -319,7 +234,6 @@ impl GraphqlRequest {
         after: Option<&str>,
     ) -> Result<Self, ReadContractError> {
         Self::new(
-            QueryKind::Read,
             READ_QUERY,
             serde_json::json!({
                 "teamId": team_id,
@@ -330,18 +244,13 @@ impl GraphqlRequest {
         )
     }
 
-    fn new(
-        kind: QueryKind,
-        query: &str,
-        variables: serde_json::Value,
-    ) -> Result<Self, ReadContractError> {
+    fn new(query: &str, variables: serde_json::Value) -> Result<Self, ReadContractError> {
         let body = serde_json::to_vec(&serde_json::json!({
             "query": query,
             "variables": variables,
         }))
         .map_err(|_| ReadContractError::Configuration)?;
         Ok(Self {
-            kind,
             body: Zeroizing::new(body),
         })
     }
@@ -351,29 +260,8 @@ impl fmt::Debug for GraphqlRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("GraphqlRequest")
-            .field("kind", &self.kind)
             .field("body", &"[redacted]")
             .finish()
-    }
-}
-
-/// Whether the required global request and complexity Linear rate-limit headers
-/// were present and contained bounded numeric values. Numeric counters are
-/// deliberately not retained.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RateLimitHeaderStatus {
-    valid: bool,
-}
-
-impl RateLimitHeaderStatus {
-    #[cfg(test)]
-    fn valid() -> Self {
-        Self { valid: true }
-    }
-
-    #[cfg(test)]
-    fn invalid() -> Self {
-        Self { valid: false }
     }
 }
 
@@ -382,7 +270,7 @@ impl RateLimitHeaderStatus {
 struct ReadResponse {
     status: u16,
     content_type_valid: bool,
-    rate_limits: RateLimitHeaderStatus,
+    rate_limits_valid: bool,
     body: Zeroizing<Vec<u8>>,
 }
 
@@ -390,16 +278,16 @@ impl ReadResponse {
     #[cfg(test)]
     fn synthetic(
         status: u16,
-        rate_limits: RateLimitHeaderStatus,
+        rate_limits_valid: bool,
         body: impl AsRef<[u8]>,
     ) -> Result<Self, ReadContractError> {
-        Self::synthetic_with_content_type(status, rate_limits, true, body)
+        Self::synthetic_with_content_type(status, rate_limits_valid, true, body)
     }
 
     #[cfg(test)]
     fn synthetic_with_content_type(
         status: u16,
-        rate_limits: RateLimitHeaderStatus,
+        rate_limits_valid: bool,
         content_type_valid: bool,
         body: impl AsRef<[u8]>,
     ) -> Result<Self, ReadContractError> {
@@ -410,7 +298,7 @@ impl ReadResponse {
         Ok(Self {
             status,
             content_type_valid,
-            rate_limits,
+            rate_limits_valid,
             body: Zeroizing::new(body.to_vec()),
         })
     }
@@ -422,7 +310,7 @@ impl fmt::Debug for ReadResponse {
             .debug_struct("ReadResponse")
             .field("status", &self.status)
             .field("content_type_valid", &self.content_type_valid)
-            .field("rate_limits", &self.rate_limits)
+            .field("rate_limits_valid", &self.rate_limits_valid)
             .field("body", &"[redacted]")
             .finish()
     }
@@ -534,7 +422,7 @@ impl ReadTransport for HttpsReadTransport {
         Ok(ReadResponse {
             status,
             content_type_valid,
-            rate_limits,
+            rate_limits_valid: rate_limits,
             body,
         })
     }
@@ -562,7 +450,7 @@ fn parse_content_type_header(headers: &oauth2::reqwest::header::HeaderMap) -> bo
 }
 
 #[cfg(any(test, target_os = "macos"))]
-fn parse_rate_limit_headers(headers: &oauth2::reqwest::header::HeaderMap) -> RateLimitHeaderStatus {
+fn parse_rate_limit_headers(headers: &oauth2::reqwest::header::HeaderMap) -> bool {
     use oauth2::reqwest::header::HeaderName;
 
     let limit = parse_rate_limit_value(
@@ -590,35 +478,33 @@ fn parse_rate_limit_headers(headers: &oauth2::reqwest::header::HeaderMap) -> Rat
         headers,
         HeaderName::from_static("x-ratelimit-complexity-reset"),
     );
-    RateLimitHeaderStatus {
-        valid: match (
-            limit,
-            remaining,
-            reset,
-            complexity,
-            complexity_limit,
-            complexity_remaining,
-            complexity_reset,
-        ) {
-            (
-                Some(limit),
-                Some(remaining),
-                Some(reset),
-                Some(complexity),
-                Some(complexity_limit),
-                Some(complexity_remaining),
-                Some(complexity_reset),
-            ) => {
-                limit > 0
-                    && remaining <= limit
-                    && reset > 0
-                    && complexity_limit > 0
-                    && complexity <= complexity_limit
-                    && complexity_remaining <= complexity_limit
-                    && complexity_reset > 0
-            }
-            _ => false,
-        },
+    match (
+        limit,
+        remaining,
+        reset,
+        complexity,
+        complexity_limit,
+        complexity_remaining,
+        complexity_reset,
+    ) {
+        (
+            Some(limit),
+            Some(remaining),
+            Some(reset),
+            Some(complexity),
+            Some(complexity_limit),
+            Some(complexity_remaining),
+            Some(complexity_reset),
+        ) => {
+            limit > 0
+                && remaining <= limit
+                && reset > 0
+                && complexity_limit > 0
+                && complexity <= complexity_limit
+                && complexity_remaining <= complexity_limit
+                && complexity_reset > 0
+        }
+        _ => false,
     }
 }
 
@@ -795,7 +681,7 @@ fn decode<T: for<'de> Deserialize<'de>>(response: ReadResponse) -> Result<T, Rea
     if !response.content_type_valid {
         return Err(ReadContractError::ContentType);
     }
-    if !response.rate_limits.valid {
+    if !response.rate_limits_valid {
         return Err(ReadContractError::RateLimitHeaders);
     }
     if response.status != 200 {
@@ -879,15 +765,10 @@ impl<'a> ReadVerifier<'a> {
                 {
                     return Err(ReadContractError::PaginationInvalid);
                 }
-                let report = ReadContractReport {
-                    actor_identity_verified: true,
-                    relationships_verified: true,
-                    issue_read_verified: true,
-                    comment_read_verified: true,
-                    pagination_verified: true,
-                    rate_limit_headers_verified: true,
-                    redaction_verified,
-                };
+                if !redaction_verified {
+                    return Err(ReadContractError::ReadFieldsInvalid);
+                }
+                let report = ReadContractReport { redaction_verified };
                 let viewer_id = app_actor_id
                     .take()
                     .ok_or(ReadContractError::ActorIdentityMismatch)?;
@@ -1194,7 +1075,7 @@ mod tests {
 
     struct FakeTransport {
         responses: VecDeque<Result<ReadResponse, ReadContractError>>,
-        requests: Vec<(QueryKind, Vec<u8>)>,
+        requests: Vec<Vec<u8>>,
     }
 
     impl FakeTransport {
@@ -1212,7 +1093,7 @@ mod tests {
             _access_token: &str,
             request: &GraphqlRequest,
         ) -> Result<ReadResponse, ReadContractError> {
-            self.requests.push((request.kind, request.body.to_vec()));
+            self.requests.push(request.body.to_vec());
             self.responses
                 .pop_front()
                 .unwrap_or(Err(ReadContractError::RequestFailed))
@@ -1224,7 +1105,7 @@ mod tests {
     }
 
     fn response(body: impl AsRef<[u8]>) -> ReadResponse {
-        ReadResponse::synthetic(200, RateLimitHeaderStatus::valid(), body).expect("response")
+        ReadResponse::synthetic(200, true, body).expect("response")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1416,21 +1297,21 @@ mod tests {
                 HeaderValue::from_static(value),
             );
         }
-        assert!(parse_rate_limit_headers(&headers).valid);
+        assert!(parse_rate_limit_headers(&headers));
 
         let mut comma_joined = headers.clone();
         comma_joined.insert(
             HeaderName::from_static("x-complexity"),
             HeaderValue::from_static("10,11"),
         );
-        assert!(!parse_rate_limit_headers(&comma_joined).valid);
+        assert!(!parse_rate_limit_headers(&comma_joined));
 
         let mut duplicate = headers;
         duplicate.append(
             HeaderName::from_static("x-ratelimit-requests-reset"),
             HeaderValue::from_static("1770000000001"),
         );
-        assert!(!parse_rate_limit_headers(&duplicate).valid);
+        assert!(!parse_rate_limit_headers(&duplicate));
 
         let mut oversized = HeaderMap::new();
         for (name, value) in [
@@ -1447,7 +1328,7 @@ mod tests {
                 HeaderValue::from_static(value),
             );
         }
-        assert!(!parse_rate_limit_headers(&oversized).valid);
+        assert!(!parse_rate_limit_headers(&oversized));
     }
 
     #[test]
@@ -1571,12 +1452,10 @@ mod tests {
         let report = ReadVerifier::new(&mut transport)
             .run(ACCESS, &config())
             .expect("contract");
-        assert!(report.passed());
+        assert!(report.redaction_verified());
         assert_eq!(transport.requests.len(), 2);
-        assert_eq!(transport.requests[0].0, QueryKind::Read);
-        assert_eq!(transport.requests[1].0, QueryKind::Read);
-        let first = String::from_utf8_lossy(&transport.requests[0].1);
-        let second = String::from_utf8_lossy(&transport.requests[1].1);
+        let first = String::from_utf8_lossy(&transport.requests[0]);
+        let second = String::from_utf8_lossy(&transport.requests[1]);
         assert!(first.contains("NagiLinearReadContract"));
         assert!(first.contains("\"issueId\":\"00000000-0000-4000-8000-000000000003\""));
         assert!(first.contains("\"teamId\":\"00000000-0000-4000-8000-000000000002\""));
@@ -1964,7 +1843,7 @@ mod tests {
 
         let missing_headers = ReadResponse::synthetic(
             200,
-            RateLimitHeaderStatus::invalid(),
+            false,
             scope_response(
                 "synthetic-app",
                 true,
@@ -1988,7 +1867,7 @@ mod tests {
 
         let invalid_content_type = ReadResponse::synthetic_with_content_type(
             200,
-            RateLimitHeaderStatus::valid(),
+            true,
             false,
             scope_response(
                 "synthetic-app",
@@ -2049,7 +1928,7 @@ mod tests {
         let report = ReadVerifier::new(&mut transport)
             .run(ACCESS, &config())
             .expect("contract");
-        assert!(report.passed());
+        assert!(report.redaction_verified());
     }
 
     #[test]

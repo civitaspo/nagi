@@ -488,6 +488,15 @@ fn macos_preflight_is_opt_in_and_platform_gated() {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn non_macos_build_keeps_error_boundary() {
+    assert_eq!(
+        nagi::linear::ReadContractError::UnsupportedPlatform.to_string(),
+        "Linear read contract is unsupported on this host"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn standalone_binary_is_a_single_plain_executable() {

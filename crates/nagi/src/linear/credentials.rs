@@ -9,11 +9,13 @@
 //! return [`CredentialError::UnsupportedPlatform`] before reading a path,
 //! environment variable, or keychain item.
 
+#[cfg(any(test, target_os = "macos"))]
+use crate::linear::ReadContractError;
 #[cfg(target_os = "macos")]
 use crate::linear::oauth::{self, OAuthConfig};
 use crate::linear::oauth::{OAuthError, TokenBundle};
 #[cfg(any(test, target_os = "macos"))]
-use crate::linear::read::{ReadContractError, ReadContractReport, VerifiedReadOutcome};
+use crate::linear::read::{ReadContractReport, VerifiedReadOutcome};
 #[cfg(target_os = "macos")]
 use oauth2::reqwest::blocking::{Body, Client, ClientBuilder, Response};
 #[cfg(target_os = "macos")]
@@ -1026,13 +1028,6 @@ struct LoadedRecord {
 
 /// The local credential lifecycle manager.
 pub struct CredentialManager {
-    #[cfg_attr(
-        all(not(test), not(target_os = "macos")),
-        expect(
-            dead_code,
-            reason = "P0-05 provider operations will bind refresh requests to the configured client"
-        )
-    )]
     client_id: String,
     store: Box<dyn CredentialStore>,
     transport: Option<Box<dyn ProviderTransport>>,
@@ -1086,6 +1081,7 @@ impl CredentialManager {
     /// Constructs the production manager for an explicitly requested provider
     /// read contract. It retains the refresh-capable transport and Keychain
     /// store but cannot launch authorization because no authorizer is installed.
+    #[cfg(target_os = "macos")]
     pub(crate) fn production_read(
         client_id: impl Into<String>,
         callback_port: u16,
@@ -1231,7 +1227,7 @@ impl CredentialManager {
 
     /// Acquires a serialized token lease, accepts only a typed fully verified
     /// read outcome, persists or checks its app viewer binding while the lock
-    /// remains held, and returns the boolean-only report. A failed provider
+    /// remains held, and returns its redaction-only report. A failed provider
     /// verification never reaches the binding write.
     #[cfg(any(test, target_os = "macos"))]
     pub(crate) fn with_verified_read(
@@ -1247,9 +1243,6 @@ impl CredentialManager {
             .map_err(ReadContractError::Credential)?;
         let outcome = callback(record.envelope.access_token.as_str())?;
         let (report, viewer_id) = outcome.into_parts();
-        if !report.passed() {
-            return Err(ReadContractError::ReadFieldsInvalid);
-        }
         self.bind_viewer_id(record, viewer_id)
             .map_err(ReadContractError::Credential)?;
         Ok(report)
@@ -1606,13 +1599,6 @@ fn duration_millis(duration: Duration) -> Result<i64, CredentialError> {
         .ok_or(CredentialError::Configuration)
 }
 
-#[cfg_attr(
-    all(not(test), not(target_os = "macos")),
-    expect(
-        dead_code,
-        reason = "P0-05 provider operations will validate the configured client identifier"
-    )
-)]
 pub(crate) fn bounded_client_id(client_id: &str) -> Result<String, CredentialError> {
     if client_id.is_empty()
         || client_id.len() > MAX_CLIENT_ID_BYTES
@@ -2261,10 +2247,10 @@ mod tests {
         let report = manager
             .with_verified_read(|token| {
                 assert_eq!(token, ACCESS);
-                Ok(VerifiedReadOutcome::for_test(VIEWER, true))
+                Ok(VerifiedReadOutcome::for_test(VIEWER))
             })
             .expect("verified read");
-        assert!(report.passed());
+        assert!(report.redaction_verified());
         assert_eq!(writes.get(), 1);
         let record = manager.load_record().expect("record").expect("record");
         assert_eq!(record.envelope.revision, 2);
@@ -2281,7 +2267,7 @@ mod tests {
         let writes = Rc::clone(&store.writes);
         let mut manager = fake_manager(store, FakeTransport::new([]), NOW_MS, authorizer());
         manager
-            .with_verified_read(|_| Ok(VerifiedReadOutcome::for_test(VIEWER, true)))
+            .with_verified_read(|_| Ok(VerifiedReadOutcome::for_test(VIEWER)))
             .expect("matching viewer");
         assert_eq!(writes.get(), 0);
         assert_eq!(
@@ -2299,8 +2285,7 @@ mod tests {
             .expect("record")
             .bytes;
         assert_eq!(
-            manager
-                .with_verified_read(|_| { Ok(VerifiedReadOutcome::for_test(OTHER_VIEWER, true)) }),
+            manager.with_verified_read(|_| Ok(VerifiedReadOutcome::for_test(OTHER_VIEWER))),
             Err(ReadContractError::Credential(
                 CredentialError::Configuration
             ))
@@ -2332,7 +2317,7 @@ mod tests {
         assert_eq!(
             manager.with_verified_read(|_| {
                 replacement_pending.set(true);
-                Ok(VerifiedReadOutcome::for_test(VIEWER, true))
+                Ok(VerifiedReadOutcome::for_test(VIEWER))
             }),
             Err(ReadContractError::Credential(
                 CredentialError::StorageUncertain
@@ -2360,7 +2345,7 @@ mod tests {
         assert_eq!(
             manager.with_verified_read(|_| {
                 replacement_pending.set(true);
-                Ok(VerifiedReadOutcome::for_test(VIEWER, true))
+                Ok(VerifiedReadOutcome::for_test(VIEWER))
             }),
             Err(ReadContractError::Credential(
                 CredentialError::StorageUncertain
@@ -2396,15 +2381,14 @@ mod tests {
         );
 
         assert_eq!(
-            manager.with_verified_read(|_| Ok(VerifiedReadOutcome::for_test(VIEWER, false))),
+            manager.with_verified_read(|_| Err(ReadContractError::ReadFieldsInvalid)),
             Err(ReadContractError::ReadFieldsInvalid)
         );
         assert_eq!(writes.get(), 0);
 
         for viewer_id in ["", "   ", "bad\nviewer"] {
             assert_eq!(
-                manager
-                    .with_verified_read(|_| { Ok(VerifiedReadOutcome::for_test(viewer_id, true)) }),
+                manager.with_verified_read(|_| Ok(VerifiedReadOutcome::for_test(viewer_id))),
                 Err(ReadContractError::Credential(
                     CredentialError::Configuration
                 ))
@@ -2429,7 +2413,7 @@ mod tests {
         assert_eq!(
             manager.with_verified_read(|_| {
                 callback_called_in_closure.set(true);
-                Ok(VerifiedReadOutcome::for_test(VIEWER, true))
+                Ok(VerifiedReadOutcome::for_test(VIEWER))
             }),
             Err(ReadContractError::Credential(
                 CredentialError::Configuration
@@ -2458,7 +2442,7 @@ mod tests {
         let writes = Rc::clone(&store.writes);
         let mut manager = fake_manager(store, FakeTransport::new([]), NOW_MS, authorizer());
         assert_eq!(
-            manager.with_verified_read(|_| Ok(VerifiedReadOutcome::for_test(VIEWER, true))),
+            manager.with_verified_read(|_| Ok(VerifiedReadOutcome::for_test(VIEWER))),
             Err(ReadContractError::Credential(CredentialError::Storage))
         );
         assert_eq!(writes.get(), 1);
