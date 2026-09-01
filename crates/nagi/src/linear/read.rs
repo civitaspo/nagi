@@ -9,6 +9,7 @@
 
 use serde::Deserialize;
 use std::fmt;
+#[cfg(target_os = "macos")]
 use std::time::Duration;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -16,8 +17,11 @@ use crate::linear::ReadContractError;
 #[cfg(target_os = "macos")]
 use crate::linear::credentials::CredentialManager;
 
+#[cfg(target_os = "macos")]
 const GRAPHQL_ENDPOINT: &str = "https://api.linear.app/graphql";
+#[cfg(target_os = "macos")]
 const READ_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(target_os = "macos")]
 const READ_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_READ_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_ID_BYTES: usize = 4 * 1024;

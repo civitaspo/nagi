@@ -1326,6 +1326,7 @@ impl CredentialManager {
         Ok(Some(LoadedRecord { envelope, bytes }))
     }
 
+    #[cfg(any(test, target_os = "macos"))]
     fn load_access_record(&mut self) -> Result<LoadedRecord, CredentialError> {
         let record = self.load_record()?.ok_or(CredentialError::NotReady)?;
         self.validate_client_binding(&record.envelope)?;
@@ -1351,6 +1352,7 @@ impl CredentialManager {
         Ok(())
     }
 
+    #[cfg(any(test, target_os = "macos"))]
     fn bind_viewer_id(
         &mut self,
         record: LoadedRecord,

@@ -439,6 +439,7 @@ fn render_read_contract_evidence(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
     use std::collections::BTreeSet;
 
     fn args(values: &[&str]) -> Vec<OsString> {
