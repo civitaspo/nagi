@@ -44,11 +44,12 @@ credential envelope versions are rejected rather than silently migrated.
 
 The deployment fixture must contain the exact configured canonical UUID setup
 issue with a non-whitespace body and at least two distinct top-level comments
-with non-whitespace bodies. The verifier requests one comment per page with a
-top-level-parent filter, requires a real cursor transition, rejects duplicate
-comment IDs and cursor rewind/cycle, and treats inline comments as top-level
-comments when their returned `parentId` is null; no `quotedText` is retained or
-needed. This is a bounded
+with non-whitespace bodies. The verifier requests exactly two one-item pages
+with a top-level-parent filter, requires the first page's cursor transition,
+validates two distinct comments and cursors without following the second page,
+and rejects duplicate comment IDs and cursor rewind/cycle. Inline comments are
+treated as top-level comments when their returned `parentId` is null; no
+`quotedText` is retained or needed. This is a bounded, non-exhaustive
 synthetic-fixture contract, not a completeness claim about the workspace.
 
 Tool versions and upstream tag revisions are declared in contracts/versions.toml. Codex and the Temporal CLI are installed through exact mise/Aqua pins; mise.lock owns their platform artifact URLs and SHA-256 checksums. The Rust SDK pin is recorded centrally until the SDK is introduced by its implementation PR. mise install --locked must be used for reproducible tool installation.

@@ -128,10 +128,12 @@ Issue comments use an explicit `first: 1` Relay page, `after` cursor, a
 are still included when Linear represents them with a null `parentId`; no
 `quotedText` field is retained or needed. Each edge is checked for its cursor,
 comment ID, issue ID, update timestamp, and top-level `parentId`. Pagination
-stops only on a verified `hasNextPage=false` page after observing a bounded
-cursor transition; a missing end cursor is invalid only when `hasNextPage=true`,
-while final-page cursor inconsistencies and any cursor rewind or cycle fail
-closed. The documented global request and complexity rate-limit
+reads exactly two one-item pages: the first must report `hasNextPage=true` with
+a bounded `endCursor` used as the second page's `after`, and the second must
+prove a distinct valid comment and cursor. The second page is fully validated
+but never followed, even when it reports `hasNextPage=true`; a terminal null
+`endCursor` is valid. Cursor inconsistencies and any cursor rewind or cycle
+fail closed. The documented global request and complexity rate-limit
 headers must be present exactly once and contain bounded unsigned values.
 Descriptions and comment bodies are reduced to non-whitespace presence bits and
 are not returned, logged, or persisted.
@@ -143,8 +145,8 @@ are never included in evidence. The default `mise run test` and CI paths remain
 provider-free.
 
 The fixture issue must have a non-whitespace body and at least two distinct
-top-level comments with non-whitespace bodies; the bounded `first: 1` query
-proves one cursor transition without enumerating the workspace or claiming
+top-level comments with non-whitespace bodies; exactly two bounded `first: 1`
+pages prove one cursor transition without enumerating the workspace or claiming
 collection completeness.
 
 The raw-build and live-runner procedure and standalone evidence constraints are

@@ -28,7 +28,6 @@ const MAX_ID_BYTES: usize = 4 * 1024;
 const MAX_CURSOR_BYTES: usize = 4 * 1024;
 const MAX_ACCESS_TOKEN_BYTES: usize = 16 * 1024;
 const COMMENT_PAGE_SIZE: u64 = 1;
-const MAX_COMMENT_PAGES: usize = 4;
 
 const READ_QUERY: &str = r#"query NagiLinearReadContract($teamId: String!, $issueId: String!, $commentFirst: Int!, $commentAfter: String) {
   organization {
@@ -641,7 +640,6 @@ impl<'de> Deserialize<'de> for ContentPresence {
 struct PageResult {
     has_next_page: bool,
     end_cursor: Option<String>,
-    last_edge_cursor: Option<String>,
 }
 
 fn decode<T: for<'de> Deserialize<'de>>(response: ReadResponse) -> Result<T, ReadContractError> {
@@ -674,59 +672,51 @@ fn verify_read(
         return Err(ReadContractError::Configuration);
     }
 
-    let mut after = None;
     let mut app_actor_id = None;
     let mut seen_cursors = Vec::new();
     let mut seen_comment_ids = Vec::new();
-    for _ in 0..MAX_COMMENT_PAGES {
-        let previous_cursor_count = seen_cursors.len();
-        let request = GraphqlRequest::issue(
-            config.team_id.as_str(),
-            config.setup_issue_id.as_str(),
-            after.as_deref(),
-        )?;
-        let response = transport.execute(access_token, &request)?;
-        let scope: ScopeData = decode(response)?;
-        let page = validate_scope(
-            &scope,
-            config,
-            &mut app_actor_id,
-            &mut seen_cursors,
-            &mut seen_comment_ids,
-        )?;
-        if page
-            .last_edge_cursor
-            .as_deref()
-            .is_some_and(|cursor| after.as_deref() == Some(cursor))
-        {
-            return Err(ReadContractError::PaginationInvalid);
-        }
-        if !page.has_next_page {
-            if after.is_none()
-                || page.last_edge_cursor.is_none()
-                || seen_cursors.len() < 2
-                || seen_comment_ids.len() < 2
-            {
-                return Err(ReadContractError::PaginationInvalid);
-            }
-            let viewer_id = app_actor_id
-                .take()
-                .ok_or(ReadContractError::ActorIdentityMismatch)?;
-            return Ok(VerifiedReadOutcome::new(viewer_id));
-        }
-        let next = page
-            .end_cursor
-            .ok_or(ReadContractError::PaginationInvalid)?;
-        if after.as_deref() == Some(next.as_str())
-            || seen_cursors[..previous_cursor_count]
-                .iter()
-                .any(|cursor| cursor == &next)
-        {
-            return Err(ReadContractError::PaginationInvalid);
-        }
-        after = Some(next);
+    let first_request = GraphqlRequest::issue(
+        config.team_id.as_str(),
+        config.setup_issue_id.as_str(),
+        None,
+    )?;
+    let first_response = transport.execute(access_token, &first_request)?;
+    let first_scope: ScopeData = decode(first_response)?;
+    let first_page = validate_scope(
+        &first_scope,
+        config,
+        &mut app_actor_id,
+        &mut seen_cursors,
+        &mut seen_comment_ids,
+    )?;
+    if !first_page.has_next_page {
+        return Err(ReadContractError::PaginationInvalid);
     }
-    Err(ReadContractError::PaginationInvalid)
+    let after = first_page
+        .end_cursor
+        .ok_or(ReadContractError::PaginationInvalid)?;
+
+    let second_request = GraphqlRequest::issue(
+        config.team_id.as_str(),
+        config.setup_issue_id.as_str(),
+        Some(after.as_str()),
+    )?;
+    let second_response = transport.execute(access_token, &second_request)?;
+    let second_scope: ScopeData = decode(second_response)?;
+    validate_scope(
+        &second_scope,
+        config,
+        &mut app_actor_id,
+        &mut seen_cursors,
+        &mut seen_comment_ids,
+    )?;
+    if seen_cursors.len() < 2 || seen_comment_ids.len() < 2 {
+        return Err(ReadContractError::PaginationInvalid);
+    }
+    let viewer_id = app_actor_id
+        .take()
+        .ok_or(ReadContractError::ActorIdentityMismatch)?;
+    Ok(VerifiedReadOutcome::new(viewer_id))
 }
 
 fn validate_scope(
@@ -860,7 +850,6 @@ fn validate_scope(
     Ok(PageResult {
         has_next_page: comments.page_info.has_next_page,
         end_cursor,
-        last_edge_cursor,
     })
 }
 
@@ -1266,7 +1255,36 @@ mod tests {
     }
 
     #[test]
-    fn verifier_accepts_null_end_cursor_on_non_empty_terminal_page() {
+    fn verifier_accepts_null_end_cursor_on_non_empty_second_page() {
+        let mut transport = FakeTransport::new([
+            response(
+                SyntheticScope {
+                    has_next: true,
+                    edge_cursor: "cursor-one",
+                    end_cursor: Some("cursor-one"),
+                    comment_id: "synthetic-comment-one",
+                    ..Default::default()
+                }
+                .response(),
+            ),
+            response(
+                SyntheticScope {
+                    edge_cursor: "cursor-two",
+                    end_cursor: None,
+                    comment_id: "synthetic-comment-two",
+                    ..Default::default()
+                }
+                .response(),
+            ),
+        ]);
+        verify_read(&mut transport, ACCESS, &config()).expect("contract");
+        assert_eq!(transport.requests.len(), 2);
+        let second = String::from_utf8_lossy(&transport.requests[1]);
+        assert!(second.contains("\"commentAfter\":\"cursor-one\""));
+    }
+
+    #[test]
+    fn verifier_accepts_second_page_reporting_more_without_following_it() {
         let mut transport = FakeTransport::new([
             response(
                 SyntheticScope {
@@ -1288,20 +1306,11 @@ mod tests {
                 }
                 .response(),
             ),
-            response(
-                SyntheticScope {
-                    edge_cursor: "cursor-three",
-                    end_cursor: None,
-                    comment_id: "synthetic-comment-three",
-                    ..Default::default()
-                }
-                .response(),
-            ),
         ]);
         verify_read(&mut transport, ACCESS, &config()).expect("contract");
-        assert_eq!(transport.requests.len(), 3);
-        let third = String::from_utf8_lossy(&transport.requests[2]);
-        assert!(third.contains("\"commentAfter\":\"cursor-two\""));
+        assert_eq!(transport.requests.len(), 2);
+        let second = String::from_utf8_lossy(&transport.requests[1]);
+        assert!(second.contains("\"commentAfter\":\"cursor-one\""));
     }
 
     #[test]
@@ -1613,7 +1622,7 @@ mod tests {
     }
 
     #[test]
-    fn verifier_rejects_malformed_and_unbounded_page_info() {
+    fn verifier_rejects_malformed_page_info() {
         let mut missing_cursor = FakeTransport::new([response(
             SyntheticScope {
                 has_next: true,
@@ -1651,89 +1660,6 @@ mod tests {
         ]);
         assert_eq!(
             verify_read(&mut repeated_cursor, ACCESS, &config()),
-            Err(ReadContractError::PaginationInvalid)
-        );
-
-        let mut unbounded = FakeTransport::new([
-            response(
-                SyntheticScope {
-                    has_next: true,
-                    edge_cursor: "one",
-                    end_cursor: Some("one"),
-                    comment_id: "synthetic-comment-one",
-                    ..Default::default()
-                }
-                .response(),
-            ),
-            response(
-                SyntheticScope {
-                    has_next: true,
-                    edge_cursor: "two",
-                    end_cursor: Some("two"),
-                    comment_id: "synthetic-comment-two",
-                    ..Default::default()
-                }
-                .response(),
-            ),
-            response(
-                SyntheticScope {
-                    has_next: true,
-                    edge_cursor: "three",
-                    end_cursor: Some("three"),
-                    comment_id: "synthetic-comment-three",
-                    ..Default::default()
-                }
-                .response(),
-            ),
-            response(
-                SyntheticScope {
-                    has_next: true,
-                    edge_cursor: "four",
-                    end_cursor: Some("four"),
-                    comment_id: "synthetic-comment-four",
-                    ..Default::default()
-                }
-                .response(),
-            ),
-        ]);
-        assert_eq!(
-            verify_read(&mut unbounded, ACCESS, &config()),
-            Err(ReadContractError::PaginationInvalid)
-        );
-
-        let mut non_adjacent_cycle = FakeTransport::new([
-            response(
-                SyntheticScope {
-                    has_next: true,
-                    edge_cursor: "cycle-one",
-                    end_cursor: Some("cycle-one"),
-                    comment_id: "synthetic-comment-one",
-                    ..Default::default()
-                }
-                .response(),
-            ),
-            response(
-                SyntheticScope {
-                    has_next: true,
-                    edge_cursor: "cycle-two",
-                    end_cursor: Some("cycle-two"),
-                    comment_id: "synthetic-comment-two",
-                    ..Default::default()
-                }
-                .response(),
-            ),
-            response(
-                SyntheticScope {
-                    edge_cursor: "cycle-one",
-                    end_cursor: Some("cycle-one"),
-                    comment_id: "synthetic-comment-three",
-                    ..Default::default()
-                }
-                .response(),
-            ),
-        ]);
-        assert_eq!(
-            verify_read(&mut non_adjacent_cycle, ACCESS, &config()),
             Err(ReadContractError::PaginationInvalid)
         );
 
