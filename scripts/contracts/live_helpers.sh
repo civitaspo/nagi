@@ -158,17 +158,12 @@ done
 
 live_verify_process_group() {
   local pid="$1"
-  local pgid
   local poll
-  # ps is not available in every restricted test sandbox. When it is
-  # available, require the process-group leader invariant established by
-  # setsid or Bash monitor mode; otherwise retain that launch invariant.
-  # setsid establishes the session asynchronously relative to the parent
+  # Require the process-group invariant established by setsid or Bash monitor
+  # mode. setsid establishes the session asynchronously relative to the parent
   # shell, so retry the invariant for a finite startup window.
   for ((poll = 0; poll < LIVE_GROUP_START_POLLS; poll++)); do
-    pgid="$(/bin/ps -o pgid= -p "${pid}" 2>/dev/null | /usr/bin/tr -d '[:space:]' || true)"
-    if [[ -z "${pgid}" || "${pgid}" == "${pid}" ]] \
-      && kill -0 -- "-${pid}" 2>/dev/null; then
+    if kill -0 -- "-${pid}" 2>/dev/null; then
       return 0
     fi
     # A fast child which has already exited is safe only when no group
