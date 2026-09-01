@@ -52,9 +52,13 @@ without touching a store or path.
 
 Access acquisition holds an in-process mutex and a mode-0600 advisory lock in
 a mode-0700 user-owned application-support directory across reread, state
-transition, provider request, and post-write verification. A refresh
-intent is durable before its first possible send. Linear's documented refresh
-contract uses `POST https://api.linear.app/oauth/token` with only
+transition, provider request, and post-write verification. A refresh intent is
+durable before its first possible send, and the exact bytes confirmed for that
+intent are retained across the provider call. A successful response may
+transition to a ready bundle only after an exact reread of those retained
+bytes; a replacement or read ambiguity returns `StorageUncertain` without
+adopting, overwriting, or deleting the replacement. Linear's documented
+refresh contract uses `POST https://api.linear.app/oauth/token` with only
 `grant_type=refresh_token`, `refresh_token`, and `client_id`. The manager
 keeps the old bundle on an ambiguous response and permits one byte-for-byte
 replay only while `now_ms < first_send_at_ms + 1,800,000`; the exact deadline
@@ -79,11 +83,14 @@ persists revoke-pending, then sends the documented
 `POST https://api.linear.app/oauth/revoke` request with `token` and
 `token_type_hint=refresh_token`. Only HTTP 200 is treated as provider
 confirmation. A confirmed result is persisted as a delete-pending tombstone
-before exact deletion and absence verification. If that tombstone write
-definitively proves that the exact prior revoke-pending bytes remain after an
-HTTP 200, the manager may finish deletion after an exact reread; any storage
-uncertainty retains the record and remains blocked. Uncertain revoke outcomes
-are never automatically retried.
+before exact deletion and absence verification. The exact revoke-pending bytes
+confirmed before the provider call must still be present after an HTTP 200;
+replacement or read ambiguity returns `StorageUncertain` without adopting,
+overwriting, or deleting the current record. If a tombstone write is
+definitively unsuccessful while those exact bytes remain, the manager may
+finish deletion after another exact reread; any other storage uncertainty
+retains the record and remains blocked. Uncertain revoke outcomes are never
+automatically retried.
 
 The implementation follows Linear's [OAuth 2.0 authentication documentation](https://linear.app/developers/oauth-2-0-authentication)
 and [OAuth actor authorization documentation](https://linear.app/developers/oauth-actor-authorization).
@@ -113,15 +120,24 @@ cooperating Nagi processes only; a non-cooperating process can still change the
 Keychain item.
 
 The default test suite is credential-free, browser-free, provider-free, and
-Keychain-free. An ignored Darwin-only test uses a unique synthetic locator,
-spawns fresh test processes for write/read, and then requires exact deletion
-followed by an absence check. It is available through the opt-in
-`scripts/contracts/macos.sh` contract command. If the host has no usable
-default file-based Keychain, an explicit request fails closed; only an unset
-contract layer is allowed to skip. The contract does not inspect signing
-entitlements or require a provisioning profile. No access or refresh token is
-written to logs, SQLite, prompts,
-worktrees, or public evidence; diagnostics remain coarse and redacted.
+Keychain-free. An ignored Darwin-only integration test enables the default-off
+`macos-keychain-contract` feature and launches the raw Cargo-built `nagi`
+executable in fresh processes. It uses a unique synthetic locator and fixed
+nonproduction account to exercise absent, write-record-A, read-A,
+update-record-B, read-B, delete, and final-absence phases, followed by exact
+cleanup on failures. Each child runs in a unique empty working directory,
+which must remain empty after every phase; child stdout and stderr are capped
+and scanned for both synthetic record values. Each child also has a short
+deadline followed by kill and reap to bound an unexpected Keychain
+interaction. The raw Cargo-built executable path is outside any `.app`, and
+the roundtrip succeeds without a provisioning profile supplied by the
+harness; these are the standalone runtime packaging checks. They do not prove
+ACL or signing-identity behavior. The contract is available through the
+opt-in `scripts/contracts/macos.sh` command. If the host has no usable default
+file-based Keychain, an explicit request fails closed; only an unset contract
+layer is allowed to skip. No access or refresh token is written to logs,
+SQLite, prompts, worktrees, or public evidence; diagnostics remain coarse and
+redacted.
 
 ## Deliberate residuals and later boundaries
 

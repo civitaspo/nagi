@@ -602,6 +602,17 @@ mod keychain {
     const KEYCHAIN_SERVICE: &str = "dev.nagi.linear.oauth.v1";
     const KEYCHAIN_ACCOUNT: &str = "default";
 
+    #[cfg(feature = "macos-keychain-contract")]
+    const CONTRACT_SERVICE_PREFIX: &str = "dev.nagi.contract.synthetic.";
+    #[cfg(feature = "macos-keychain-contract")]
+    const CONTRACT_MAX_SERVICE_SUFFIX_BYTES: usize = 32;
+    #[cfg(feature = "macos-keychain-contract")]
+    const CONTRACT_ACCOUNT: &str = "round-trip";
+    #[cfg(feature = "macos-keychain-contract")]
+    const CONTRACT_RECORD_A: &[u8] = b"nagi-keychain-contract-record-a";
+    #[cfg(feature = "macos-keychain-contract")]
+    const CONTRACT_RECORD_B: &[u8] = b"nagi-keychain-contract-record-b";
+
     /// Generic-password store backed by the user's default file-based
     /// Keychain (normally the login Keychain).
     ///
@@ -621,11 +632,6 @@ mod keychain {
             Self::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
         }
 
-        #[cfg(test)]
-        pub fn new_for_test(service: &str, account: &str) -> Result<Self, i32> {
-            Self::new(service, account).map_err(|error| error.code())
-        }
-
         fn new(service: &str, account: &str) -> Result<Self, SecurityError> {
             let default_keychain = SecKeychain::default()?;
             Ok(Self {
@@ -633,30 +639,6 @@ mod keychain {
                 account: account.to_owned(),
                 default_keychain,
             })
-        }
-
-        #[cfg(test)]
-        pub(crate) fn write_for_test(&self, bytes: &[u8]) -> Result<(), i32> {
-            self.write_item(bytes).map_err(|error| error.code())
-        }
-
-        #[cfg(test)]
-        pub(crate) fn read_for_test(&self) -> Result<Option<Vec<u8>>, i32> {
-            match self.read_item() {
-                Ok(Some(data)) => Ok(Some(data)),
-                Ok(None) => Ok(None),
-                Err(error) if error.code() == errSecItemNotFound => Ok(None),
-                Err(error) => Err(error.code()),
-            }
-        }
-
-        #[cfg(test)]
-        pub(crate) fn delete_for_test(&self) -> Result<(), i32> {
-            match self.delete_item() {
-                Ok(()) => Ok(()),
-                Err(error) if error.code() == errSecItemNotFound => Ok(()),
-                Err(error) => Err(error.code()),
-            }
         }
 
         fn search_options(&self, load_data: bool) -> ItemSearchOptions {
@@ -719,6 +701,82 @@ mod keychain {
             self.search_options(false).delete()
         }
 
+        #[cfg(feature = "macos-keychain-contract")]
+        fn contract_read(&self) -> Result<Option<Vec<u8>>, SecurityError> {
+            match self.read_item() {
+                Ok(value) => Ok(value),
+                Err(error) if error.code() == errSecItemNotFound => Ok(None),
+                Err(error) => Err(error),
+            }
+        }
+
+        #[cfg(feature = "macos-keychain-contract")]
+        fn contract_write(&self, bytes: &[u8]) -> Result<(), SecurityError> {
+            self.write_item(bytes)
+        }
+
+        #[cfg(feature = "macos-keychain-contract")]
+        fn contract_delete(&self) -> Result<(), SecurityError> {
+            self.delete_item()
+        }
+
+        #[cfg(feature = "macos-keychain-contract")]
+        fn contract_record(&self, expected: &[u8]) -> Result<(), SecurityError> {
+            match self.contract_read()? {
+                Some(value) if value.as_slice() == expected => Ok(()),
+                _ => Err(SecurityError::from_code(errSecParam)),
+            }
+        }
+
+        #[cfg(feature = "macos-keychain-contract")]
+        pub(super) fn run_contract_phase(service: &str, phase: &str) -> Result<(), SecurityError> {
+            let Some(suffix) = service.strip_prefix(CONTRACT_SERVICE_PREFIX) else {
+                return Err(SecurityError::from_code(errSecParam));
+            };
+            if suffix.is_empty()
+                || suffix.len() > CONTRACT_MAX_SERVICE_SUFFIX_BYTES
+                || !suffix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            {
+                return Err(SecurityError::from_code(errSecParam));
+            }
+            if !matches!(
+                phase,
+                "absent" | "write" | "read-a" | "update" | "read-b" | "delete"
+            ) {
+                return Err(SecurityError::from_code(errSecParam));
+            }
+
+            let store = Self::new(service, CONTRACT_ACCOUNT)?;
+            match phase {
+                "absent" => {
+                    if store.contract_read()?.is_some() {
+                        return Err(SecurityError::from_code(errSecParam));
+                    }
+                }
+                "write" => {
+                    if store.contract_read()?.is_some() {
+                        return Err(SecurityError::from_code(errSecParam));
+                    }
+                    store.contract_write(CONTRACT_RECORD_A)?;
+                }
+                "read-a" => store.contract_record(CONTRACT_RECORD_A)?,
+                "update" => {
+                    store.contract_record(CONTRACT_RECORD_A)?;
+                    store.contract_write(CONTRACT_RECORD_B)?;
+                }
+                "read-b" => store.contract_record(CONTRACT_RECORD_B)?,
+                "delete" => match store.contract_delete() {
+                    Ok(()) => {}
+                    Err(error) if error.code() == errSecItemNotFound => {}
+                    Err(error) => return Err(error),
+                },
+                _ => unreachable!("contract phase validated above"),
+            }
+            Ok(())
+        }
+
         fn map_error(error: SecurityError) -> StoreError {
             // Keep OSStatus values out of logs and public errors.  In
             // particular, errSecAuthFailed/interaction-required outcomes are
@@ -768,6 +826,15 @@ mod keychain {
 
 #[cfg(target_os = "macos")]
 use keychain::KeychainStore;
+
+#[cfg(all(target_os = "macos", feature = "macos-keychain-contract"))]
+pub(crate) fn run_macos_keychain_contract_phase(
+    service: &str,
+    phase: &str,
+) -> Result<(), CredentialError> {
+    keychain::KeychainStore::run_contract_phase(service, phase)
+        .map_err(|_| CredentialError::Storage)
+}
 
 trait WallClock {
     /// Returns the current Unix epoch time in milliseconds.
@@ -1175,7 +1242,7 @@ impl CredentialManager {
             started_at_ms: now,
             confirmed_at_ms: None,
         });
-        self.write_record(&pending, Some(&record.bytes))?;
+        let pending_bytes = self.write_record_and_return_bytes(&pending, Some(&record.bytes))?;
 
         let response = match self
             .transport
@@ -1202,8 +1269,8 @@ impl CredentialManager {
             .as_mut()
             .ok_or(CredentialError::InvalidEnvelope)?
             .confirmed_at_ms = Some(confirmed_at_ms);
-        let pending_bytes = self.load_record()?.map(|record| record.bytes);
-        match self.write_record(&tombstone, pending_bytes.as_ref()) {
+        self.verify_current_bytes(&pending_bytes)?;
+        match self.write_record(&tombstone, Some(&pending_bytes)) {
             Ok(()) => {
                 let record = self
                     .load_record()?
@@ -1214,14 +1281,12 @@ impl CredentialManager {
                 // A definitive tombstone-write failure means the exact prior
                 // bytes were observed. Re-read that same record before the
                 // terminal delete; uncertainty never takes this path.
+                self.verify_current_bytes(&pending_bytes)?;
                 let record = match self.load_record() {
                     Ok(Some(record)) => record,
                     Ok(None) | Err(_) => return Err(CredentialError::StorageUncertain),
                 };
-                let Some(expected) = pending_bytes.as_ref() else {
-                    return Err(CredentialError::StorageUncertain);
-                };
-                if record.bytes.as_slice() != expected.as_slice() {
+                if record.bytes.as_slice() != pending_bytes.as_slice() {
                     return Err(CredentialError::StorageUncertain);
                 }
                 self.finish_local_delete(record)
@@ -1243,6 +1308,15 @@ impl CredentialManager {
         envelope: &CredentialEnvelope,
         previous_bytes: Option<&Zeroizing<Vec<u8>>>,
     ) -> Result<(), CredentialError> {
+        self.write_record_and_return_bytes(envelope, previous_bytes)
+            .map(|_| ())
+    }
+
+    fn write_record_and_return_bytes(
+        &mut self,
+        envelope: &CredentialEnvelope,
+        previous_bytes: Option<&Zeroizing<Vec<u8>>>,
+    ) -> Result<Zeroizing<Vec<u8>>, CredentialError> {
         let bytes = serialize_envelope(envelope)?;
         let _write_result = self.store.write(&bytes);
         let observed = match self.store.read() {
@@ -1253,7 +1327,7 @@ impl CredentialManager {
             .as_ref()
             .is_some_and(|observed| observed.as_slice() == bytes.as_slice())
         {
-            return Ok(());
+            return Ok(bytes);
         }
         let previous_matches = match (previous_bytes, observed.as_ref()) {
             (Some(expected), Some(observed)) => observed.as_slice() == expected.as_slice(),
@@ -1264,6 +1338,19 @@ impl CredentialManager {
             return Err(CredentialError::Storage);
         }
         Err(CredentialError::StorageUncertain)
+    }
+
+    fn verify_current_bytes(&mut self, expected: &[u8]) -> Result<(), CredentialError> {
+        let observed = self
+            .store
+            .read()
+            .map_err(|_| CredentialError::StorageUncertain)?
+            .ok_or(CredentialError::StorageUncertain)?;
+        if observed.as_slice() == expected {
+            Ok(())
+        } else {
+            Err(CredentialError::StorageUncertain)
+        }
     }
 
     #[cfg_attr(
@@ -1293,7 +1380,7 @@ impl CredentialManager {
             attempt_count: 1,
             replay_consumed: false,
         });
-        self.write_record(&pending, Some(&record.bytes))?;
+        let pending_bytes = self.write_record_and_return_bytes(&pending, Some(&record.bytes))?;
         let response = self
             .transport
             .as_mut()
@@ -1308,7 +1395,7 @@ impl CredentialManager {
                 pending.refresh_token.as_str(),
             )
             .map_err(|_| refresh_failure_error(&pending))?;
-        self.accept_refresh_response(pending, response, now)
+        self.accept_refresh_response(pending, &pending_bytes, response, now)
     }
 
     #[cfg_attr(
@@ -1349,7 +1436,7 @@ impl CredentialManager {
             .as_mut()
             .ok_or(CredentialError::InvalidEnvelope)?
             .replay_consumed = true;
-        self.write_record(&replay, Some(&record.bytes))?;
+        let replay_bytes = self.write_record_and_return_bytes(&replay, Some(&record.bytes))?;
         let intent = replay
             .refresh
             .as_ref()
@@ -1360,7 +1447,7 @@ impl CredentialManager {
             .ok_or_else(|| refresh_failure_error(&replay))?
             .refresh(intent.client_id.as_str(), intent.refresh_token.as_str())
             .map_err(|_| refresh_failure_error(&replay))?;
-        self.accept_refresh_response(replay, response, now)
+        self.accept_refresh_response(replay, &replay_bytes, response, now)
     }
 
     #[cfg_attr(
@@ -1373,6 +1460,7 @@ impl CredentialManager {
     fn accept_refresh_response(
         &mut self,
         pending: CredentialEnvelope,
+        pending_bytes: &Zeroizing<Vec<u8>>,
         response: ProviderResponse,
         original_now: i64,
     ) -> Result<LoadedRecord, CredentialError> {
@@ -1402,8 +1490,8 @@ impl CredentialManager {
         };
         let ready =
             CredentialEnvelope::ready(next_revision(&pending)?, access, refresh, expires_at_ms)?;
-        let pending_bytes = self.load_record()?.map(|record| record.bytes);
-        self.write_record(&ready, pending_bytes.as_ref())?;
+        self.verify_current_bytes(pending_bytes)?;
+        self.write_record(&ready, Some(pending_bytes))?;
         self.load_record()?.ok_or(CredentialError::StorageUncertain)
     }
 
@@ -1616,6 +1704,8 @@ mod tests {
         fail_delete: Rc<Cell<bool>>,
         writes: Rc<Cell<usize>>,
         deletes: Rc<Cell<usize>>,
+        replace_on_next_read: Option<Rc<Cell<bool>>>,
+        replacement: Option<Zeroizing<Vec<u8>>>,
     }
 
     #[derive(Clone, Copy, Default)]
@@ -1630,6 +1720,17 @@ mod tests {
         fn read(&mut self) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
             if self.fail_read {
                 return Err(StoreError::Unavailable);
+            }
+            if self
+                .replace_on_next_read
+                .as_ref()
+                .is_some_and(|replace| replace.get())
+            {
+                self.replace_on_next_read
+                    .as_ref()
+                    .expect("replacement flag")
+                    .set(false);
+                self.value = self.replacement.take();
             }
             if self
                 .fail_read_after_write
@@ -1720,6 +1821,8 @@ mod tests {
         refresh_outcomes: VecDeque<FakeOutcome>,
         revoke_outcomes: VecDeque<FakeOutcome>,
         requests: RefCell<Vec<(String, String)>>,
+        replace_after_refresh: Option<Rc<Cell<bool>>>,
+        replace_after_revoke: Option<Rc<Cell<bool>>>,
     }
 
     impl FakeTransport {
@@ -1730,7 +1833,17 @@ mod tests {
                 refresh_outcomes: refresh_outcomes.into_iter().collect(),
                 revoke_outcomes: VecDeque::new(),
                 requests: RefCell::new(Vec::new()),
+                replace_after_refresh: None,
+                replace_after_revoke: None,
             }
+        }
+
+        fn replace_store_after_refresh(&mut self, flag: Rc<Cell<bool>>) {
+            self.replace_after_refresh = Some(flag);
+        }
+
+        fn replace_store_after_revoke(&mut self, flag: Rc<Cell<bool>>) {
+            self.replace_after_revoke = Some(flag);
         }
     }
 
@@ -1749,7 +1862,12 @@ mod tests {
                 .pop_front()
                 .unwrap_or(FakeOutcome::NoResponse)
             {
-                FakeOutcome::Response(response) => Ok(response),
+                FakeOutcome::Response(response) => {
+                    if let Some(replace) = &self.replace_after_refresh {
+                        replace.set(true);
+                    }
+                    Ok(response)
+                }
                 FakeOutcome::NoResponse => Err(ProviderTransportError::NoResponse),
             }
         }
@@ -1764,7 +1882,12 @@ mod tests {
                 .pop_front()
                 .unwrap_or(FakeOutcome::NoResponse)
             {
-                FakeOutcome::Response(response) => Ok(response),
+                FakeOutcome::Response(response) => {
+                    if let Some(replace) = &self.replace_after_revoke {
+                        replace.set(true);
+                    }
+                    Ok(response)
+                }
                 FakeOutcome::NoResponse => Err(ProviderTransportError::NoResponse),
             }
         }
@@ -2240,6 +2363,38 @@ mod tests {
     }
 
     #[test]
+    fn refresh_replacement_during_provider_call_is_not_adopted() {
+        let replace = Rc::new(Cell::new(false));
+        let replacement = ready_bytes(9, READY_AT_MS);
+        let store = MemoryStore {
+            value: Some(ready_bytes(1, EXPIRED_AT_MS)),
+            replace_on_next_read: Some(Rc::clone(&replace)),
+            replacement: Some(replacement.clone()),
+            ..MemoryStore::default()
+        };
+        let writes = Rc::clone(&store.writes);
+        let deletes = Rc::clone(&store.deletes);
+        let mut transport = FakeTransport::new([FakeOutcome::Response(token_response(
+            NEW_ACCESS,
+            NEW_REFRESH,
+            60,
+        ))]);
+        transport.replace_store_after_refresh(replace);
+        let mut manager = fake_manager(store, transport, NOW_MS, authorizer());
+
+        assert_eq!(
+            manager.with_access_token(|_| "unexpected callback"),
+            Err(CredentialError::StorageUncertain)
+        );
+        assert_eq!(writes.get(), 1);
+        assert_eq!(deletes.get(), 0);
+        assert_eq!(
+            manager.load_record().expect("read").expect("record").bytes,
+            replacement
+        );
+    }
+
+    #[test]
     fn first_refresh_clock_failure_retains_unconsumed_replay() {
         let pending =
             replay_pending_bytes_with_revision_and_expiry(2, NOW_MS, 1, false, EXPIRED_AT_MS);
@@ -2656,6 +2811,34 @@ mod tests {
     }
 
     #[test]
+    fn revoke_replacement_during_provider_call_is_not_adopted_or_deleted() {
+        let replace = Rc::new(Cell::new(false));
+        let replacement = ready_bytes(9, READY_AT_MS);
+        let store = MemoryStore {
+            value: Some(ready_bytes(1, READY_AT_MS)),
+            replace_on_next_read: Some(Rc::clone(&replace)),
+            replacement: Some(replacement.clone()),
+            ..MemoryStore::default()
+        };
+        let writes = Rc::clone(&store.writes);
+        let deletes = Rc::clone(&store.deletes);
+        let mut transport = FakeTransport::new([]);
+        transport.revoke_outcomes.push_back(FakeOutcome::Response(
+            ProviderResponse::synthetic(200, b"").expect("response"),
+        ));
+        transport.replace_store_after_revoke(replace);
+        let mut manager = fake_manager(store, transport, NOW_MS, authorizer());
+
+        assert_eq!(manager.logout(true), Err(CredentialError::StorageUncertain));
+        assert_eq!(writes.get(), 1);
+        assert_eq!(deletes.get(), 0);
+        assert_eq!(
+            manager.load_record().expect("read").expect("record").bytes,
+            replacement
+        );
+    }
+
+    #[test]
     fn definitive_tombstone_write_failure_deletes_only_exact_retained_record() {
         let mut transport = FakeTransport::new([]);
         transport.revoke_outcomes.push_back(FakeOutcome::Response(
@@ -2775,104 +2958,6 @@ mod tests {
             Err(CredentialError::StorageUncertain)
         );
         assert_eq!(deletes.get(), 0);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    #[ignore = "touches a unique synthetic default file-based Keychain item"]
-    fn macos_keychain_round_trip_uses_only_a_synthetic_locator() {
-        const SYNTHETIC_MISMATCH: i32 = i32::MIN;
-        const SYNTHETIC_NOT_ABSENT: i32 = i32::MIN + 1;
-        const SYNTHETIC_CHILD_FAILURE: i32 = i32::MIN + 2;
-        const ERR_SEC_ITEM_NOT_FOUND: i32 = -25_300;
-        const PHASE_ENV: &str = "NAGI_KEYCHAIN_CONTRACT_PHASE";
-        const SERVICE_ENV: &str = "NAGI_KEYCHAIN_CONTRACT_SERVICE";
-        const SYNTHETIC_ACCOUNT: &str = "round-trip";
-        const TEST_NAME: &str =
-            "linear::credentials::tests::macos_keychain_round_trip_uses_only_a_synthetic_locator";
-
-        if let Ok(phase) = std::env::var(PHASE_ENV) {
-            let service = std::env::var(SERVICE_ENV).expect("synthetic service");
-            assert!(service.starts_with("dev.nagi.contract.synthetic."));
-            assert_ne!(SYNTHETIC_ACCOUNT, "default");
-            let store = KeychainStore::new_for_test(&service, SYNTHETIC_ACCOUNT)
-                .unwrap_or_else(|status| panic!("synthetic Keychain setup failed ({status})"));
-            match phase.as_str() {
-                "write" => store
-                    .write_for_test(br#"synthetic-keychain-record"#)
-                    .expect("synthetic Keychain write"),
-                "read" => {
-                    let value = store
-                        .read_for_test()
-                        .expect("synthetic Keychain read")
-                        .expect("synthetic Keychain item");
-                    assert!(value.as_slice() == br#"synthetic-keychain-record"#);
-                }
-                _ => panic!("unknown synthetic Keychain phase"),
-            }
-            return;
-        }
-
-        let suffix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let service = format!("dev.nagi.contract.synthetic.{suffix}");
-        assert!(service.starts_with("dev.nagi.contract.synthetic."));
-        assert_ne!(SYNTHETIC_ACCOUNT, "default");
-        let store =
-            KeychainStore::new_for_test(&service, SYNTHETIC_ACCOUNT).unwrap_or_else(|status| {
-                panic!("synthetic Keychain preflight failed (OSStatus {status})")
-            });
-        match store.read_for_test() {
-            Ok(None) => {}
-            Ok(Some(_)) => panic!("synthetic Keychain locator was not absent before the test"),
-            Err(status) => panic!("synthetic Keychain preflight failed (OSStatus {status})"),
-        }
-        let result = (|| {
-            for phase in ["write", "read"] {
-                let output = std::process::Command::new(
-                    std::env::current_exe().map_err(|_| SYNTHETIC_CHILD_FAILURE)?,
-                )
-                .args(["--exact", TEST_NAME, "--ignored", "--nocapture"])
-                .env(PHASE_ENV, phase)
-                .env(SERVICE_ENV, &service)
-                .output()
-                .map_err(|_| SYNTHETIC_CHILD_FAILURE)?;
-                if !output.status.success()
-                    || output
-                        .stdout
-                        .windows(br#"synthetic-keychain-record"#.len())
-                        .any(|window| window == br#"synthetic-keychain-record"#)
-                    || output
-                        .stderr
-                        .windows(br#"synthetic-keychain-record"#.len())
-                        .any(|window| window == br#"synthetic-keychain-record"#)
-                {
-                    return Err(SYNTHETIC_CHILD_FAILURE);
-                }
-            }
-            let value = store.read_for_test()?.ok_or(ERR_SEC_ITEM_NOT_FOUND)?;
-            if value.as_slice() != br#"synthetic-keychain-record"# {
-                return Err(SYNTHETIC_MISMATCH);
-            }
-            Ok::<(), i32>(())
-        })();
-        // Cleanup is attempted regardless of assertion/result outcome, and the
-        // locator is never the production service/account pair.
-        let cleanup = store.delete_for_test().and_then(|()| {
-            if store.read_for_test()?.is_none() {
-                Ok(())
-            } else {
-                Err(SYNTHETIC_NOT_ABSENT)
-            }
-        });
-        match (result, cleanup) {
-            (Ok(()), Ok(())) => {}
-            (result, cleanup) => {
-                panic!("synthetic Keychain contract failed: result={result:?}, cleanup={cleanup:?}")
-            }
-        }
     }
 
     #[test]

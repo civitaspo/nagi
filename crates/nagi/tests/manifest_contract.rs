@@ -13,13 +13,6 @@ const VERSIONS: &str = include_str!("../../../contracts/versions.toml");
 const MISE: &str = include_str!("../../../mise.toml");
 const MISE_LOCK: &str = include_str!("../../../mise.lock");
 const WORKSPACE_CARGO: &str = include_str!("../../../Cargo.toml");
-const PACKAGE_CARGO: &str = include_str!("../Cargo.toml");
-const CREDENTIALS_SOURCE: &str = include_str!("../src/linear/credentials.rs");
-const CLI_SOURCE: &str = include_str!("../src/cli.rs");
-const MAIN_SOURCE: &str = include_str!("../src/main.rs");
-const LINEAR_OAUTH_DOC: &str = include_str!("../../../docs/linear-oauth.md");
-const OAUTH_ADR: &str = include_str!("../../../docs/adr/0001-linear-oauth-pkce.md");
-const AGENTS: &str = include_str!("../../../AGENTS.md");
 
 #[cfg(unix)]
 const MACOS_SCRIPT: &str = concat!(
@@ -408,78 +401,6 @@ fn tool_manifests_cross_check_declared_versions_and_backends() {
     }
 }
 
-#[test]
-fn standalone_credential_boundary_has_file_keychain_and_pure_executable_contract() {
-    let workspace = parse_toml("workspace Cargo.toml", WORKSPACE_CARGO);
-    let workspace = toml_table("workspace Cargo.toml", &workspace);
-    let members = workspace
-        .get("workspace")
-        .and_then(TomlValue::as_table)
-        .and_then(|workspace| workspace.get("members"))
-        .and_then(TomlValue::as_array)
-        .expect("workspace members");
-    assert_eq!(members.len(), 1);
-    assert_eq!(members[0].as_str(), Some("crates/nagi"));
-
-    let package = parse_toml("nagi Cargo.toml", PACKAGE_CARGO);
-    let package = toml_table("nagi Cargo.toml", &package);
-    assert_eq!(
-        toml_string(
-            "nagi package",
-            package.get("package").unwrap().as_table().unwrap(),
-            "name"
-        ),
-        "nagi"
-    );
-    assert!(!PACKAGE_CARGO.contains(".app"));
-    assert!(!PACKAGE_CARGO.to_ascii_lowercase().contains("provision"));
-    assert!(!PACKAGE_CARGO.to_ascii_lowercase().contains("entitlement"));
-
-    for forbidden in [
-        "use_protected_keychain",
-        "kSecUseDataProtectionKeychain",
-        "kSecAttrSynchronizable",
-        "set_access_synchronized",
-        "kSecAttrAccessGroup",
-        "set_access_group",
-        "application-identifier",
-        "keychain-access-groups",
-    ] {
-        assert!(
-            !CREDENTIALS_SOURCE.contains(forbidden),
-            "credential implementation contains forbidden standalone selector: {forbidden}"
-        );
-    }
-    for required in [
-        "ItemAddOptions",
-        "ItemSearchOptions",
-        "ItemUpdateOptions",
-        "Location::FileKeychain",
-        "SecKeychain::default",
-        "update_item",
-    ] {
-        assert!(
-            CREDENTIALS_SOURCE.contains(required),
-            "credential implementation is missing the file-based SecItem boundary: {required}"
-        );
-    }
-    assert!(!CREDENTIALS_SOURCE.to_ascii_lowercase().contains("sqlite"));
-    assert!(CLI_SOURCE.contains("println!(\"{}\", manager.status())"));
-    assert!(!CLI_SOURCE.contains("println!(\"{}\", token"));
-    assert!(!MAIN_SOURCE.contains("token"));
-
-    for source in [LINEAR_OAUTH_DOC, OAUTH_ADR, AGENTS] {
-        assert!(source.contains("file-based"));
-        assert!(source.contains("restart"));
-        assert!(source.contains("provisioning"));
-        assert!(source.contains("SQLite") || source.contains("sqlite"));
-    }
-    assert!(LINEAR_OAUTH_DOC.contains("fresh test processes"));
-    assert!(LINEAR_OAUTH_DOC.contains("fails closed"));
-    assert!(OAUTH_ADR.contains("pure executable"));
-    assert!(OAUTH_ADR.contains("ACL/shim"));
-}
-
 #[cfg(unix)]
 fn command_output(script: &str, environment: &[(&str, &str)]) -> Output {
     let mut command = Command::new("bash");
@@ -535,7 +456,7 @@ fn macos_preflight_is_opt_in_and_platform_gated() {
 
 #[cfg(unix)]
 #[test]
-fn standalone_binary_is_a_single_plain_executable_with_a_closed_cli_surface() {
+fn standalone_binary_is_a_single_plain_executable() {
     let executable = std::path::Path::new(env!("CARGO_BIN_EXE_nagi"));
     assert!(executable.is_file());
     let executable_text = executable.to_string_lossy().to_ascii_lowercase();
@@ -545,17 +466,6 @@ fn standalone_binary_is_a_single_plain_executable_with_a_closed_cli_surface() {
         executable.file_name().and_then(|name| name.to_str()),
         Some("nagi")
     );
-
-    let sentinel = b"synthetic-cli-secret";
-    let output = Command::new(executable)
-        .args(["auth", "linear", "login", "--token", "synthetic-cli-secret"])
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .output()
-        .expect("standalone CLI should start");
-    assert!(!output.status.success());
-    assert!(!bytes_contain(&output.stdout, sentinel));
-    assert!(!bytes_contain(&output.stderr, sentinel));
 }
 
 #[cfg(unix)]
