@@ -15,7 +15,7 @@ use crate::linear::ReadContractError;
 use crate::linear::oauth::{self, OAuthConfig};
 use crate::linear::oauth::{OAuthError, TokenBundle};
 #[cfg(any(test, target_os = "macos"))]
-use crate::linear::read::{ReadContractReport, VerifiedReadOutcome};
+use crate::linear::read::VerifiedReadOutcome;
 #[cfg(target_os = "macos")]
 use oauth2::reqwest::blocking::{Body, Client, ClientBuilder, Response};
 #[cfg(target_os = "macos")]
@@ -1227,13 +1227,13 @@ impl CredentialManager {
 
     /// Acquires a serialized token lease, accepts only a typed fully verified
     /// read outcome, persists or checks its app viewer binding while the lock
-    /// remains held, and returns its redaction-only report. A failed provider
-    /// verification never reaches the binding write.
+    /// remains held. A failed provider verification never reaches the binding
+    /// write.
     #[cfg(any(test, target_os = "macos"))]
     pub(crate) fn with_verified_read(
         &mut self,
         callback: impl FnOnce(&str) -> Result<VerifiedReadOutcome, ReadContractError>,
-    ) -> Result<ReadContractReport, ReadContractError> {
+    ) -> Result<(), ReadContractError> {
         let _guard = self
             .critical_section
             .lock()
@@ -1242,10 +1242,10 @@ impl CredentialManager {
             .load_access_record()
             .map_err(ReadContractError::Credential)?;
         let outcome = callback(record.envelope.access_token.as_str())?;
-        let (report, viewer_id) = outcome.into_parts();
+        let viewer_id = outcome.into_viewer_id();
         self.bind_viewer_id(record, viewer_id)
             .map_err(ReadContractError::Credential)?;
-        Ok(report)
+        Ok(())
     }
 
     /// Explicitly revokes the latest refresh token and then removes local state.
@@ -2246,13 +2246,12 @@ mod tests {
         let writes = Rc::clone(&store.writes);
         let mut manager = fake_manager(store, FakeTransport::new([]), NOW_MS, authorizer());
 
-        let report = manager
+        manager
             .with_verified_read(|token| {
                 assert_eq!(token, ACCESS);
                 Ok(VerifiedReadOutcome::for_test(VIEWER))
             })
             .expect("verified read");
-        assert!(report.redaction_verified());
         assert_eq!(writes.get(), 1);
         let record = manager.load_record().expect("record").expect("record");
         assert_eq!(record.envelope.revision, 2);
@@ -2434,7 +2433,7 @@ mod tests {
     }
 
     #[test]
-    fn bind_write_failure_returns_no_report_and_preserves_record() {
+    fn bind_write_failure_preserves_record() {
         let initial = ready_bytes(1, READY_AT_MS);
         let store = MemoryStore {
             value: Some(initial.clone()),

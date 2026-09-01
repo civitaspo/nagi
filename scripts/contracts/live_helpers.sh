@@ -51,6 +51,76 @@ live_validate_path_components() {
   return 0
 }
 
+live_trusted_executable() {
+  (($# == 1)) || return 1
+  local candidate="$1"
+  live_validate_path_components "${candidate}" \
+    && [[ -f "${candidate}" && ! -L "${candidate}" && -x "${candidate}" ]]
+}
+live_select_trusted_git() {
+  (($# == 0)) || return 1
+  local candidate
+  for candidate in /usr/bin/git /usr/local/bin/git /opt/homebrew/bin/git; do
+    if live_trusted_executable "${candidate}"; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+  return 1
+}
+live_validate_repository_args() {
+  (($# == 2)) || return 1
+  local git_path="$1" repo_root="$2"
+  [[ -d "${repo_root}" ]] && live_validate_path_components "${repo_root}" \
+    && live_trusted_executable "${git_path}"
+}
+live_resolve_repository() {
+  (($# == 2)) || return 1
+  local script_directory="$1" git_path="$2" repo_candidate repo_root
+  [[ -d "${script_directory}" ]] \
+    && live_validate_path_components "${script_directory}" \
+    && live_trusted_executable "${git_path}" \
+    || return 1
+  repo_candidate="$(cd "${script_directory}/../.." 2>/dev/null && pwd -P 2>/dev/null)" \
+    || return 1
+  live_validate_repository_args "${git_path}" "${repo_candidate}" || return 1
+  repo_root="$("${git_path}" -C "${repo_candidate}" rev-parse --show-toplevel 2>/dev/null)" \
+    || return 1
+  live_validate_repository_args "${git_path}" "${repo_root}" || return 1
+  printf '%s\n' "${repo_root}"
+}
+live_validate_clean_revision() {
+  (($# == 2)) || return 1
+  local git_path="$1" repo_root="$2" status_output
+  live_validate_repository_args "${git_path}" "${repo_root}" || return 1
+  "${git_path}" -C "${repo_root}" diff --quiet --exit-code HEAD -- 2>/dev/null \
+    || return 1
+  "${git_path}" -C "${repo_root}" diff --cached --quiet --exit-code HEAD -- 2>/dev/null \
+    || return 1
+  status_output="$("${git_path}" -C "${repo_root}" status --porcelain --untracked-files=all 2>/dev/null)" \
+    || return 1
+  [[ -z "${status_output}" ]]
+}
+live_read_checked_revision() {
+  (($# == 2)) || return 1
+  local git_path="$1" repo_root="$2" revision
+  live_validate_repository_args "${git_path}" "${repo_root}" || return 1
+  revision="$("${git_path}" -C "${repo_root}" rev-parse --verify HEAD 2>/dev/null)" \
+    || return 1
+  [[ "${revision}" =~ ^[0-9a-f]{40}$ ]] || return 1
+  printf '%s\n' "${revision}"
+}
+live_validate_home_directory() {
+  (($# == 1)) || return 1
+  local home_directory="$1"
+  case "${home_directory}" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  [[ "${home_directory}" != *$'\n'* && "${home_directory}" != *$'\r'* \
+    && "${home_directory}" != *$'\t'* && -d "${home_directory}" ]]
+}
+
 live_file_size() {
   /usr/bin/wc -c <"$1" | /usr/bin/tr -d '[:space:]'
 }

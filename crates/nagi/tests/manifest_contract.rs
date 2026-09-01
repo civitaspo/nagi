@@ -589,12 +589,12 @@ fn live_preflight_validates_configuration_and_never_exposes_values() {
 #[test]
 fn live_runner_builds_and_supervises_one_raw_standalone_binary() {
     assert!(LIVE_SCRIPT_SOURCE.contains("BASH_SOURCE"));
-    assert!(LIVE_SCRIPT_SOURCE.contains("\"${git_path}\" -C \"${repo_root}\""));
+    assert!(LIVE_HELPERS_SOURCE.contains("\"${git_path}\" -C \"${repo_root}\""));
     assert!(LIVE_SCRIPT_SOURCE.contains("live_helpers.sh"));
     assert!(LIVE_SCRIPT_SOURCE.contains("build-raw.sh"));
     assert!(LIVE_SCRIPT_SOURCE.contains("target/nagi-contract"));
     assert!(LIVE_SCRIPT_SOURCE.contains("debug/nagi"));
-    assert!(LIVE_SCRIPT_SOURCE.contains("is_clean_checked_revision"));
+    assert!(LIVE_SCRIPT_SOURCE.contains("live_validate_clean_revision"));
     assert!(LIVE_SCRIPT_SOURCE.contains("post_revision"));
     assert!(LIVE_SCRIPT_SOURCE.contains("env -i"));
     assert!(LIVE_SCRIPT_SOURCE.contains("HOME=\"${home_directory}\""));
@@ -627,7 +627,7 @@ fn live_runner_builds_and_supervises_one_raw_standalone_binary() {
     assert!(LIVE_SCRIPT_SOURCE.contains("live_validate_binary \"${binary}\""));
     assert!(LIVE_SCRIPT_SOURCE.contains("${command_status}\" -eq 125"));
     assert!(RAW_BUILD_SOURCE.contains("build --locked --offline --bin nagi"));
-    assert!(RAW_BUILD_SOURCE.contains("/usr/bin/git"));
+    assert!(LIVE_HELPERS_SOURCE.contains("/usr/bin/git"));
     assert!(RAW_BUILD_SOURCE.contains("\"${mise_path}\" exec --locked"));
     assert!(RAW_BUILD_SOURCE.contains("rust@1.98.0"));
     assert!(RAW_BUILD_SOURCE.contains("EXPECTED_RUST_VERSION=1.98.0"));
@@ -655,7 +655,7 @@ fn live_runner_has_hermetic_negative_gates_for_child_and_binary() {
         "stderr_size > max_output_bytes",
         "if ((timed_out));",
         "return 125",
-        "rejected the checked repository",
+        "live_resolve_repository",
         "requires a clean checked revision",
     ] {
         assert!(

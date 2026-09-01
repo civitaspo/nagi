@@ -85,60 +85,32 @@ fi
 # All revision checks and the build below are scoped to this exact checkout.
 script_directory="$(cd "$(/usr/bin/dirname "${BASH_SOURCE[0]}")" && pwd -P 2>/dev/null || true)"
 helper_script="${script_directory}/live_helpers.sh"
-repo_candidate="$(cd "${script_directory}/../.." && pwd -P 2>/dev/null || true)"
-git_path=""
-for candidate in /usr/bin/git /usr/local/bin/git /opt/homebrew/bin/git; do
-  if [[ -f "${candidate}" && ! -L "${candidate}" && -x "${candidate}" ]]; then
-    git_path="${candidate}"
-    break
-  fi
-done
-if [[ -z "${git_path}" ]]; then
-  echo "Live preflight requires a trusted Git executable." >&2
-  exit 1
-fi
-repo_root="$("${git_path}" -C "${repo_candidate}" rev-parse --show-toplevel 2>/dev/null || true)"
-case "${repo_root}" in
-  /*) ;;
-  *)
-    echo "Live preflight could not determine the checked source directory." >&2
-    exit 1
-    ;;
-esac
-if [[ "${repo_root}" == *$'\n'* || "${repo_root}" == *$'\r'* || "${repo_root}" == *$'\t'* || ! -d "${repo_root}" ]]; then
-  echo "Live preflight rejected the checked source directory." >&2
-  exit 1
-fi
-
-is_clean_checked_revision() {
-  if ! "${git_path}" -C "${repo_root}" diff --quiet --exit-code HEAD --; then
-    return 1
-  fi
-  if ! "${git_path}" -C "${repo_root}" diff --cached --quiet --exit-code HEAD --; then
-    return 1
-  fi
-  local status_output
-  status_output="$("${git_path}" -C "${repo_root}" status --porcelain --untracked-files=all)" || return 1
-  [[ -z "${status_output}" ]]
-}
-
-if ! is_clean_checked_revision; then
-  echo "Live preflight requires a clean checked revision." >&2
-  exit 1
-fi
-
-revision="$("${git_path}" -C "${repo_root}" rev-parse --verify HEAD 2>/dev/null || true)"
-if [[ ! "${revision}" =~ ^[0-9a-f]{40}$ ]]; then
-  echo "Live preflight could not determine a full checked revision." >&2
-  exit 2
-fi
-
 if [[ ! -f "${helper_script}" || -L "${helper_script}" ]]; then
   echo "Live preflight could not load its checked helper." >&2
   exit 1
 fi
 # shellcheck source=/dev/null
 . "${helper_script}"
+if ! live_validate_path_components "${script_directory}"; then
+  echo "Live preflight rejected its script path." >&2
+  exit 1
+fi
+if ! git_path="$(live_select_trusted_git)"; then
+  echo "Live preflight requires a trusted Git executable." >&2
+  exit 1
+fi
+if ! repo_root="$(live_resolve_repository "${script_directory}" "${git_path}")"; then
+  echo "Live preflight could not determine the checked source directory." >&2
+  exit 1
+fi
+if ! live_validate_clean_revision "${git_path}" "${repo_root}"; then
+  echo "Live preflight requires a clean checked revision." >&2
+  exit 1
+fi
+if ! revision="$(live_read_checked_revision "${git_path}" "${repo_root}")"; then
+  echo "Live preflight could not determine a full checked revision." >&2
+  exit 2
+fi
 
 if [[ "$(/usr/bin/uname -s)" != "Darwin" ]]; then
   echo "Live-provider contracts require macOS Keychain support." >&2
@@ -146,14 +118,14 @@ if [[ "$(/usr/bin/uname -s)" != "Darwin" ]]; then
 fi
 
 home_directory="${HOME:-}"
-case "${home_directory}" in
-  /*) ;;
-  *)
-    echo "Live preflight requires a valid local Keychain home directory." >&2
-    exit 1
-    ;;
-esac
-if [[ "${home_directory}" == *$'\n'* || "${home_directory}" == *$'\r'* || "${home_directory}" == *$'\t'* || ! -d "${home_directory}" ]]; then
+if ! live_validate_home_directory "${home_directory}"; then
+  case "${home_directory}" in
+    /*) ;;
+    *)
+      echo "Live preflight requires a valid local Keychain home directory." >&2
+      exit 1
+      ;;
+  esac
   echo "Live preflight rejected the local Keychain home directory." >&2
   exit 1
 fi
@@ -188,7 +160,7 @@ if [[ ! "${binary_digest_before}" =~ ^[0-9a-f]{64}$ ]]; then
   exit 1
 fi
 
-if ! is_clean_checked_revision; then
+if ! live_validate_clean_revision "${git_path}" "${repo_root}"; then
   echo "Live preflight rejected a changed checked revision after the build." >&2
   exit 1
 fi
@@ -264,8 +236,12 @@ if [[ ${command_status} -eq 0 && ${stderr_size} -ne 0 ]]; then
   exit 1
 fi
 
-post_revision="$("${git_path}" -C "${repo_root}" rev-parse --verify HEAD 2>/dev/null || true)"
-if ! live_validate_revision "${revision}" "${post_revision}" || ! is_clean_checked_revision; then
+post_revision=""
+if ! post_revision="$(live_read_checked_revision "${git_path}" "${repo_root}")"; then
+  post_revision=""
+fi
+if ! live_validate_revision "${revision}" "${post_revision}" \
+  || ! live_validate_clean_revision "${git_path}" "${repo_root}"; then
   echo "Live preflight rejected a changed checked revision after the run." >&2
   exit 1
 fi

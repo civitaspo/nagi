@@ -126,68 +126,35 @@ impl fmt::Debug for ReadContractConfig {
     }
 }
 
-/// Redaction state retained after a successful read-contract verification.
-///
-/// All other contract checks are represented by the surrounding `Result`; no
-/// IDs, timestamps, content, page counts, rate-limit counts, or provider
-/// payloads are retained in this value.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ReadContractReport {
-    redaction_verified: bool,
-}
-
-impl ReadContractReport {
-    #[cfg(test)]
-    pub(crate) fn for_test() -> Self {
-        Self {
-            redaction_verified: true,
-        }
-    }
-
-    /// Returns whether content was reduced to presence-only state.
-    pub(crate) fn redaction_verified(&self) -> bool {
-        self.redaction_verified
-    }
-}
-
-/// Internal result of a fully verified read. The viewer ID is kept separate
-/// from the redaction-only report and is zeroized as soon as credential binding
-/// consumes it.
+/// Internal result of a fully verified read. The viewer ID is zeroized as soon
+/// as credential binding consumes it. All other contract checks are
+/// represented by the surrounding `Result`.
 #[derive(Eq, PartialEq)]
 pub(crate) struct VerifiedReadOutcome {
-    report: ReadContractReport,
     viewer_id: Zeroizing<String>,
 }
 
 impl VerifiedReadOutcome {
-    fn new(report: ReadContractReport, viewer_id: Zeroizing<String>) -> Self {
-        Self { report, viewer_id }
+    fn new(viewer_id: Zeroizing<String>) -> Self {
+        Self { viewer_id }
     }
 
     #[cfg(test)]
     pub(crate) fn for_test(viewer_id: &str) -> Self {
-        Self::new(
-            ReadContractReport::for_test(),
-            Zeroizing::new(viewer_id.to_owned()),
-        )
+        Self::new(Zeroizing::new(viewer_id.to_owned()))
     }
 
-    pub(crate) fn into_parts(self) -> (ReadContractReport, Zeroizing<String>) {
-        (self.report, self.viewer_id)
-    }
-}
-
-impl std::ops::Deref for VerifiedReadOutcome {
-    type Target = ReadContractReport;
-
-    fn deref(&self) -> &Self::Target {
-        &self.report
+    pub(crate) fn into_viewer_id(self) -> Zeroizing<String> {
+        self.viewer_id
     }
 }
 
 impl fmt::Debug for VerifiedReadOutcome {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.report.fmt(formatter)
+        formatter
+            .debug_struct("VerifiedReadOutcome")
+            .field("viewer_id", &"[redacted]")
+            .finish()
     }
 }
 
@@ -530,12 +497,29 @@ fn parse_rate_limit_value(
     value.parse::<u64>().ok()
 }
 
+/// Presence-only marker for the top-level GraphQL `errors` member. A missing
+/// member uses `Default`; any present JSON value is consumed and rejected by
+/// the decoder without retaining provider error contents.
+#[derive(Default)]
+struct GraphqlErrorsPresence(bool);
+
+impl<'de> Deserialize<'de> for GraphqlErrorsPresence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        serde::de::IgnoredAny::deserialize(deserializer)?;
+        Ok(Self(true))
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GraphqlEnvelope<T> {
     data: Option<T>,
     #[serde(default)]
-    errors: Vec<serde::de::IgnoredAny>,
+    #[serde(rename = "errors")]
+    errors: GraphqlErrorsPresence,
     /// GraphQL permits implementation-specific top-level extensions. They
     /// are intentionally ignored after the closed data shape is parsed.
     #[allow(dead_code)]
@@ -646,7 +630,7 @@ where
 }
 
 /// Content is consumed into a presence bit at deserialization time. This keeps
-/// the report from retaining an issue description or comment body.
+/// the verified outcome from retaining an issue description or comment body.
 #[derive(Clone, Copy, Debug)]
 struct ContentPresence(bool);
 
@@ -666,7 +650,6 @@ struct PageResult {
     has_next_page: bool,
     end_cursor: Option<String>,
     last_edge_cursor: Option<String>,
-    redaction_verified: bool,
 }
 
 fn decode<T: for<'de> Deserialize<'de>>(response: ReadResponse) -> Result<T, ReadContractError> {
@@ -681,7 +664,7 @@ fn decode<T: for<'de> Deserialize<'de>>(response: ReadResponse) -> Result<T, Rea
     }
     let envelope: GraphqlEnvelope<T> =
         serde_json::from_slice(&response.body).map_err(|_| ReadContractError::GraphqlResponse)?;
-    if !envelope.errors.is_empty() {
+    if envelope.errors.0 {
         return Err(ReadContractError::GraphqlResponse);
     }
     envelope.data.ok_or(ReadContractError::GraphqlResponse)
@@ -703,7 +686,6 @@ fn verify_read(
     let mut app_actor_id = None;
     let mut seen_cursors = Vec::new();
     let mut seen_comment_ids = Vec::new();
-    let mut redaction_verified = false;
     for _ in 0..MAX_COMMENT_PAGES {
         let previous_cursor_count = seen_cursors.len();
         let request = GraphqlRequest::issue(
@@ -720,7 +702,6 @@ fn verify_read(
             &mut seen_cursors,
             &mut seen_comment_ids,
         )?;
-        redaction_verified |= page.redaction_verified;
         if page
             .last_edge_cursor
             .as_deref()
@@ -737,14 +718,10 @@ fn verify_read(
             {
                 return Err(ReadContractError::PaginationInvalid);
             }
-            if !redaction_verified {
-                return Err(ReadContractError::ReadFieldsInvalid);
-            }
-            let report = ReadContractReport { redaction_verified };
             let viewer_id = app_actor_id
                 .take()
                 .ok_or(ReadContractError::ActorIdentityMismatch)?;
-            return Ok(VerifiedReadOutcome::new(report, viewer_id));
+            return Ok(VerifiedReadOutcome::new(viewer_id));
         }
         let next = page
             .end_cursor
@@ -841,7 +818,6 @@ fn validate_scope(
     }
 
     let mut last_edge_cursor = None;
-    let mut comment_body_present = true;
     for edge in &comments.edges {
         validate_opaque(&edge.cursor, ReadContractError::PaginationInvalid)?;
         if seen_cursors.iter().any(|cursor| cursor == &edge.cursor) {
@@ -873,7 +849,6 @@ fn validate_scope(
         if !comment.body.0 {
             return Err(ReadContractError::ReadFieldsInvalid);
         }
-        comment_body_present &= comment.body.0;
     }
 
     let end_cursor = match &comments.page_info.end_cursor {
@@ -895,7 +870,6 @@ fn validate_scope(
         has_next_page: comments.page_info.has_next_page,
         end_cursor,
         last_edge_cursor,
-        redaction_verified: description.0 && comment_body_present,
     })
 }
 
@@ -955,7 +929,7 @@ fn valid_timestamp(value: &str) -> bool {
 pub(crate) fn run_live(
     manager: &mut CredentialManager,
     config: &ReadContractConfig,
-) -> Result<ReadContractReport, ReadContractError> {
+) -> Result<(), ReadContractError> {
     let mut transport = HttpsReadTransport::new()?;
     manager.with_verified_read(|access_token| verify_read(&mut transport, access_token, config))
 }
@@ -1265,11 +1239,8 @@ mod tests {
             .expect("missing errors succeeds");
         assert_eq!(missing, serde_json::json!({"ok": true}));
 
-        let empty = decode::<serde_json::Value>(response(br#"{"data":{"ok":true},"errors":[]}"#))
-            .expect("empty errors succeeds");
-        assert_eq!(empty, serde_json::json!({"ok": true}));
-
         for errors in [
+            serde_json::json!([]),
             serde_json::Value::Null,
             serde_json::json!(42),
             serde_json::json!({}),
@@ -1380,8 +1351,7 @@ mod tests {
                 "synthetic-comment-two",
             )),
         ]);
-        let report = verify_read(&mut transport, ACCESS, &config()).expect("contract");
-        assert!(report.redaction_verified());
+        verify_read(&mut transport, ACCESS, &config()).expect("contract");
         assert_eq!(transport.requests.len(), 2);
         let first = String::from_utf8_lossy(&transport.requests[0]);
         let second = String::from_utf8_lossy(&transport.requests[1]);
@@ -1854,8 +1824,7 @@ mod tests {
                 "synthetic-comment-two",
             )),
         ]);
-        let report = verify_read(&mut transport, ACCESS, &config()).expect("contract");
-        assert!(report.redaction_verified());
+        verify_read(&mut transport, ACCESS, &config()).expect("contract");
     }
 
     #[test]
@@ -2130,8 +2099,8 @@ mod tests {
                 "synthetic-comment-two",
             )),
         ]);
-        let report = verify_read(&mut transport, ACCESS, &config()).expect("contract");
-        let debug = format!("{report:?}");
+        let outcome = verify_read(&mut transport, ACCESS, &config()).expect("contract");
+        let debug = format!("{outcome:?}");
         assert!(!debug.contains(ACCESS));
         assert!(!debug.contains("synthetic-app"));
         assert!(!debug.contains("synthetic issue body"));

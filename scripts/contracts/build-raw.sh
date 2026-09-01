@@ -60,71 +60,35 @@ if (($# != 0)); then
   exit 2
 fi
 
-trusted_executable() {
-  local candidate="$1"
-  [[ "${candidate}" == /* && -f "${candidate}" && ! -L "${candidate}" && -x "${candidate}" ]] \
-    && live_validate_path_components "${candidate}"
-}
-
-git_path=""
-for candidate in /usr/bin/git /usr/local/bin/git /opt/homebrew/bin/git; do
-  if trusted_executable "${candidate}"; then
-    git_path="${candidate}"
-    break
-  fi
-done
-if [[ -z "${git_path}" ]]; then
+if ! git_path="$(live_select_trusted_git)"; then
   echo "Raw Nagi build requires a trusted Git executable." >&2
   exit 1
 fi
 
-repo_candidate="$(cd "${script_directory}/../.." && pwd -P 2>/dev/null || true)"
-repo_root="$("${git_path}" -C "${repo_candidate}" rev-parse --show-toplevel 2>/dev/null || true)"
-case "${repo_root}" in
-  /*) ;;
-  *)
-    echo "Raw Nagi build requires a checked repository." >&2
-    exit 1
-    ;;
-esac
-if [[ "${repo_root}" == *$'\n'* || "${repo_root}" == *$'\r'* || "${repo_root}" == *$'\t'* || ! -d "${repo_root}" ]]; then
-  echo "Raw Nagi build rejected the checked repository." >&2
-  exit 1
-fi
-if ! live_validate_path_components "${repo_root}"; then
-  echo "Raw Nagi build rejected the checked repository path." >&2
+if ! repo_root="$(live_resolve_repository "${script_directory}" "${git_path}")"; then
+  echo "Raw Nagi build requires a checked repository." >&2
   exit 1
 fi
 
-if ! "${git_path}" -C "${repo_root}" diff --quiet --exit-code HEAD --; then
-  echo "Raw Nagi build requires a clean checked revision." >&2
-  exit 1
-fi
-if ! "${git_path}" -C "${repo_root}" diff --cached --quiet --exit-code HEAD --; then
-  echo "Raw Nagi build requires a clean checked revision." >&2
-  exit 1
-fi
-status_output="$("${git_path}" -C "${repo_root}" status --porcelain --untracked-files=all)"
-if [[ -n "${status_output}" ]]; then
+if ! live_validate_clean_revision "${git_path}" "${repo_root}"; then
   echo "Raw Nagi build requires a clean checked revision." >&2
   exit 1
 fi
 
-revision="$("${git_path}" -C "${repo_root}" rev-parse --verify HEAD 2>/dev/null || true)"
-if [[ ! "${revision}" =~ ^[0-9a-f]{40}$ ]]; then
+if ! revision="$(live_read_checked_revision "${git_path}" "${repo_root}")"; then
   echo "Raw Nagi build could not determine a full checked revision." >&2
   exit 2
 fi
 
 home_directory="${HOME:-}"
-case "${home_directory}" in
-  /*) ;;
-  *)
-    echo "Raw Nagi build requires a valid local home directory." >&2
-    exit 1
-    ;;
-esac
-if [[ "${home_directory}" == *$'\n'* || "${home_directory}" == *$'\r'* || "${home_directory}" == *$'\t'* || ! -d "${home_directory}" ]]; then
+if ! live_validate_home_directory "${home_directory}"; then
+  case "${home_directory}" in
+    /*) ;;
+    *)
+      echo "Raw Nagi build requires a valid local home directory." >&2
+      exit 1
+      ;;
+  esac
   echo "Raw Nagi build rejected the local home directory." >&2
   exit 1
 fi
@@ -139,7 +103,7 @@ for candidate in \
   /usr/local/bin/mise \
   /usr/bin/mise \
   /bin/mise; do
-  if trusted_executable "${candidate}"; then
+  if live_trusted_executable "${candidate}"; then
     mise_path="${candidate}"
     break
   fi
@@ -244,9 +208,12 @@ if ! live_validate_binary "${binary}"; then
   exit 1
 fi
 
-post_revision="$("${git_path}" -C "${repo_root}" rev-parse --verify HEAD 2>/dev/null || true)"
-post_status_output="$("${git_path}" -C "${repo_root}" status --porcelain --untracked-files=all)"
-if [[ "${post_revision}" != "${revision}" || -n "${post_status_output}" ]]; then
+post_revision=""
+if ! post_revision="$(live_read_checked_revision "${git_path}" "${repo_root}")"; then
+  post_revision=""
+fi
+if ! live_validate_revision "${revision}" "${post_revision}" \
+  || ! live_validate_clean_revision "${git_path}" "${repo_root}"; then
   echo "Raw Nagi build rejected a changed checked revision." >&2
   exit 1
 fi

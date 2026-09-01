@@ -278,8 +278,8 @@ fn run_read_contract() -> Result<(), CliError> {
         read::run_live(&mut manager, &config)
     })();
     match result {
-        Ok(report) => {
-            println!("{}", render_read_contract_evidence(&revision, Ok(&report)));
+        Ok(()) => {
+            println!("{}", render_read_contract_evidence(&revision, Ok(())));
             Ok(())
         }
         Err(error) => {
@@ -382,10 +382,7 @@ struct EvidenceFailure {
 }
 
 #[cfg(target_os = "macos")]
-fn render_read_contract_evidence(
-    revision: &str,
-    result: Result<&read::ReadContractReport, ReadContractError>,
-) -> String {
+fn render_read_contract_evidence(revision: &str, result: Result<(), ReadContractError>) -> String {
     let passed = result.is_ok();
     let evidence = ReadContractEvidence {
         schema_version: 1,
@@ -415,14 +412,7 @@ fn render_read_contract_evidence(
             },
             EvidenceCheck {
                 name: "redaction",
-                result: if result
-                    .as_ref()
-                    .is_ok_and(|report| report.redaction_verified())
-                {
-                    "pass"
-                } else {
-                    "fail"
-                },
+                result: if passed { "pass" } else { "fail" },
             },
             EvidenceCheck {
                 name: "preflight",
@@ -486,10 +476,9 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn read_contract_evidence_is_closed_and_reflects_report_outcome() {
+    fn read_contract_evidence_is_closed_and_reflects_result() {
         let revision = "0123456789abcdef0123456789abcdef01234567";
-        let passing_report = read::ReadContractReport::for_test();
-        let passing = render_read_contract_evidence(revision, Ok(&passing_report));
+        let passing = render_read_contract_evidence(revision, Ok(()));
         let passing: serde_json::Value = serde_json::from_str(&passing).expect("evidence JSON");
         let passing_object = passing.as_object().expect("evidence object");
         assert_eq!(

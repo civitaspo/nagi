@@ -84,7 +84,7 @@ Although the domain operation is read-only, the internal access lease may
 durably persist refresh/replay intent transitions, a refreshed credential, or
 the first verified viewer binding while its lock is held. Therefore
 `with_access_token`/the verified read lease is not a storage-read-only API; its
-production read path returns only a fully verified boolean report.
+production read path returns only a fully verified success/failure result.
 
 `status` is local classification only and never refreshes, revokes, launches a
 browser, deletes data, or prints secret-bearing values. A replay-pending record
@@ -146,33 +146,11 @@ top-level comments with non-whitespace bodies; the bounded `first: 1` query
 proves one cursor transition without enumerating the workspace or claiming
 collection completeness.
 
-The live runner resolves the repository from its own script path, requires a
-clean checked revision, and builds the ordinary raw
-`target/nagi-contract/debug/nagi` executable in that exact checkout with
-`NAGI_CONTRACT_BUILD_REVISION` set to the checked revision. This deterministic
-path is also the path used for the explicit local login that creates the
-existing Keychain lease; no alternate binary is accepted. The runner rejects
-symlinked target path components, scripts, wrong names, and app-like bundle
-paths, and verifies a native Mach-O file before execution. The locked mise
-Rust/Cargo build has its own five-minute bounded supervisor. The read child has
-a 150-second deadline covering the four bounded 30-second page requests plus
-startup, contained-group termination, and reap; evidence is printed only when
-it exactly matches the closed pass or fail record. Cargo runs offline through a
-fixed `env -i`; the child receives only validated non-secret bindings and the
-selected `HOME`; no signing, profile, browser, or token flow is needed.
-The runner compares a SHA-256 binding immediately before and after execution to
-detect artifact replacement; a same-UID path race remains a runtime-integrity
-limitation for the later signed-manifest gate.
-
-To create the lease, an operator first runs the shared raw-build helper from
-the exact checkout, `scripts/contracts/build-raw.sh`, then invokes
-`target/nagi-contract/debug/nagi auth linear login` with the local client ID
-and optional callback-port configuration. The helper embeds the exact checked
-revision, validates the pinned Rust release/source revision, and uses the same
-deterministic target path and offline build settings as the live runner. Login
-refuses to replace existing state. The later live runner rebuilds that same
-path and only performs the read; it never performs login or silently changes
-credentials.
+The raw-build and live-runner procedure and standalone evidence constraints are
+documented in the [contract test harness](contract-testing.md). OAuth's role is
+limited to the explicit `auth linear login` step that creates the Keychain
+lease; login refuses to replace existing state, and the later read does not
+silently change credentials.
 
 Confirmed logout first
 persists revoke-pending, then sends the documented
