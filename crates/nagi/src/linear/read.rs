@@ -970,160 +970,89 @@ mod tests {
         ReadResponse::synthetic(200, true, body).expect("response")
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn scope_response(
-        actor_id: &str,
+    struct SyntheticScope {
+        actor_id: &'static str,
         actor_app: bool,
         actor_is_me: bool,
-        issue_id: &str,
-        issue_team: &str,
-        issue_workspace: &str,
-        team_id: &str,
-        team_workspace: &str,
+        issue_id: &'static str,
+        issue_team: &'static str,
+        issue_workspace: &'static str,
+        team_id: &'static str,
+        team_workspace: &'static str,
         has_next: bool,
-        edge_cursor: &str,
-        end_cursor: Option<&str>,
-    ) -> Vec<u8> {
-        scope_response_with_content(
-            actor_id,
-            actor_app,
-            actor_is_me,
-            issue_id,
-            issue_team,
-            issue_workspace,
-            team_id,
-            team_workspace,
-            has_next,
-            edge_cursor,
-            end_cursor,
-            "synthetic issue body",
-            "synthetic comment body",
-        )
+        edge_cursor: &'static str,
+        end_cursor: Option<&'static str>,
+        issue_body: &'static str,
+        comment_body: &'static str,
+        comment_id: &'static str,
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn scope_response_with_comment_id(
-        actor_id: &str,
-        actor_app: bool,
-        actor_is_me: bool,
-        issue_id: &str,
-        issue_team: &str,
-        issue_workspace: &str,
-        team_id: &str,
-        team_workspace: &str,
-        has_next: bool,
-        edge_cursor: &str,
-        end_cursor: Option<&str>,
-        comment_id: &str,
-    ) -> Vec<u8> {
-        scope_response_with_content_and_id(
-            actor_id,
-            actor_app,
-            actor_is_me,
-            issue_id,
-            issue_team,
-            issue_workspace,
-            team_id,
-            team_workspace,
-            has_next,
-            edge_cursor,
-            end_cursor,
-            "synthetic issue body",
-            "synthetic comment body",
-            comment_id,
-        )
+    impl Default for SyntheticScope {
+        fn default() -> Self {
+            Self {
+                actor_id: "synthetic-app",
+                actor_app: true,
+                actor_is_me: true,
+                issue_id: ISSUE,
+                issue_team: TEAM,
+                issue_workspace: WORKSPACE,
+                team_id: TEAM,
+                team_workspace: WORKSPACE,
+                has_next: false,
+                edge_cursor: "cursor",
+                end_cursor: Some("cursor"),
+                issue_body: "synthetic issue body",
+                comment_body: "synthetic comment body",
+                comment_id: "synthetic-comment",
+            }
+        }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn scope_response_with_content(
-        actor_id: &str,
-        actor_app: bool,
-        actor_is_me: bool,
-        issue_id: &str,
-        issue_team: &str,
-        issue_workspace: &str,
-        team_id: &str,
-        team_workspace: &str,
-        has_next: bool,
-        edge_cursor: &str,
-        end_cursor: Option<&str>,
-        issue_body: &str,
-        comment_body: &str,
-    ) -> Vec<u8> {
-        scope_response_with_content_and_id(
-            actor_id,
-            actor_app,
-            actor_is_me,
-            issue_id,
-            issue_team,
-            issue_workspace,
-            team_id,
-            team_workspace,
-            has_next,
-            edge_cursor,
-            end_cursor,
-            issue_body,
-            comment_body,
-            "synthetic-comment",
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn scope_response_with_content_and_id(
-        actor_id: &str,
-        actor_app: bool,
-        actor_is_me: bool,
-        issue_id: &str,
-        issue_team: &str,
-        issue_workspace: &str,
-        team_id: &str,
-        team_workspace: &str,
-        has_next: bool,
-        edge_cursor: &str,
-        end_cursor: Option<&str>,
-        issue_body: &str,
-        comment_body: &str,
-        comment_id: &str,
-    ) -> Vec<u8> {
-        serde_json::json!({
-            "data": {
-                "organization": {"id": WORKSPACE},
-                "viewer": {
-                    "id": actor_id,
-                    "app": actor_app,
-                    "isMe": actor_is_me,
-                    "organization": {"id": WORKSPACE}
-                },
-                "team": {
-                    "id": team_id,
-                    "organization": {"id": team_workspace}
-                },
-                "issue": {
-                    "id": issue_id,
-                    "updatedAt": "2026-09-01T00:00:00.000Z",
-                    "description": issue_body,
-                    "team": {
-                        "id": issue_team,
-                        "organization": {"id": issue_workspace}
+    impl SyntheticScope {
+        fn response(self) -> Vec<u8> {
+            serde_json::json!({
+                "data": {
+                    "organization": {"id": WORKSPACE},
+                    "viewer": {
+                        "id": self.actor_id,
+                        "app": self.actor_app,
+                        "isMe": self.actor_is_me,
+                        "organization": {"id": WORKSPACE}
                     },
-                    "comments": {
-                        "edges": [{
-                            "cursor": edge_cursor,
-                            "node": {
-                                "id": comment_id,
-                                "updatedAt": "2026-09-01T00:00:01.000Z",
-                                "issueId": issue_id,
-                                "parentId": null,
-                                "body": comment_body
+                    "team": {
+                        "id": self.team_id,
+                        "organization": {"id": self.team_workspace}
+                    },
+                    "issue": {
+                        "id": self.issue_id,
+                        "updatedAt": "2026-09-01T00:00:00.000Z",
+                        "description": self.issue_body,
+                        "team": {
+                            "id": self.issue_team,
+                            "organization": {"id": self.issue_workspace}
+                        },
+                        "comments": {
+                            "edges": [{
+                                "cursor": self.edge_cursor,
+                                "node": {
+                                    "id": self.comment_id,
+                                    "updatedAt": "2026-09-01T00:00:01.000Z",
+                                    "issueId": self.issue_id,
+                                    "parentId": null,
+                                    "body": self.comment_body
+                                }
+                            }],
+                            "pageInfo": {
+                                "hasNextPage": self.has_next,
+                                "endCursor": self.end_cursor
                             }
-                        }],
-                        "pageInfo": {"hasNextPage": has_next, "endCursor": end_cursor}
+                        }
                     }
                 }
-            }
-        })
-        .to_string()
-        .into_bytes()
+            })
+            .to_string()
+            .into_bytes()
+        }
     }
 
     #[test]
@@ -1285,20 +1214,7 @@ mod tests {
     #[test]
     fn verifier_rejects_semantically_invalid_issue_timestamp() {
         let mut invalid_issue_timestamp: serde_json::Value =
-            serde_json::from_slice(&scope_response(
-                "synthetic-app",
-                true,
-                true,
-                ISSUE,
-                TEAM,
-                WORKSPACE,
-                TEAM,
-                WORKSPACE,
-                false,
-                "cursor",
-                Some("cursor"),
-            ))
-            .expect("response JSON");
+            serde_json::from_slice(&SyntheticScope::default().response()).expect("response JSON");
         invalid_issue_timestamp["data"]["issue"]["updatedAt"] =
             serde_json::Value::String("2026-09-31T00:00:00.000Z".to_owned());
         let mut transport = FakeTransport::new([response(
@@ -1313,34 +1229,25 @@ mod tests {
     #[test]
     fn verifier_reads_only_viewer_and_exact_issue_with_bounded_comments() {
         let mut transport = FakeTransport::new([
-            response(scope_response_with_comment_id(
-                "synthetic-app",
-                true,
-                true,
-                ISSUE,
-                TEAM,
-                WORKSPACE,
-                TEAM,
-                WORKSPACE,
-                true,
-                "cursor-one",
-                Some("cursor-one"),
-                "synthetic-comment-one",
-            )),
-            response(scope_response_with_comment_id(
-                "synthetic-app",
-                true,
-                true,
-                ISSUE,
-                TEAM,
-                WORKSPACE,
-                TEAM,
-                WORKSPACE,
-                false,
-                "cursor-two",
-                Some("cursor-two"),
-                "synthetic-comment-two",
-            )),
+            response(
+                SyntheticScope {
+                    has_next: true,
+                    edge_cursor: "cursor-one",
+                    end_cursor: Some("cursor-one"),
+                    comment_id: "synthetic-comment-one",
+                    ..Default::default()
+                }
+                .response(),
+            ),
+            response(
+                SyntheticScope {
+                    edge_cursor: "cursor-two",
+                    end_cursor: Some("cursor-two"),
+                    comment_id: "synthetic-comment-two",
+                    ..Default::default()
+                }
+                .response(),
+            ),
         ]);
         verify_read(&mut transport, ACCESS, &config()).expect("contract");
         assert_eq!(transport.requests.len(), 2);
@@ -1361,48 +1268,35 @@ mod tests {
     #[test]
     fn verifier_accepts_null_end_cursor_on_non_empty_terminal_page() {
         let mut transport = FakeTransport::new([
-            response(scope_response_with_comment_id(
-                "synthetic-app",
-                true,
-                true,
-                ISSUE,
-                TEAM,
-                WORKSPACE,
-                TEAM,
-                WORKSPACE,
-                true,
-                "cursor-one",
-                Some("cursor-one"),
-                "synthetic-comment-one",
-            )),
-            response(scope_response_with_comment_id(
-                "synthetic-app",
-                true,
-                true,
-                ISSUE,
-                TEAM,
-                WORKSPACE,
-                TEAM,
-                WORKSPACE,
-                true,
-                "cursor-two",
-                Some("cursor-two"),
-                "synthetic-comment-two",
-            )),
-            response(scope_response_with_comment_id(
-                "synthetic-app",
-                true,
-                true,
-                ISSUE,
-                TEAM,
-                WORKSPACE,
-                TEAM,
-                WORKSPACE,
-                false,
-                "cursor-three",
-                None,
-                "synthetic-comment-three",
-            )),
+            response(
+                SyntheticScope {
+                    has_next: true,
+                    edge_cursor: "cursor-one",
+                    end_cursor: Some("cursor-one"),
+                    comment_id: "synthetic-comment-one",
+                    ..Default::default()
+                }
+                .response(),
+            ),
+            response(
+                SyntheticScope {
+                    has_next: true,
+                    edge_cursor: "cursor-two",
+                    end_cursor: Some("cursor-two"),
+                    comment_id: "synthetic-comment-two",
+                    ..Default::default()
+                }
+                .response(),
+            ),
+            response(
+                SyntheticScope {
+                    edge_cursor: "cursor-three",
+                    end_cursor: None,
+                    comment_id: "synthetic-comment-three",
+                    ..Default::default()
+                }
+                .response(),
+            ),
         ]);
         verify_read(&mut transport, ACCESS, &config()).expect("contract");
         assert_eq!(transport.requests.len(), 3);
@@ -1413,34 +1307,25 @@ mod tests {
     #[test]
     fn verifier_rejects_duplicate_comment_ids_across_pages() {
         let mut transport = FakeTransport::new([
-            response(scope_response_with_comment_id(
-                "synthetic-app",
-                true,
-                true,
-                ISSUE,
-                TEAM,
-                WORKSPACE,
-                TEAM,
-                WORKSPACE,
-                true,
-                "cursor-one",
-                Some("cursor-one"),
-                "synthetic-comment-one",
-            )),
-            response(scope_response_with_comment_id(
-                "synthetic-app",
-                true,
-                true,
-                ISSUE,
-                TEAM,
-                WORKSPACE,
-                TEAM,
-                WORKSPACE,
-                false,
-                "cursor-two",
-                Some("cursor-two"),
-                "synthetic-comment-one",
-            )),
+            response(
+                SyntheticScope {
+                    has_next: true,
+                    edge_cursor: "cursor-one",
+                    end_cursor: Some("cursor-one"),
+                    comment_id: "synthetic-comment-one",
+                    ..Default::default()
+                }
+                .response(),
+            ),
+            response(
+                SyntheticScope {
+                    edge_cursor: "cursor-two",
+                    end_cursor: Some("cursor-two"),
+                    comment_id: "synthetic-comment-one",
+                    ..Default::default()
+                }
+                .response(),
+            ),
         ]);
         assert_eq!(
             verify_read(&mut transport, ACCESS, &config()),
@@ -1450,19 +1335,14 @@ mod tests {
 
     #[test]
     fn verifier_requires_a_bounded_cursor_transition_before_success() {
-        let mut transport = FakeTransport::new([response(scope_response(
-            "synthetic-app",
-            true,
-            true,
-            ISSUE,
-            TEAM,
-            WORKSPACE,
-            TEAM,
-            WORKSPACE,
-            false,
-            "only-cursor",
-            Some("only-cursor"),
-        ))]);
+        let mut transport = FakeTransport::new([response(
+            SyntheticScope {
+                edge_cursor: "only-cursor",
+                end_cursor: Some("only-cursor"),
+                ..Default::default()
+            }
+            .response(),
+        )]);
         assert_eq!(
             verify_read(&mut transport, ACCESS, &config()),
             Err(ReadContractError::PaginationInvalid)
@@ -1471,93 +1351,57 @@ mod tests {
 
     #[test]
     fn verifier_rejects_identity_and_relationship_mismatches() {
-        let mut wrong_actor = FakeTransport::new([response(scope_response(
-            "synthetic-user",
-            false,
-            true,
-            ISSUE,
-            TEAM,
-            WORKSPACE,
-            TEAM,
-            WORKSPACE,
-            false,
-            "cursor",
-            Some("cursor"),
-        ))]);
+        let mut wrong_actor = FakeTransport::new([response(
+            SyntheticScope {
+                actor_id: "synthetic-user",
+                actor_app: false,
+                ..Default::default()
+            }
+            .response(),
+        )]);
         assert_eq!(
             verify_read(&mut wrong_actor, ACCESS, &config()),
             Err(ReadContractError::ActorIdentityMismatch)
         );
 
-        let mut whitespace_actor = FakeTransport::new([response(scope_response(
-            "   ",
-            true,
-            true,
-            ISSUE,
-            TEAM,
-            WORKSPACE,
-            TEAM,
-            WORKSPACE,
-            false,
-            "cursor",
-            Some("cursor"),
-        ))]);
+        let mut whitespace_actor = FakeTransport::new([response(
+            SyntheticScope {
+                actor_id: "   ",
+                ..Default::default()
+            }
+            .response(),
+        )]);
         assert_eq!(
             verify_read(&mut whitespace_actor, ACCESS, &config()),
             Err(ReadContractError::ActorIdentityMismatch)
         );
 
-        let mut wrong_issue = FakeTransport::new([response(scope_response(
-            "synthetic-app",
-            true,
-            true,
-            "other",
-            TEAM,
-            WORKSPACE,
-            TEAM,
-            WORKSPACE,
-            false,
-            "cursor",
-            Some("cursor"),
-        ))]);
+        let mut wrong_issue = FakeTransport::new([response(
+            SyntheticScope {
+                issue_id: "other",
+                ..Default::default()
+            }
+            .response(),
+        )]);
         assert_eq!(
             verify_read(&mut wrong_issue, ACCESS, &config()),
             Err(ReadContractError::RelationshipMismatch)
         );
 
-        let mut wrong_team = FakeTransport::new([response(scope_response(
-            "synthetic-app",
-            true,
-            true,
-            ISSUE,
-            "other",
-            WORKSPACE,
-            TEAM,
-            WORKSPACE,
-            false,
-            "cursor",
-            Some("cursor"),
-        ))]);
+        let mut wrong_team = FakeTransport::new([response(
+            SyntheticScope {
+                issue_team: "other",
+                ..Default::default()
+            }
+            .response(),
+        )]);
         assert_eq!(
             verify_read(&mut wrong_team, ACCESS, &config()),
             Err(ReadContractError::RelationshipMismatch)
         );
 
         let mut wrong_viewer_workspace: serde_json::Value =
-            serde_json::from_slice(&scope_response(
-                "synthetic-app",
-                true,
-                true,
-                ISSUE,
-                TEAM,
-                WORKSPACE,
-                TEAM,
-                WORKSPACE,
-                false,
-                "cursor",
-                Some("cursor"),
-            ))
-            .expect("response JSON");
+            serde_json::from_slice(&SyntheticScope::default().response()).expect("response JSON");
         wrong_viewer_workspace["data"]["viewer"]["organization"]["id"] =
             serde_json::Value::String("00000000-0000-4000-8000-000000000099".to_owned());
         let mut wrong_viewer_workspace = FakeTransport::new([response(
@@ -1568,20 +1412,8 @@ mod tests {
             Err(ReadContractError::RelationshipMismatch)
         );
 
-        let mut wrong_team_workspace: serde_json::Value = serde_json::from_slice(&scope_response(
-            "synthetic-app",
-            true,
-            true,
-            ISSUE,
-            TEAM,
-            WORKSPACE,
-            TEAM,
-            WORKSPACE,
-            false,
-            "cursor",
-            Some("cursor"),
-        ))
-        .expect("response JSON");
+        let mut wrong_team_workspace: serde_json::Value =
+            serde_json::from_slice(&SyntheticScope::default().response()).expect("response JSON");
         wrong_team_workspace["data"]["team"]["organization"]["id"] =
             serde_json::Value::String("00000000-0000-4000-8000-000000000099".to_owned());
         let mut wrong_team_workspace = FakeTransport::new([response(
@@ -1592,20 +1424,8 @@ mod tests {
             Err(ReadContractError::RelationshipMismatch)
         );
 
-        let mut wrong_issue_workspace: serde_json::Value = serde_json::from_slice(&scope_response(
-            "synthetic-app",
-            true,
-            true,
-            ISSUE,
-            TEAM,
-            WORKSPACE,
-            TEAM,
-            WORKSPACE,
-            false,
-            "cursor",
-            Some("cursor"),
-        ))
-        .expect("response JSON");
+        let mut wrong_issue_workspace: serde_json::Value =
+            serde_json::from_slice(&SyntheticScope::default().response()).expect("response JSON");
         wrong_issue_workspace["data"]["issue"]["team"]["organization"]["id"] =
             serde_json::Value::String("00000000-0000-4000-8000-000000000099".to_owned());
         let mut wrong_issue_workspace = FakeTransport::new([response(
@@ -1617,34 +1437,27 @@ mod tests {
         );
 
         let mut changing_actor = FakeTransport::new([
-            response(scope_response_with_comment_id(
-                "synthetic-app-one",
-                true,
-                true,
-                ISSUE,
-                TEAM,
-                WORKSPACE,
-                TEAM,
-                WORKSPACE,
-                true,
-                "cursor-one",
-                Some("cursor-one"),
-                "synthetic-comment-one",
-            )),
-            response(scope_response_with_comment_id(
-                "synthetic-app-two",
-                true,
-                true,
-                ISSUE,
-                TEAM,
-                WORKSPACE,
-                TEAM,
-                WORKSPACE,
-                false,
-                "cursor-two",
-                Some("cursor-two"),
-                "synthetic-comment-two",
-            )),
+            response(
+                SyntheticScope {
+                    actor_id: "synthetic-app-one",
+                    has_next: true,
+                    edge_cursor: "cursor-one",
+                    end_cursor: Some("cursor-one"),
+                    comment_id: "synthetic-comment-one",
+                    ..Default::default()
+                }
+                .response(),
+            ),
+            response(
+                SyntheticScope {
+                    actor_id: "synthetic-app-two",
+                    edge_cursor: "cursor-two",
+                    end_cursor: Some("cursor-two"),
+                    comment_id: "synthetic-comment-two",
+                    ..Default::default()
+                }
+                .response(),
+            ),
         ]);
         assert_eq!(
             verify_read(&mut changing_actor, ACCESS, &config()),
@@ -1654,41 +1467,25 @@ mod tests {
 
     #[test]
     fn verifier_requires_non_whitespace_issue_and_comment_body_presence() {
-        let mut empty_issue_body = FakeTransport::new([response(scope_response_with_content(
-            "synthetic-app",
-            true,
-            true,
-            ISSUE,
-            TEAM,
-            WORKSPACE,
-            TEAM,
-            WORKSPACE,
-            false,
-            "cursor",
-            Some("cursor"),
-            " \t\n",
-            "synthetic comment body",
-        ))]);
+        let mut empty_issue_body = FakeTransport::new([response(
+            SyntheticScope {
+                issue_body: " \t\n",
+                ..Default::default()
+            }
+            .response(),
+        )]);
         assert_eq!(
             verify_read(&mut empty_issue_body, ACCESS, &config()),
             Err(ReadContractError::ReadFieldsInvalid)
         );
 
-        let mut empty_comment_body = FakeTransport::new([response(scope_response_with_content(
-            "synthetic-app",
-            true,
-            true,
-            ISSUE,
-            TEAM,
-            WORKSPACE,
-            TEAM,
-            WORKSPACE,
-            false,
-            "cursor",
-            Some("cursor"),
-            "synthetic issue body",
-            " \n\t",
-        ))]);
+        let mut empty_comment_body = FakeTransport::new([response(
+            SyntheticScope {
+                comment_body: " \n\t",
+                ..Default::default()
+            }
+            .response(),
+        )]);
         assert_eq!(
             verify_read(&mut empty_comment_body, ACCESS, &config()),
             Err(ReadContractError::ReadFieldsInvalid)
@@ -1697,21 +1494,14 @@ mod tests {
 
     #[test]
     fn required_nullable_fields_preserve_explicit_null_and_reject_omission() {
-        let mut explicit_null_description: serde_json::Value =
-            serde_json::from_slice(&scope_response(
-                "synthetic-app",
-                true,
-                true,
-                ISSUE,
-                TEAM,
-                WORKSPACE,
-                TEAM,
-                WORKSPACE,
-                false,
-                "cursor",
-                None,
-            ))
-            .expect("response JSON");
+        let mut explicit_null_description: serde_json::Value = serde_json::from_slice(
+            &SyntheticScope {
+                end_cursor: None,
+                ..Default::default()
+            }
+            .response(),
+        )
+        .expect("response JSON");
         explicit_null_description["data"]["issue"]["description"] = serde_json::Value::Null;
         let mut transport = FakeTransport::new([response(
             serde_json::to_vec(&explicit_null_description).expect("response JSON"),
@@ -1721,19 +1511,13 @@ mod tests {
             Err(ReadContractError::ReadFieldsInvalid)
         );
 
-        let mut omitted_description: serde_json::Value = serde_json::from_slice(&scope_response(
-            "synthetic-app",
-            true,
-            true,
-            ISSUE,
-            TEAM,
-            WORKSPACE,
-            TEAM,
-            WORKSPACE,
-            false,
-            "cursor",
-            None,
-        ))
+        let mut omitted_description: serde_json::Value = serde_json::from_slice(
+            &SyntheticScope {
+                end_cursor: None,
+                ..Default::default()
+            }
+            .response(),
+        )
         .expect("response JSON");
         omitted_description["data"]["issue"]
             .as_object_mut()
@@ -1747,19 +1531,13 @@ mod tests {
             Err(ReadContractError::GraphqlResponse)
         );
 
-        let mut omitted_parent: serde_json::Value = serde_json::from_slice(&scope_response(
-            "synthetic-app",
-            true,
-            true,
-            ISSUE,
-            TEAM,
-            WORKSPACE,
-            TEAM,
-            WORKSPACE,
-            false,
-            "cursor",
-            None,
-        ))
+        let mut omitted_parent: serde_json::Value = serde_json::from_slice(
+            &SyntheticScope {
+                end_cursor: None,
+                ..Default::default()
+            }
+            .response(),
+        )
         .expect("response JSON");
         omitted_parent["data"]["issue"]["comments"]["edges"][0]["node"]
             .as_object_mut()
@@ -1783,24 +1561,9 @@ mod tests {
             Err(ReadContractError::GraphqlResponse)
         );
 
-        let missing_headers = ReadResponse::synthetic(
-            200,
-            false,
-            scope_response(
-                "synthetic-app",
-                true,
-                true,
-                ISSUE,
-                TEAM,
-                WORKSPACE,
-                TEAM,
-                WORKSPACE,
-                false,
-                "cursor",
-                Some("cursor"),
-            ),
-        )
-        .expect("response");
+        let missing_headers =
+            ReadResponse::synthetic(200, false, SyntheticScope::default().response())
+                .expect("response");
         let mut transport = FakeTransport::new([missing_headers]);
         assert_eq!(
             verify_read(&mut transport, ACCESS, &config()),
@@ -1811,19 +1574,7 @@ mod tests {
             200,
             true,
             false,
-            scope_response(
-                "synthetic-app",
-                true,
-                true,
-                ISSUE,
-                TEAM,
-                WORKSPACE,
-                TEAM,
-                WORKSPACE,
-                false,
-                "cursor",
-                Some("cursor"),
-            ),
+            SyntheticScope::default().response(),
         )
         .expect("response");
         let mut transport = FakeTransport::new([invalid_content_type]);
@@ -1835,90 +1586,68 @@ mod tests {
 
     #[test]
     fn verifier_accepts_standard_top_level_graphql_extensions_and_ignores_them() {
-        let mut first: serde_json::Value = serde_json::from_slice(&scope_response(
-            "synthetic-app",
-            true,
-            true,
-            ISSUE,
-            TEAM,
-            WORKSPACE,
-            TEAM,
-            WORKSPACE,
-            true,
-            "cursor-one",
-            Some("cursor-one"),
-        ))
+        let mut first: serde_json::Value = serde_json::from_slice(
+            &SyntheticScope {
+                has_next: true,
+                edge_cursor: "cursor-one",
+                end_cursor: Some("cursor-one"),
+                ..Default::default()
+            }
+            .response(),
+        )
         .expect("response JSON");
         first["extensions"] = serde_json::json!({"traceId": "synthetic-trace"});
         let mut transport = FakeTransport::new([
             response(serde_json::to_vec(&first).expect("response JSON")),
-            response(scope_response_with_comment_id(
-                "synthetic-app",
-                true,
-                true,
-                ISSUE,
-                TEAM,
-                WORKSPACE,
-                TEAM,
-                WORKSPACE,
-                false,
-                "cursor-two",
-                Some("cursor-two"),
-                "synthetic-comment-two",
-            )),
+            response(
+                SyntheticScope {
+                    edge_cursor: "cursor-two",
+                    end_cursor: Some("cursor-two"),
+                    comment_id: "synthetic-comment-two",
+                    ..Default::default()
+                }
+                .response(),
+            ),
         ]);
         verify_read(&mut transport, ACCESS, &config()).expect("contract");
     }
 
     #[test]
     fn verifier_rejects_malformed_and_unbounded_page_info() {
-        let mut missing_cursor = FakeTransport::new([response(scope_response(
-            "synthetic-app",
-            true,
-            true,
-            ISSUE,
-            TEAM,
-            WORKSPACE,
-            TEAM,
-            WORKSPACE,
-            true,
-            "cursor",
-            None,
-        ))]);
+        let mut missing_cursor = FakeTransport::new([response(
+            SyntheticScope {
+                has_next: true,
+                end_cursor: None,
+                ..Default::default()
+            }
+            .response(),
+        )]);
         assert_eq!(
             verify_read(&mut missing_cursor, ACCESS, &config()),
             Err(ReadContractError::PaginationInvalid)
         );
 
         let mut repeated_cursor = FakeTransport::new([
-            response(scope_response_with_comment_id(
-                "synthetic-app",
-                true,
-                true,
-                ISSUE,
-                TEAM,
-                WORKSPACE,
-                TEAM,
-                WORKSPACE,
-                true,
-                "same",
-                Some("same"),
-                "synthetic-comment-one",
-            )),
-            response(scope_response_with_comment_id(
-                "synthetic-app",
-                true,
-                true,
-                ISSUE,
-                TEAM,
-                WORKSPACE,
-                TEAM,
-                WORKSPACE,
-                true,
-                "same",
-                Some("same"),
-                "synthetic-comment-two",
-            )),
+            response(
+                SyntheticScope {
+                    has_next: true,
+                    edge_cursor: "same",
+                    end_cursor: Some("same"),
+                    comment_id: "synthetic-comment-one",
+                    ..Default::default()
+                }
+                .response(),
+            ),
+            response(
+                SyntheticScope {
+                    has_next: true,
+                    edge_cursor: "same",
+                    end_cursor: Some("same"),
+                    comment_id: "synthetic-comment-two",
+                    ..Default::default()
+                }
+                .response(),
+            ),
         ]);
         assert_eq!(
             verify_read(&mut repeated_cursor, ACCESS, &config()),
@@ -1926,62 +1655,46 @@ mod tests {
         );
 
         let mut unbounded = FakeTransport::new([
-            response(scope_response_with_comment_id(
-                "synthetic-app",
-                true,
-                true,
-                ISSUE,
-                TEAM,
-                WORKSPACE,
-                TEAM,
-                WORKSPACE,
-                true,
-                "one",
-                Some("one"),
-                "synthetic-comment-one",
-            )),
-            response(scope_response_with_comment_id(
-                "synthetic-app",
-                true,
-                true,
-                ISSUE,
-                TEAM,
-                WORKSPACE,
-                TEAM,
-                WORKSPACE,
-                true,
-                "two",
-                Some("two"),
-                "synthetic-comment-two",
-            )),
-            response(scope_response_with_comment_id(
-                "synthetic-app",
-                true,
-                true,
-                ISSUE,
-                TEAM,
-                WORKSPACE,
-                TEAM,
-                WORKSPACE,
-                true,
-                "three",
-                Some("three"),
-                "synthetic-comment-three",
-            )),
-            response(scope_response_with_comment_id(
-                "synthetic-app",
-                true,
-                true,
-                ISSUE,
-                TEAM,
-                WORKSPACE,
-                TEAM,
-                WORKSPACE,
-                true,
-                "four",
-                Some("four"),
-                "synthetic-comment-four",
-            )),
+            response(
+                SyntheticScope {
+                    has_next: true,
+                    edge_cursor: "one",
+                    end_cursor: Some("one"),
+                    comment_id: "synthetic-comment-one",
+                    ..Default::default()
+                }
+                .response(),
+            ),
+            response(
+                SyntheticScope {
+                    has_next: true,
+                    edge_cursor: "two",
+                    end_cursor: Some("two"),
+                    comment_id: "synthetic-comment-two",
+                    ..Default::default()
+                }
+                .response(),
+            ),
+            response(
+                SyntheticScope {
+                    has_next: true,
+                    edge_cursor: "three",
+                    end_cursor: Some("three"),
+                    comment_id: "synthetic-comment-three",
+                    ..Default::default()
+                }
+                .response(),
+            ),
+            response(
+                SyntheticScope {
+                    has_next: true,
+                    edge_cursor: "four",
+                    end_cursor: Some("four"),
+                    comment_id: "synthetic-comment-four",
+                    ..Default::default()
+                }
+                .response(),
+            ),
         ]);
         assert_eq!(
             verify_read(&mut unbounded, ACCESS, &config()),
@@ -1989,48 +1702,35 @@ mod tests {
         );
 
         let mut non_adjacent_cycle = FakeTransport::new([
-            response(scope_response_with_comment_id(
-                "synthetic-app",
-                true,
-                true,
-                ISSUE,
-                TEAM,
-                WORKSPACE,
-                TEAM,
-                WORKSPACE,
-                true,
-                "cycle-one",
-                Some("cycle-one"),
-                "synthetic-comment-one",
-            )),
-            response(scope_response_with_comment_id(
-                "synthetic-app",
-                true,
-                true,
-                ISSUE,
-                TEAM,
-                WORKSPACE,
-                TEAM,
-                WORKSPACE,
-                true,
-                "cycle-two",
-                Some("cycle-two"),
-                "synthetic-comment-two",
-            )),
-            response(scope_response_with_comment_id(
-                "synthetic-app",
-                true,
-                true,
-                ISSUE,
-                TEAM,
-                WORKSPACE,
-                TEAM,
-                WORKSPACE,
-                false,
-                "cycle-one",
-                Some("cycle-one"),
-                "synthetic-comment-three",
-            )),
+            response(
+                SyntheticScope {
+                    has_next: true,
+                    edge_cursor: "cycle-one",
+                    end_cursor: Some("cycle-one"),
+                    comment_id: "synthetic-comment-one",
+                    ..Default::default()
+                }
+                .response(),
+            ),
+            response(
+                SyntheticScope {
+                    has_next: true,
+                    edge_cursor: "cycle-two",
+                    end_cursor: Some("cycle-two"),
+                    comment_id: "synthetic-comment-two",
+                    ..Default::default()
+                }
+                .response(),
+            ),
+            response(
+                SyntheticScope {
+                    edge_cursor: "cycle-one",
+                    end_cursor: Some("cycle-one"),
+                    comment_id: "synthetic-comment-three",
+                    ..Default::default()
+                }
+                .response(),
+            ),
         ]);
         assert_eq!(
             verify_read(&mut non_adjacent_cycle, ACCESS, &config()),
@@ -2038,70 +1738,52 @@ mod tests {
         );
 
         let mut inconsistent_final_cursor = FakeTransport::new([
-            response(scope_response_with_comment_id(
-                "synthetic-app",
-                true,
-                true,
-                ISSUE,
-                TEAM,
-                WORKSPACE,
-                TEAM,
-                WORKSPACE,
-                true,
-                "cursor-one",
-                Some("cursor-one"),
-                "synthetic-comment-one",
-            )),
-            response(scope_response_with_comment_id(
-                "synthetic-app",
-                true,
-                true,
-                ISSUE,
-                TEAM,
-                WORKSPACE,
-                TEAM,
-                WORKSPACE,
-                false,
-                "cursor-two",
-                Some("cursor-one"),
-                "synthetic-comment-two",
-            )),
+            response(
+                SyntheticScope {
+                    has_next: true,
+                    edge_cursor: "cursor-one",
+                    end_cursor: Some("cursor-one"),
+                    comment_id: "synthetic-comment-one",
+                    ..Default::default()
+                }
+                .response(),
+            ),
+            response(
+                SyntheticScope {
+                    edge_cursor: "cursor-two",
+                    end_cursor: Some("cursor-one"),
+                    comment_id: "synthetic-comment-two",
+                    ..Default::default()
+                }
+                .response(),
+            ),
         ]);
         assert_eq!(
             verify_read(&mut inconsistent_final_cursor, ACCESS, &config()),
             Err(ReadContractError::PaginationInvalid)
         );
 
-        let mut empty_final_page = serde_json::from_slice::<serde_json::Value>(&scope_response(
-            "synthetic-app",
-            true,
-            true,
-            ISSUE,
-            TEAM,
-            WORKSPACE,
-            TEAM,
-            WORKSPACE,
-            false,
-            "cursor-two",
-            Some("cursor-two"),
-        ))
+        let mut empty_final_page = serde_json::from_slice::<serde_json::Value>(
+            &SyntheticScope {
+                edge_cursor: "cursor-two",
+                end_cursor: Some("cursor-two"),
+                ..Default::default()
+            }
+            .response(),
+        )
         .expect("response JSON");
         empty_final_page["data"]["issue"]["comments"]["edges"] = serde_json::json!([]);
         let mut empty_final = FakeTransport::new([
-            response(scope_response_with_comment_id(
-                "synthetic-app",
-                true,
-                true,
-                ISSUE,
-                TEAM,
-                WORKSPACE,
-                TEAM,
-                WORKSPACE,
-                true,
-                "cursor-one",
-                Some("cursor-one"),
-                "synthetic-comment-one",
-            )),
+            response(
+                SyntheticScope {
+                    has_next: true,
+                    edge_cursor: "cursor-one",
+                    end_cursor: Some("cursor-one"),
+                    comment_id: "synthetic-comment-one",
+                    ..Default::default()
+                }
+                .response(),
+            ),
             response(serde_json::to_vec(&empty_final_page).expect("response JSON")),
         ]);
         assert_eq!(
@@ -2113,34 +1795,25 @@ mod tests {
     #[test]
     fn diagnostics_never_include_access_or_content_values() {
         let mut transport = FakeTransport::new([
-            response(scope_response_with_comment_id(
-                "synthetic-app",
-                true,
-                true,
-                ISSUE,
-                TEAM,
-                WORKSPACE,
-                TEAM,
-                WORKSPACE,
-                true,
-                "cursor-one",
-                Some("cursor-one"),
-                "synthetic-comment-one",
-            )),
-            response(scope_response_with_comment_id(
-                "synthetic-app",
-                true,
-                true,
-                ISSUE,
-                TEAM,
-                WORKSPACE,
-                TEAM,
-                WORKSPACE,
-                false,
-                "cursor-two",
-                Some("cursor-two"),
-                "synthetic-comment-two",
-            )),
+            response(
+                SyntheticScope {
+                    has_next: true,
+                    edge_cursor: "cursor-one",
+                    end_cursor: Some("cursor-one"),
+                    comment_id: "synthetic-comment-one",
+                    ..Default::default()
+                }
+                .response(),
+            ),
+            response(
+                SyntheticScope {
+                    edge_cursor: "cursor-two",
+                    end_cursor: Some("cursor-two"),
+                    comment_id: "synthetic-comment-two",
+                    ..Default::default()
+                }
+                .response(),
+            ),
         ]);
         let outcome = verify_read(&mut transport, ACCESS, &config()).expect("contract");
         let debug = format!("{outcome:?}");
