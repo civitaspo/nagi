@@ -146,6 +146,7 @@ LIVE_CHILD_GROUP_ID=""
 LIVE_CHILD_REAP_FAILED=0
 LIVE_TERM_GRACE_POLLS=20
 LIVE_KILL_GRACE_POLLS=20
+LIVE_GROUP_START_POLLS=20
 
 LIVE_SETSID_PATH=""
 for candidate in /usr/bin/setsid /bin/setsid; do
@@ -158,19 +159,27 @@ done
 live_verify_process_group() {
   local pid="$1"
   local pgid
+  local poll
   # ps is not available in every restricted test sandbox. When it is
   # available, require the process-group leader invariant established by
   # setsid or Bash monitor mode; otherwise retain that launch invariant.
-  pgid="$(/bin/ps -o pgid= -p "${pid}" 2>/dev/null | /usr/bin/tr -d '[:space:]' || true)"
-  if [[ -n "${pgid}" && "${pgid}" != "${pid}" ]]; then
-    return 1
-  fi
-  # A live child without a killable group is never accepted. A fast child
-  # which has already exited is safe only when no group remains to clean up.
-  if ! kill -0 -- "-${pid}" 2>/dev/null && kill -0 "${pid}" 2>/dev/null; then
-    return 1
-  fi
-  return 0
+  # setsid establishes the session asynchronously relative to the parent
+  # shell, so retry the invariant for a finite startup window.
+  for ((poll = 0; poll < LIVE_GROUP_START_POLLS; poll++)); do
+    pgid="$(/bin/ps -o pgid= -p "${pid}" 2>/dev/null | /usr/bin/tr -d '[:space:]' || true)"
+    if [[ -z "${pgid}" || "${pgid}" == "${pid}" ]] \
+      && kill -0 -- "-${pid}" 2>/dev/null; then
+      return 0
+    fi
+    # A fast child which has already exited is safe only when no group
+    # remains to clean up. A live child without a killable group is never
+    # accepted.
+    if ! kill -0 "${pid}" 2>/dev/null && ! kill -0 -- "-${pid}" 2>/dev/null; then
+      return 0
+    fi
+    /bin/sleep 0.1
+  done
+  return 1
 }
 
 live_start_child_inner() {
