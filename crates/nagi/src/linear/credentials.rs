@@ -1227,7 +1227,7 @@ impl CredentialManager {
             replay_consumed: false,
         });
         self.write_record(&pending, Some(&record.bytes))?;
-        let response = match self
+        let response = self
             .transport
             .as_mut()
             .ok_or_else(|| refresh_failure_error(&pending))?
@@ -1239,18 +1239,8 @@ impl CredentialManager {
                     .client_id
                     .as_str(),
                 pending.refresh_token.as_str(),
-            ) {
-            Ok(response) => response,
-            #[cfg(any(test, target_os = "macos"))]
-            Err(ProviderTransportError::NoResponse) => {
-                return Err(refresh_failure_error(&pending));
-            }
-            #[cfg(target_os = "macos")]
-            Err(
-                ProviderTransportError::ClientConfiguration
-                | ProviderTransportError::ResponseTooLarge,
-            ) => return Err(refresh_failure_error(&pending)),
-        };
+            )
+            .map_err(|_| refresh_failure_error(&pending))?;
         self.accept_refresh_response(pending, response, now)
     }
 
@@ -1297,15 +1287,12 @@ impl CredentialManager {
             .refresh
             .as_ref()
             .ok_or(CredentialError::InvalidEnvelope)?;
-        let response = match self
+        let response = self
             .transport
             .as_mut()
             .ok_or_else(|| refresh_failure_error(&replay))?
             .refresh(intent.client_id.as_str(), intent.refresh_token.as_str())
-        {
-            Ok(response) => response,
-            Err(_) => return Err(refresh_failure_error(&replay)),
-        };
+            .map_err(|_| refresh_failure_error(&replay))?;
         self.accept_refresh_response(replay, response, now)
     }
 
