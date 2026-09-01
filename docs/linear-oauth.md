@@ -20,8 +20,8 @@ The contract is deliberately narrow:
 - Browser, clock, entropy, listener, and token transport boundaries are
   injectable. Tests therefore do not open a browser or contact Linear.
 - The returned `requested_actor` value records the `actor=app` request metadata;
-  it is not a verified provider identity. Live identity verification belongs to
-  P0-05.
+  it is not, by itself, a verified provider identity. P0-05 verifies the
+  provider `viewer` during its bounded read and binds that app actor locally.
 
 ## Local credential lifecycle
 
@@ -72,6 +72,20 @@ replay retains the consumed intent and requires reauthorization.
 The verified ready write returns that exact record to the caller; no later
 unconstrained read selects the token-bearing record.
 
+The envelope is version 2 and carries the exact OAuth client identifier used at
+login plus an optional verified app `viewer.id`. A first successful P0-05 read
+binds that viewer ID under the same credential lock and records a new revision;
+later reads must match it, while a mismatch fails closed without changing the
+record. Refresh and replay preserve the binding. Older envelopes are rejected
+and are never silently migrated. Local `status` and confirmed `logout` remain
+available because they do not need a provider identity.
+
+Although the domain operation is read-only, the internal access lease may
+durably persist refresh/replay intent transitions, a refreshed credential, or
+the first verified viewer binding while its lock is held. Therefore
+`with_access_token`/the verified read lease is not a storage-read-only API; its
+production read path returns only a fully verified success/failure result.
+
 `status` is local classification only and never refreshes, revokes, launches a
 browser, deletes data, or prints secret-bearing values. A replay-pending record
 is reported as such only while the current clock is within its strict replay
@@ -80,6 +94,67 @@ as reauthorization-required, while clock failure or rollback is unavailable.
 Once a replay is consumed or its deadline expires without a durably verified
 ready bundle, P0-04 has no destructive local recovery: out-of-band provider or
 local remediation is required, and there is no force-delete fallback.
+
+## Read contract
+
+P0-05 adds the explicit opt-in command `nagi contract linear read`, invoked by
+`NAGI_CONTRACT_LIVE=1 mise run contract:live`. The command reads the client ID,
+loopback redirect, workspace ID, team ID, and one synthetic setup issue ID from
+deployment-local configuration. It rejects token, API-key, PAT, client-secret,
+and other credential-shaped environment values. It never accepts a token from
+arguments or environment and never falls back to a user actor.
+
+The command acquires the P0-04 Keychain-managed access lease and holds its
+process/advisory lock across the complete bounded read. The fixed HTTPS GraphQL
+endpoint is used with redirects, proxies, and retries disabled, a 10-second
+connect deadline, a 30-second request deadline, and a bounded response body.
+The query performs only exact lookups for the current organization, viewer,
+configured team, and configured issue; it does not query an issue or team
+collection and contains no mutation. The viewer must report `app=true` and
+`isMe=true`; the organization and team relationships must match the exact
+configured bindings. The opaque viewer ID must remain stable across the
+bounded comment pages and match the credential's previously verified binding,
+or become that binding on the first successful read. Private app-registration
+and administrator-consent facts remain out-of-band.
+
+The workspace, team, and setup-issue inputs are exact canonical lowercase UUID
+strings. They are opaque equality bindings: the verifier does not normalize a
+Linear shorthand such as `ABC-123`, even though the provider's `issue(id:)`
+field accepts shorthand and returns a canonical UUID.
+
+Issue comments use an explicit `first: 1` Relay page, `after` cursor, a
+`parent: { null: true }` filter, `includeArchived: false`, and
+`orderBy: updatedAt`. The filter selects top-level comments; inline comments
+are still included when Linear represents them with a null `parentId`; no
+`quotedText` field is retained or needed. Each edge is checked for its cursor,
+comment ID, issue ID, update timestamp, and top-level `parentId`. Pagination
+reads exactly two one-item pages: the first must report `hasNextPage=true` with
+a bounded `endCursor` used as the second page's `after`, and the second must
+prove a distinct valid comment and cursor. The second page is fully validated
+but never followed, even when it reports `hasNextPage=true`; a terminal null
+`endCursor` is valid. Cursor inconsistencies and any cursor rewind or cycle
+fail closed. The documented global request and complexity rate-limit
+headers must be present exactly once and contain bounded unsigned values.
+Descriptions and comment bodies are reduced to non-whitespace presence bits and
+are not returned, logged, or persisted.
+
+The command emits only the existing closed redacted evidence schema: fixed
+contract metadata and boolean/category outcomes. Provider payloads, IDs,
+timestamps, content, counters, credentials, local paths, and machine details
+are never included in evidence. The default `mise run test` and CI paths remain
+provider-free.
+
+The fixture issue must have a non-whitespace body and at least two distinct
+top-level comments with non-whitespace bodies; exactly two bounded `first: 1`
+pages prove one cursor transition without enumerating the workspace or claiming
+collection completeness.
+
+The raw-build and live-runner procedure and standalone evidence constraints are
+documented in the [contract test harness](contract-testing.md). OAuth's role is
+limited to the explicit `auth linear login` step that creates the Keychain
+lease; login refuses to replace existing state, and the later read does not
+silently change credentials.
+
 Confirmed logout first
 persists revoke-pending, then sends the documented
 `POST https://api.linear.app/oauth/revoke` request with `token` and
@@ -97,12 +172,14 @@ automatically retried.
 The verified tombstone record is passed directly to final deletion, whose
 last read must still match it exactly.
 
-The implementation follows Linear's [OAuth 2.0 authentication documentation](https://linear.app/developers/oauth-2-0-authentication)
-and [OAuth actor authorization documentation](https://linear.app/developers/oauth-actor-authorization).
-Linear does not document an actor-identity field as part of the token response,
-so `actor=app` is treated as authorization-request metadata; the bundle does
-not claim a verified actor identity. Identity lookup belongs to a later provider
-operation.
+The implementation follows Linear's [OAuth 2.0 authentication documentation](https://linear.app/developers/oauth-2-0-authentication),
+[OAuth actor authorization documentation](https://linear.app/developers/oauth-actor-authorization),
+and [Agents guidance](https://linear.app/developers/agents). Linear does not
+document an actor-identity field as part of the token response, so `actor=app`
+is treated as authorization-request metadata. The bounded P0-05 `viewer` read
+and durable client/viewer binding provide the separate identity proof required
+by this contract; those IDs remain private local state and never enter public
+evidence.
 
 The Keychain implementation follows Apple's [TN3137: On Mac Keychains](https://developer.apple.com/documentation/technotes/tn3137-on-mac-keychains)
 and [generic-password item contract](https://developer.apple.com/documentation/security/ksecclassgenericpassword).
