@@ -535,7 +535,7 @@ fn parse_rate_limit_value(
 struct GraphqlEnvelope<T> {
     data: Option<T>,
     #[serde(default)]
-    errors: Option<Vec<serde::de::IgnoredAny>>,
+    errors: Vec<serde::de::IgnoredAny>,
     /// GraphQL permits implementation-specific top-level extensions. They
     /// are intentionally ignored after the closed data shape is parsed.
     #[allow(dead_code)]
@@ -681,7 +681,7 @@ fn decode<T: for<'de> Deserialize<'de>>(response: ReadResponse) -> Result<T, Rea
     }
     let envelope: GraphqlEnvelope<T> =
         serde_json::from_slice(&response.body).map_err(|_| ReadContractError::GraphqlResponse)?;
-    if envelope.errors.is_some_and(|errors| !errors.is_empty()) {
+    if !envelope.errors.is_empty() {
         return Err(ReadContractError::GraphqlResponse);
     }
     envelope.data.ok_or(ReadContractError::GraphqlResponse)
@@ -923,98 +923,26 @@ fn validate_timestamp(value: &str) -> Result<(), ReadContractError> {
 
 fn valid_timestamp(value: &str) -> bool {
     let bytes = value.as_bytes();
-    if !(20..=MAX_CURSOR_BYTES).contains(&bytes.len()) {
-        return false;
-    }
-    if bytes.get(4) != Some(&b'-')
-        || bytes.get(7) != Some(&b'-')
+    if !(20..=MAX_CURSOR_BYTES).contains(&bytes.len())
         || !matches!(bytes.get(10), Some(b'T' | b't'))
-        || bytes.get(13) != Some(&b':')
-        || bytes.get(16) != Some(&b':')
+        || bytes.get(0..4).is_some_and(|year| year == b"0000")
+        || bytes
+            .get(17..19)
+            .is_some_and(|second| second[0] > b'5' || (second[0] == b'5' && second[1] > b'9'))
     {
         return false;
     }
-    let Some(year) = fixed_digits(bytes, 0, 4) else {
-        return false;
-    };
-    let Some(month) = fixed_digits(bytes, 5, 2) else {
-        return false;
-    };
-    let Some(day) = fixed_digits(bytes, 8, 2) else {
-        return false;
-    };
-    let Some(hour) = fixed_digits(bytes, 11, 2) else {
-        return false;
-    };
-    let Some(minute) = fixed_digits(bytes, 14, 2) else {
-        return false;
-    };
-    let Some(second) = fixed_digits(bytes, 17, 2) else {
-        return false;
-    };
-    if year == 0
-        || !(1..=12).contains(&month)
-        || day == 0
-        || day > days_in_month(year, month)
-        || hour > 23
-        || minute > 59
-        || second > 59
-    {
-        return false;
-    }
-
-    let mut suffix = 19;
-    if bytes.get(suffix) == Some(&b'.') {
-        let fraction_start = suffix + 1;
-        while bytes
-            .get(suffix + 1)
-            .is_some_and(|byte| byte.is_ascii_digit())
-        {
-            suffix += 1;
-        }
-        let fraction_end = suffix + 1;
-        if fraction_end == fraction_start
-            || fraction_end - fraction_start > 12
-            || bytes
-                .get(fraction_start..fraction_end)
-                .is_none_or(|fraction| !fraction.iter().all(u8::is_ascii_digit))
-        {
+    if bytes.get(19) == Some(&b'.') {
+        let fraction_digits = bytes[20..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if !(1..=12).contains(&fraction_digits) {
             return false;
         }
-        suffix = fraction_end;
     }
-    match bytes.get(suffix) {
-        Some(b'Z' | b'z') => suffix + 1 == bytes.len(),
-        Some(b'+' | b'-') => {
-            suffix + 6 == bytes.len()
-                && bytes.get(suffix + 3) == Some(&b':')
-                && fixed_digits(bytes, suffix + 1, 2).is_some_and(|offset_hour| offset_hour <= 23)
-                && fixed_digits(bytes, suffix + 4, 2)
-                    .is_some_and(|offset_minute| offset_minute <= 59)
-        }
-        _ => false,
-    }
-}
 
-fn fixed_digits(bytes: &[u8], start: usize, length: usize) -> Option<u32> {
-    let digits = bytes.get(start..start + length)?;
-    if !digits.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    digits.iter().try_fold(0_u32, |value, digit| {
-        value.checked_mul(10)?.checked_add(u32::from(digit - b'0'))
-    })
-}
-
-fn days_in_month(year: u32, month: u32) -> u32 {
-    match month {
-        2 if year.is_multiple_of(400) || (year.is_multiple_of(4) && !year.is_multiple_of(100)) => {
-            29
-        }
-        2 => 28,
-        4 | 6 | 9 | 11 => 30,
-        _ => 31,
-    }
+    chrono::DateTime::parse_from_rfc3339(value).is_ok()
 }
 
 /// Runs the live verifier with the P0-04 Keychain-managed access lease.
@@ -1332,6 +1260,38 @@ mod tests {
     }
 
     #[test]
+    fn graphql_errors_are_presence_sensitive_and_never_retained() {
+        let missing = decode::<serde_json::Value>(response(br#"{"data":{"ok":true}}"#))
+            .expect("missing errors succeeds");
+        assert_eq!(missing, serde_json::json!({"ok": true}));
+
+        let empty = decode::<serde_json::Value>(response(br#"{"data":{"ok":true},"errors":[]}"#))
+            .expect("empty errors succeeds");
+        assert_eq!(empty, serde_json::json!({"ok": true}));
+
+        for errors in [
+            serde_json::Value::Null,
+            serde_json::json!(42),
+            serde_json::json!({}),
+        ] {
+            let body = serde_json::json!({"data": {"ok": true}, "errors": errors});
+            assert_eq!(
+                decode::<serde_json::Value>(response(body.to_string())),
+                Err(ReadContractError::GraphqlResponse)
+            );
+        }
+
+        let arbitrary_errors = serde_json::json!({
+            "data": {"ok": true},
+            "errors": [null, "synthetic-secret", {"message": "synthetic-secret"}, 42]
+        });
+        let error = decode::<serde_json::Value>(response(arbitrary_errors.to_string()))
+            .expect_err("nonempty errors fails");
+        assert_eq!(error, ReadContractError::GraphqlResponse);
+        assert!(!error.to_string().contains("synthetic-secret"));
+    }
+
+    #[test]
     fn timestamps_require_semantic_rfc3339_shape() {
         for value in [
             "2026-09-01T00:00:00Z",
@@ -1344,6 +1304,7 @@ mod tests {
         for value in [
             "2026-09-01T00:00:00.",
             "2026-09-01T00:00:00.1234567890123Z",
+            "0000-09-01T00:00:00Z",
             "2023-02-29T00:00:00Z",
             "2026-09-31T00:00:00Z",
             "2026-09-01T24:00:00Z",
@@ -1351,6 +1312,7 @@ mod tests {
             "2026-09-01T00:00:60Z",
             "2026-09-01T00:00:61Z",
             "2026-09-01T00:00:00+24:00",
+            "2026-09-01 00:00:00Z",
             "2026-09-01T00:00:00Zextra",
             "2026/09/01T00:00:00Z",
         ] {
