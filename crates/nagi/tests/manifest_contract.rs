@@ -24,6 +24,31 @@ const LIVE_SCRIPT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../scripts/contracts/live.sh"
 );
+#[cfg(unix)]
+const LIVE_SCRIPT_SOURCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../scripts/contracts/live.sh"
+));
+#[cfg(unix)]
+const LIVE_HELPERS_SOURCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../scripts/contracts/live_helpers.sh"
+));
+#[cfg(unix)]
+const LIVE_HELPERS_SCRIPT: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../scripts/contracts/live_helpers.sh"
+);
+#[cfg(unix)]
+const RAW_BUILD_SOURCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../scripts/contracts/build-raw.sh"
+));
+#[cfg(unix)]
+const RAW_BUILD_SCRIPT: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../scripts/contracts/build-raw.sh"
+);
 
 type TomlTable = TomlMap<String, TomlValue>;
 
@@ -403,7 +428,7 @@ fn tool_manifests_cross_check_declared_versions_and_backends() {
 
 #[cfg(unix)]
 fn command_output(script: &str, environment: &[(&str, &str)]) -> Output {
-    let mut command = Command::new("bash");
+    let mut command = Command::new("/bin/bash");
     command.arg(script).env_clear().env("PATH", "/usr/bin:/bin");
     for (name, value) in environment {
         command.env(name, value);
@@ -420,9 +445,18 @@ fn live_output(extra: &[(&str, &str)]) -> Output {
         .env("PATH", "/usr/bin:/bin")
         .env("NAGI_CONTRACT_LIVE", "1")
         .env("NAGI_LINEAR_CLIENT_ID", "synthetic-client")
-        .env("NAGI_LINEAR_WORKSPACE_ID", "synthetic-workspace")
-        .env("NAGI_LINEAR_TEAM_ID", "synthetic-team")
-        .env("NAGI_LINEAR_SETUP_ISSUE_ID", "synthetic-setup")
+        .env(
+            "NAGI_LINEAR_WORKSPACE_ID",
+            "00000000-0000-4000-8000-000000000001",
+        )
+        .env(
+            "NAGI_LINEAR_TEAM_ID",
+            "00000000-0000-4000-8000-000000000002",
+        )
+        .env(
+            "NAGI_LINEAR_SETUP_ISSUE_ID",
+            "00000000-0000-4000-8000-000000000003",
+        )
         .env(
             "NAGI_LINEAR_REDIRECT_URI",
             "http://127.0.0.1:43871/oauth/callback",
@@ -458,7 +492,9 @@ fn macos_preflight_is_opt_in_and_platform_gated() {
 #[test]
 fn standalone_binary_is_a_single_plain_executable() {
     let executable = std::path::Path::new(env!("CARGO_BIN_EXE_nagi"));
-    assert!(executable.is_file());
+    let metadata = std::fs::symlink_metadata(executable).expect("standalone binary metadata");
+    assert!(metadata.file_type().is_file());
+    assert!(!metadata.file_type().is_symlink());
     let executable_text = executable.to_string_lossy().to_ascii_lowercase();
     assert!(!executable_text.contains(".app"));
     assert!(!executable_text.contains("/contents/"));
@@ -466,6 +502,22 @@ fn standalone_binary_is_a_single_plain_executable() {
         executable.file_name().and_then(|name| name.to_str()),
         Some("nagi")
     );
+    let magic = std::fs::read(executable)
+        .expect("read standalone binary magic")
+        .into_iter()
+        .take(4)
+        .collect::<Vec<_>>();
+    if cfg!(target_os = "macos") {
+        assert!(matches!(
+            magic.as_slice(),
+            [0xfe, 0xed, 0xfa, 0xce]
+                | [0xce, 0xfa, 0xed, 0xfe]
+                | [0xfe, 0xed, 0xfa, 0xcf]
+                | [0xcf, 0xfa, 0xed, 0xfe]
+        ));
+    } else {
+        assert_eq!(magic, b"\x7fELF");
+    }
 }
 
 #[cfg(unix)]
@@ -488,6 +540,8 @@ fn live_preflight_validates_configuration_and_never_exposes_values() {
         "NAGI_LINEAR_API_KEY",
         "NAGI_LINEAR_ACCESS_TOKEN",
         "NAGI_LINEAR_CLIENT_SECRET",
+        "NAGI_CONTRACT_TOKEN",
+        "NAGI_CONTRACT_SECRET",
     ] {
         let secret = "synthetic-secret-value";
         let output = command_output(LIVE_SCRIPT, &[("NAGI_CONTRACT_LIVE", "1"), (name, secret)]);
@@ -513,22 +567,153 @@ fn live_preflight_validates_configuration_and_never_exposes_values() {
     assert!(!bytes_contain(&malformed.stdout, malformed_uri.as_bytes()));
     assert!(!bytes_contain(&malformed.stderr, malformed_uri.as_bytes()));
 
-    for port in ["0", "00000", "70000"] {
+    for port in ["0", "00000", "043871", "70000"] {
         let redirect = format!("http://127.0.0.1:{port}/oauth/callback");
         let output = live_output(&[("NAGI_LINEAR_REDIRECT_URI", &redirect)]);
         assert_eq!(output.status.code(), Some(2), "port {port} must be refused");
         assert!(!bytes_contain(&output.stdout, redirect.as_bytes()));
         assert!(!bytes_contain(&output.stderr, redirect.as_bytes()));
     }
+}
 
-    for port in ["1", "43871", "65535"] {
-        let redirect = format!("http://127.0.0.1:{port}/oauth/callback");
-        assert_eq!(
-            live_output(&[("NAGI_LINEAR_REDIRECT_URI", &redirect)])
-                .status
-                .code(),
-            Some(1),
-            "valid local port {port} should reach the unimplemented contract"
+#[cfg(unix)]
+#[test]
+fn live_runner_builds_and_supervises_one_raw_standalone_binary() {
+    assert!(LIVE_SCRIPT_SOURCE.contains("BASH_SOURCE"));
+    assert!(LIVE_SCRIPT_SOURCE.contains("\"${git_path}\" -C \"${repo_root}\""));
+    assert!(LIVE_SCRIPT_SOURCE.contains("live_helpers.sh"));
+    assert!(LIVE_SCRIPT_SOURCE.contains("build-raw.sh"));
+    assert!(LIVE_SCRIPT_SOURCE.contains("target/nagi-contract"));
+    assert!(LIVE_SCRIPT_SOURCE.contains("debug/nagi"));
+    assert!(LIVE_SCRIPT_SOURCE.contains("is_clean_checked_revision"));
+    assert!(LIVE_SCRIPT_SOURCE.contains("post_revision"));
+    assert!(LIVE_SCRIPT_SOURCE.contains("env -i"));
+    assert!(LIVE_SCRIPT_SOURCE.contains("HOME=\"${home_directory}\""));
+    assert!(LIVE_HELPERS_SOURCE.contains("file -b"));
+    assert!(LIVE_HELPERS_SOURCE.contains("Mach-O"));
+    assert!(LIVE_HELPERS_SOURCE.contains("-L \"${binary}\""));
+    assert!(LIVE_HELPERS_SOURCE.contains("*.app"));
+    assert!(LIVE_HELPERS_SOURCE.contains("${binary##*/}"));
+    assert!(LIVE_HELPERS_SOURCE.contains("max_output_bytes"));
+    assert!(LIVE_HELPERS_SOURCE.contains("max_child_polls"));
+    assert!(LIVE_HELPERS_SOURCE.contains("live_validate_revision"));
+    assert!(LIVE_HELPERS_SOURCE.contains("ulimit -f 128"));
+    assert!(LIVE_HELPERS_SOURCE.contains("ulimit -f unlimited"));
+    assert!(LIVE_HELPERS_SOURCE.contains("live_supervise_child_without_file_limit"));
+    assert!(RAW_BUILD_SOURCE.contains("live_supervise_child_without_file_limit"));
+    assert!(LIVE_HELPERS_SOURCE.contains("LIVE_CHILD_GROUP_ID"));
+    assert!(LIVE_HELPERS_SOURCE.contains("live_cleanup_child_group"));
+    assert!(LIVE_HELPERS_SOURCE.contains("kill -TERM -- \"-${LIVE_CHILD_GROUP_ID}\""));
+    assert!(LIVE_HELPERS_SOURCE.contains("kill -KILL -- \"-${LIVE_CHILD_GROUP_ID}\""));
+    assert!(LIVE_HELPERS_SOURCE.contains("LIVE_TERM_GRACE_POLLS"));
+    assert!(LIVE_HELPERS_SOURCE.contains("LIVE_KILL_GRACE_POLLS"));
+    assert!(LIVE_HELPERS_SOURCE.contains("jobs -pr"));
+    assert!(LIVE_HELPERS_SOURCE.contains("return 126"));
+    assert!(LIVE_HELPERS_SOURCE.contains("wait \"${LIVE_CHILD_PID}\""));
+    assert!(LIVE_HELPERS_SOURCE.contains("cmp -s \"${stdout_file}\""));
+    assert!(LIVE_HELPERS_SOURCE.contains("live_binary_sha256"));
+    assert!(LIVE_HELPERS_SOURCE.contains("live_validate_path_components"));
+    assert!(LIVE_SCRIPT_SOURCE.contains("binary_digest_before"));
+    assert!(LIVE_SCRIPT_SOURCE.contains("binary_digest_after"));
+    assert!(LIVE_SCRIPT_SOURCE.contains("live_validate_binary \"${binary}\""));
+    assert!(LIVE_SCRIPT_SOURCE.contains("${command_status}\" -eq 125"));
+    assert!(RAW_BUILD_SOURCE.contains("build --locked --offline --bin nagi"));
+    assert!(RAW_BUILD_SOURCE.contains("/usr/bin/git"));
+    assert!(RAW_BUILD_SOURCE.contains("\"${mise_path}\" exec --locked"));
+    assert!(RAW_BUILD_SOURCE.contains("rust@1.98.0"));
+    assert!(RAW_BUILD_SOURCE.contains("EXPECTED_RUST_VERSION=1.98.0"));
+    assert!(RAW_BUILD_SOURCE.contains("PATH=/usr/bin:/bin"));
+    assert!(RAW_BUILD_SOURCE.contains("NAGI_CONTRACT_BUILD_REVISION"));
+    assert!(RAW_BUILD_SOURCE.contains("CARGO_TARGET_DIR"));
+    assert!(RAW_BUILD_SOURCE.contains("target/nagi-contract"));
+    assert!(RAW_BUILD_SOURCE.contains("BUILD_MAX_CHILD_POLLS"));
+    assert!(RAW_BUILD_SOURCE.contains("cargo --version"));
+    assert!(RAW_BUILD_SOURCE.contains("rustc -Vv"));
+    assert!(RAW_BUILD_SOURCE.contains("live_validate_binary"));
+    assert!(!RAW_BUILD_SOURCE.contains("live_supervise_child \"${build_stdout}\""));
+    assert!(!RAW_BUILD_SOURCE.contains("command -v cargo"));
+    assert!(!RAW_BUILD_SOURCE.contains("PATH=\"${PATH}\""));
+    assert!(!LIVE_SCRIPT_SOURCE.contains("NAGI_CONTRACT_BINARY"));
+    assert!(!LIVE_SCRIPT_SOURCE.contains("codesign"));
+    assert!(!LIVE_SCRIPT_SOURCE.contains("cargo run"));
+}
+
+#[cfg(unix)]
+#[test]
+fn live_runner_has_hermetic_negative_gates_for_child_and_binary() {
+    for marker in [
+        "stdout_size > max_output_bytes",
+        "stderr_size > max_output_bytes",
+        "if ((timed_out));",
+        "return 125",
+        "rejected the checked repository",
+        "requires a clean checked revision",
+    ] {
+        assert!(
+            LIVE_HELPERS_SOURCE.contains(marker) || RAW_BUILD_SOURCE.contains(marker),
+            "live runner is missing negative gate marker: {marker}"
         );
     }
+    for marker in [
+        "*.app",
+        "Mach-O*",
+        "LIVE_CHILD_GROUP_ID",
+        "live_supervise_child_without_file_limit",
+        "kill -TERM -- \"-${LIVE_CHILD_GROUP_ID}\"",
+        "kill -KILL -- \"-${LIVE_CHILD_GROUP_ID}\"",
+        "live_group_exited_within",
+        "jobs -pr",
+        "return 126",
+        "wait \"${LIVE_CHILD_PID}\"",
+    ] {
+        assert!(
+            LIVE_HELPERS_SOURCE.contains(marker) || LIVE_SCRIPT_SOURCE.contains(marker),
+            "live runner is missing negative gate marker: {marker}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn live_runner_helper_executes_hermetic_timeout_output_and_binary_negatives() {
+    let output = command_output(LIVE_HELPERS_SCRIPT, &[("NAGI_CONTRACT_HELPER", "1")]);
+    assert_eq!(output.status.code(), Some(2));
+
+    let mut command = Command::new("/bin/bash");
+    command
+        .arg(LIVE_HELPERS_SCRIPT)
+        .arg("--self-test")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin");
+    let output = command
+        .output()
+        .expect("live helper self-test should start");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "live helper self-test failed: stdout={:?}, stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+
+    let mut build_command = Command::new("/bin/bash");
+    build_command
+        .arg(RAW_BUILD_SCRIPT)
+        .arg("--self-test")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin");
+    let output = build_command
+        .output()
+        .expect("raw build helper self-test should start");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "raw build helper self-test failed: stdout={:?}, stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
 }

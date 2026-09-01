@@ -12,6 +12,8 @@
 #[cfg(target_os = "macos")]
 use crate::linear::oauth::{self, OAuthConfig};
 use crate::linear::oauth::{OAuthError, TokenBundle};
+#[cfg(any(test, target_os = "macos"))]
+use crate::linear::read::{ReadContractError, ReadContractReport, VerifiedReadOutcome};
 #[cfg(target_os = "macos")]
 use oauth2::reqwest::blocking::{Body, Client, ClientBuilder, Response};
 #[cfg(target_os = "macos")]
@@ -38,10 +40,14 @@ const LOCK_DIRECTORY_NAME: &str = "Nagi";
 #[cfg(target_os = "macos")]
 const LOCK_FILE_NAME: &str = "linear-oauth.lock";
 
-const ENVELOPE_VERSION: u8 = 1;
+// P0-05 binds each persisted credential to the exact OAuth client ID that
+// obtained it. The version bump intentionally makes pre-binding records
+// unreadable; there is no silent migration of credential material.
+const ENVELOPE_VERSION: u8 = 2;
 const MAX_ENVELOPE_BYTES: usize = 64 * 1024;
 const MAX_TOKEN_BYTES: usize = 16 * 1024;
 const MAX_CLIENT_ID_BYTES: usize = 4 * 1024;
+const MAX_VIEWER_ID_BYTES: usize = 4 * 1024;
 const MILLIS_PER_SECOND: i64 = 1_000;
 const REPLAY_GRACE_MILLIS: i64 = 30 * 60 * MILLIS_PER_SECOND;
 #[cfg(any(test, target_os = "macos"))]
@@ -52,13 +58,6 @@ const REFRESH_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const REFRESH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[cfg(target_os = "macos")]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "P0-05 provider operations will consume the private refresh lease"
-    )
-)]
 const TOKEN_ENDPOINT: &str = "https://api.linear.app/oauth/token";
 #[cfg(target_os = "macos")]
 const REVOKE_ENDPOINT: &str = "https://api.linear.app/oauth/revoke";
@@ -201,7 +200,7 @@ impl SecretText {
     }
 
     #[cfg_attr(
-        not(test),
+        all(not(test), not(target_os = "macos")),
         expect(
             dead_code,
             reason = "the refresh response parser consumes validated secret fields"
@@ -281,11 +280,18 @@ struct RevokeIntent {
     confirmed_at_ms: Option<i64>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CredentialEnvelope {
     version: u8,
     revision: u64,
+    /// Non-secret local metadata tying the token to the OAuth client used at
+    /// login. This is compared before an access-token lease is issued.
+    client_id: String,
+    /// The first verified app viewer bound to this OAuth client. It is
+    /// bootstrapped by the read contract under the credential lock and then
+    /// compared on every later read; it is never emitted in public evidence.
+    viewer_id: Option<String>,
     state: LifecycleState,
     access_token: SecretText,
     refresh_token: SecretText,
@@ -294,8 +300,27 @@ struct CredentialEnvelope {
     revoke: Option<RevokeIntent>,
 }
 
+impl fmt::Debug for CredentialEnvelope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CredentialEnvelope")
+            .field("version", &self.version)
+            .field("revision", &self.revision)
+            .field("client_id", &"[redacted]")
+            .field("viewer_id", &"[redacted]")
+            .field("state", &self.state)
+            .field("access_token", &self.access_token)
+            .field("refresh_token", &self.refresh_token)
+            .field("access_expires_at_ms", &self.access_expires_at_ms)
+            .field("refresh", &self.refresh)
+            .field("revoke", &self.revoke)
+            .finish()
+    }
+}
+
 impl CredentialEnvelope {
     fn ready(
+        client_id: &str,
         revision: u64,
         access_token: Zeroizing<String>,
         refresh_token: Zeroizing<String>,
@@ -304,6 +329,8 @@ impl CredentialEnvelope {
         Ok(Self {
             version: ENVELOPE_VERSION,
             revision,
+            client_id: bounded_client_id(client_id)?,
+            viewer_id: None,
             state: LifecycleState::Ready,
             access_token: SecretText::new(access_token.to_string())?,
             refresh_token: SecretText::new(refresh_token.to_string())?,
@@ -314,7 +341,15 @@ impl CredentialEnvelope {
     }
 
     fn validate(&self) -> Result<(), CredentialError> {
-        if self.version != ENVELOPE_VERSION || self.revision == 0 || self.access_expires_at_ms < 0 {
+        if self.version != ENVELOPE_VERSION
+            || self.revision == 0
+            || self.access_expires_at_ms < 0
+            || bounded_client_id(&self.client_id).is_err()
+            || self
+                .viewer_id
+                .as_deref()
+                .is_some_and(|viewer_id| bounded_viewer_id(viewer_id).is_err())
+        {
             return Err(CredentialError::InvalidEnvelope);
         }
         if self.access_token.as_str().len() > MAX_TOKEN_BYTES
@@ -346,6 +381,7 @@ impl CredentialEnvelope {
                 };
                 if self.revoke.is_some()
                     || intent.refresh_token.as_str() != self.refresh_token.as_str()
+                    || intent.client_id != self.client_id
                     || intent.first_send_at_ms < 0
                     || intent.replay_deadline_ms != expected_deadline
                     || intent.replay_deadline_ms <= intent.first_send_at_ms
@@ -407,7 +443,7 @@ fn parse_envelope(bytes: &[u8]) -> Result<CredentialEnvelope, CredentialError> {
 struct ProviderResponse {
     status: u16,
     #[cfg_attr(
-        not(test),
+        all(not(test), not(target_os = "macos")),
         expect(
             dead_code,
             reason = "the refresh response parser consumes the bounded provider body"
@@ -451,7 +487,7 @@ enum ProviderTransportError {
 
 trait ProviderTransport {
     #[cfg_attr(
-        not(test),
+        all(not(test), not(target_os = "macos")),
         expect(
             dead_code,
             reason = "P0-05 provider operations will consume the private refresh lease"
@@ -991,7 +1027,7 @@ struct LoadedRecord {
 /// The local credential lifecycle manager.
 pub struct CredentialManager {
     #[cfg_attr(
-        not(test),
+        all(not(test), not(target_os = "macos")),
         expect(
             dead_code,
             reason = "P0-05 provider operations will bind refresh requests to the configured client"
@@ -1045,6 +1081,18 @@ impl CredentialManager {
             let _ = (client_id, callback_port);
             Err(CredentialError::UnsupportedPlatform)
         }
+    }
+
+    /// Constructs the production manager for an explicitly requested provider
+    /// read contract. It retains the refresh-capable transport and Keychain
+    /// store but cannot launch authorization because no authorizer is installed.
+    pub(crate) fn production_read(
+        client_id: impl Into<String>,
+        callback_port: u16,
+    ) -> Result<Self, CredentialError> {
+        let mut manager = Self::production(client_id, callback_port)?;
+        manager.authorizer = None;
+        Ok(manager)
     }
 
     /// Constructs the production manager for local status inspection.  It does
@@ -1129,7 +1177,8 @@ impl CredentialManager {
         let expires_at_ms = now
             .checked_add(duration_millis(lifetime)?)
             .ok_or(CredentialError::Configuration)?;
-        let envelope = CredentialEnvelope::ready(1, access, refresh, expires_at_ms)?;
+        let envelope =
+            CredentialEnvelope::ready(&self.client_id, 1, access, refresh, expires_at_ms)?;
         self.write_record(&envelope, None).map(|_| ())
     }
 
@@ -1167,41 +1216,43 @@ impl CredentialManager {
         }
     }
 
-    /// Acquires an access token for an internal provider operation.
-    ///
-    /// The callback is crate-private so raw token material cannot become a
-    /// public API.  The lock remains held while the callback runs, preventing a
-    /// concurrent logout or refresh from invalidating the lease.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "P0-05 provider operations will consume this private access-token lease"
-        )
-    )]
+    /// Test-only access to the generic token lease. Production provider
+    /// operations must use [`Self::with_verified_read`] so an actor binding is
+    /// enforced before the lease leaves this manager.
+    #[cfg(test)]
     pub(crate) fn with_access_token<T>(
         &mut self,
         callback: impl FnOnce(&str) -> T,
     ) -> Result<T, CredentialError> {
         let _guard = self.critical_section.lock()?;
-        let record = self.load_record()?.ok_or(CredentialError::NotReady)?;
-        let now = self.clock.now()?;
-        match record.envelope.state {
-            LifecycleState::Ready if now < record.envelope.access_expires_at_ms => {
-                Ok(callback(record.envelope.access_token.as_str()))
-            }
-            LifecycleState::Ready => {
-                let record = self.refresh_record(record, now)?;
-                Ok(callback(record.envelope.access_token.as_str()))
-            }
-            LifecycleState::ReplayPending => {
-                let record = self.replay_record(record, now)?;
-                Ok(callback(record.envelope.access_token.as_str()))
-            }
-            LifecycleState::RevokePending | LifecycleState::RevokedDeletePending => {
-                Err(CredentialError::NotReady)
-            }
+        let record = self.load_access_record()?;
+        Ok(callback(record.envelope.access_token.as_str()))
+    }
+
+    /// Acquires a serialized token lease, accepts only a typed fully verified
+    /// read outcome, persists or checks its app viewer binding while the lock
+    /// remains held, and returns the boolean-only report. A failed provider
+    /// verification never reaches the binding write.
+    #[cfg(any(test, target_os = "macos"))]
+    pub(crate) fn with_verified_read(
+        &mut self,
+        callback: impl FnOnce(&str) -> Result<VerifiedReadOutcome, ReadContractError>,
+    ) -> Result<ReadContractReport, ReadContractError> {
+        let _guard = self
+            .critical_section
+            .lock()
+            .map_err(ReadContractError::Credential)?;
+        let record = self
+            .load_access_record()
+            .map_err(ReadContractError::Credential)?;
+        let outcome = callback(record.envelope.access_token.as_str())?;
+        let (report, viewer_id) = outcome.into_parts();
+        if !report.passed() {
+            return Err(ReadContractError::ReadFieldsInvalid);
         }
+        self.bind_viewer_id(record, viewer_id)
+            .map_err(ReadContractError::Credential)?;
+        Ok(report)
     }
 
     /// Explicitly revokes the latest refresh token and then removes local state.
@@ -1282,6 +1333,51 @@ impl CredentialManager {
         Ok(Some(LoadedRecord { envelope, bytes }))
     }
 
+    fn load_access_record(&mut self) -> Result<LoadedRecord, CredentialError> {
+        let record = self.load_record()?.ok_or(CredentialError::NotReady)?;
+        self.validate_client_binding(&record.envelope)?;
+        let now = self.clock.now()?;
+        match record.envelope.state {
+            LifecycleState::Ready if now < record.envelope.access_expires_at_ms => Ok(record),
+            LifecycleState::Ready => self.refresh_record(record, now),
+            LifecycleState::ReplayPending => self.replay_record(record, now),
+            LifecycleState::RevokePending | LifecycleState::RevokedDeletePending => {
+                Err(CredentialError::NotReady)
+            }
+        }
+    }
+
+    fn validate_client_binding(
+        &self,
+        envelope: &CredentialEnvelope,
+    ) -> Result<(), CredentialError> {
+        let client_id = bounded_client_id(&self.client_id)?;
+        if envelope.client_id != client_id {
+            return Err(CredentialError::Configuration);
+        }
+        Ok(())
+    }
+
+    fn bind_viewer_id(
+        &mut self,
+        record: LoadedRecord,
+        viewer_id: Zeroizing<String>,
+    ) -> Result<(), CredentialError> {
+        let record = self.read_exact_record(&record.bytes)?;
+        let viewer_id = bounded_viewer_id(viewer_id.as_str())?;
+        if let Some(expected) = record.envelope.viewer_id.as_deref() {
+            if expected == viewer_id {
+                return Ok(());
+            }
+            return Err(CredentialError::Configuration);
+        }
+
+        let mut bound = record.envelope.clone();
+        bound.revision = next_revision(&bound)?;
+        bound.viewer_id = Some(viewer_id);
+        self.write_record(&bound, Some(&record.bytes)).map(|_| ())
+    }
+
     fn read_exact_record(&mut self, expected: &[u8]) -> Result<LoadedRecord, CredentialError> {
         let observed = self
             .store
@@ -1334,7 +1430,7 @@ impl CredentialManager {
     }
 
     #[cfg_attr(
-        not(test),
+        all(not(test), not(target_os = "macos")),
         expect(
             dead_code,
             reason = "P0-05 provider operations will consume this private access-token lease"
@@ -1345,6 +1441,7 @@ impl CredentialManager {
         record: LoadedRecord,
         now: i64,
     ) -> Result<LoadedRecord, CredentialError> {
+        self.validate_client_binding(&record.envelope)?;
         let deadline = now
             .checked_add(REPLAY_GRACE_MILLIS)
             .ok_or(CredentialError::Configuration)?;
@@ -1379,7 +1476,7 @@ impl CredentialManager {
     }
 
     #[cfg_attr(
-        not(test),
+        all(not(test), not(target_os = "macos")),
         expect(
             dead_code,
             reason = "P0-05 provider operations will consume this private access-token lease"
@@ -1390,6 +1487,7 @@ impl CredentialManager {
         record: LoadedRecord,
         now: i64,
     ) -> Result<LoadedRecord, CredentialError> {
+        self.validate_client_binding(&record.envelope)?;
         let intent = record
             .envelope
             .refresh
@@ -1431,7 +1529,7 @@ impl CredentialManager {
     }
 
     #[cfg_attr(
-        not(test),
+        all(not(test), not(target_os = "macos")),
         expect(
             dead_code,
             reason = "P0-05 provider operations will consume this private access-token lease"
@@ -1468,8 +1566,14 @@ impl CredentialManager {
             Some(expires_at) => expires_at,
             None => return Err(refresh_failure_error(&pending)),
         };
-        let ready =
-            CredentialEnvelope::ready(next_revision(&pending)?, access, refresh, expires_at_ms)?;
+        let mut ready = CredentialEnvelope::ready(
+            pending.client_id.as_str(),
+            next_revision(&pending)?,
+            access,
+            refresh,
+            expires_at_ms,
+        )?;
+        ready.viewer_id = pending.viewer_id.clone();
         self.read_exact_record(&pending_record.bytes)?;
         self.write_record(&ready, Some(&pending_record.bytes))
     }
@@ -1519,6 +1623,16 @@ pub(crate) fn bounded_client_id(client_id: &str) -> Result<String, CredentialErr
     Ok(client_id.to_owned())
 }
 
+fn bounded_viewer_id(viewer_id: &str) -> Result<String, CredentialError> {
+    if viewer_id.trim().is_empty()
+        || viewer_id.len() > MAX_VIEWER_ID_BYTES
+        || viewer_id.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(CredentialError::Configuration);
+    }
+    Ok(viewer_id.to_owned())
+}
+
 fn next_revision(envelope: &CredentialEnvelope) -> Result<u64, CredentialError> {
     envelope
         .revision
@@ -1558,7 +1672,7 @@ fn map_store_error(error: StoreError) -> CredentialError {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(
-    not(test),
+    all(not(test), not(target_os = "macos")),
     expect(
         dead_code,
         reason = "P0-05 provider operations will validate the bounded refresh response"
@@ -1575,7 +1689,7 @@ struct RawRefreshResponse {
 }
 
 #[cfg_attr(
-    not(test),
+    all(not(test), not(target_os = "macos")),
     expect(
         dead_code,
         reason = "P0-05 provider operations will validate the bounded refresh response"
@@ -1620,6 +1734,8 @@ mod tests {
     const REFRESH: &str = "synthetic-refresh";
     const NEW_ACCESS: &str = "synthetic-new-access";
     const NEW_REFRESH: &str = "synthetic-new-refresh";
+    const VIEWER: &str = "synthetic-app-viewer";
+    const OTHER_VIEWER: &str = "synthetic-other-app-viewer";
     const NOW_MS: i64 = 100_000;
     const EXPIRED_AT_MS: i64 = 100_000;
     const READY_AT_MS: i64 = 200_000;
@@ -1942,12 +2058,23 @@ mod tests {
 
     fn ready_envelope(revision: u64, expires_at_ms: i64) -> CredentialEnvelope {
         CredentialEnvelope::ready(
+            CLIENT_ID,
             revision,
             Zeroizing::new(ACCESS.to_owned()),
             Zeroizing::new(REFRESH.to_owned()),
             expires_at_ms,
         )
         .expect("envelope")
+    }
+
+    fn ready_bytes_with_viewer(
+        revision: u64,
+        expires_at_ms: i64,
+        viewer_id: &str,
+    ) -> Zeroizing<Vec<u8>> {
+        let mut envelope = ready_envelope(revision, expires_at_ms);
+        envelope.viewer_id = Some(viewer_id.to_owned());
+        serialize_envelope(&envelope).expect("bytes")
     }
 
     fn replay_pending_bytes(
@@ -1981,6 +2108,7 @@ mod tests {
         access_expires_at_ms: i64,
     ) -> Zeroizing<Vec<u8>> {
         let mut envelope = CredentialEnvelope::ready(
+            CLIENT_ID,
             revision,
             Zeroizing::new(ACCESS.to_owned()),
             Zeroizing::new(REFRESH.to_owned()),
@@ -2048,11 +2176,25 @@ mod tests {
             parse_envelope(&vec![b'x'; MAX_ENVELOPE_BYTES + 1]),
             Err(CredentialError::InvalidEnvelope)
         ));
+
+        let legacy = String::from_utf8_lossy(&valid).replacen("\"version\":2", "\"version\":1", 1);
+        assert!(matches!(
+            parse_envelope(legacy.as_bytes()),
+            Err(CredentialError::InvalidEnvelope)
+        ));
+
+        let mut invalid_viewer = ready_envelope(1, READY_AT_MS);
+        invalid_viewer.viewer_id = Some("viewer\nwith-control".to_owned());
+        assert!(matches!(
+            invalid_viewer.validate(),
+            Err(CredentialError::InvalidEnvelope)
+        ));
     }
 
     #[test]
     fn revoked_delete_pending_requires_exact_nonnegative_confirmation_marker() {
         let mut valid = CredentialEnvelope::ready(
+            CLIENT_ID,
             1,
             Zeroizing::new(ACCESS.to_owned()),
             Zeroizing::new(REFRESH.to_owned()),
@@ -2098,6 +2240,231 @@ mod tests {
         assert!(!format!("{manager:?}").contains(ACCESS));
         assert!(!CredentialError::Storage.to_string().contains(REFRESH));
         assert_eq!(CredentialStatus::Ready.to_string(), "ready");
+
+        let mut envelope = ready_envelope(1, READY_AT_MS);
+        envelope.viewer_id = Some(VIEWER.to_owned());
+        let debug = format!("{envelope:?}");
+        assert!(!debug.contains(CLIENT_ID));
+        assert!(!debug.contains(VIEWER));
+    }
+
+    #[test]
+    fn verified_read_bootstraps_viewer_under_lock_and_increments_revision() {
+        let initial = ready_bytes(1, READY_AT_MS);
+        let store = MemoryStore {
+            value: Some(initial.clone()),
+            ..MemoryStore::default()
+        };
+        let writes = Rc::clone(&store.writes);
+        let mut manager = fake_manager(store, FakeTransport::new([]), NOW_MS, authorizer());
+
+        let report = manager
+            .with_verified_read(|token| {
+                assert_eq!(token, ACCESS);
+                Ok(VerifiedReadOutcome::for_test(VIEWER, true))
+            })
+            .expect("verified read");
+        assert!(report.passed());
+        assert_eq!(writes.get(), 1);
+        let record = manager.load_record().expect("record").expect("record");
+        assert_eq!(record.envelope.revision, 2);
+        assert_eq!(record.envelope.viewer_id.as_deref(), Some(VIEWER));
+    }
+
+    #[test]
+    fn verified_read_matching_viewer_is_idempotent_and_mismatch_preserves_bytes() {
+        let initial = ready_bytes_with_viewer(7, READY_AT_MS, VIEWER);
+        let store = MemoryStore {
+            value: Some(initial.clone()),
+            ..MemoryStore::default()
+        };
+        let writes = Rc::clone(&store.writes);
+        let mut manager = fake_manager(store, FakeTransport::new([]), NOW_MS, authorizer());
+        manager
+            .with_verified_read(|_| Ok(VerifiedReadOutcome::for_test(VIEWER, true)))
+            .expect("matching viewer");
+        assert_eq!(writes.get(), 0);
+        assert_eq!(
+            manager
+                .load_record()
+                .expect("record")
+                .expect("record")
+                .bytes,
+            initial
+        );
+
+        let before_mismatch = manager
+            .load_record()
+            .expect("record")
+            .expect("record")
+            .bytes;
+        assert_eq!(
+            manager
+                .with_verified_read(|_| { Ok(VerifiedReadOutcome::for_test(OTHER_VIEWER, true)) }),
+            Err(ReadContractError::Credential(
+                CredentialError::Configuration
+            ))
+        );
+        assert_eq!(writes.get(), 0);
+        assert_eq!(
+            manager
+                .load_record()
+                .expect("record")
+                .expect("record")
+                .bytes,
+            before_mismatch
+        );
+    }
+
+    #[test]
+    fn verified_read_rejects_replacement_before_existing_viewer_match() {
+        let initial = ready_bytes_with_viewer(7, READY_AT_MS, VIEWER);
+        let replacement = ready_bytes_with_viewer(8, READY_AT_MS, OTHER_VIEWER);
+        let replacement_pending = Rc::new(Cell::new(false));
+        let store = MemoryStore {
+            value: Some(initial),
+            replace_on_next_read: Some(Rc::clone(&replacement_pending)),
+            replacement: Some(replacement.clone()),
+            ..MemoryStore::default()
+        };
+        let writes = Rc::clone(&store.writes);
+        let mut manager = fake_manager(store, FakeTransport::new([]), NOW_MS, authorizer());
+        assert_eq!(
+            manager.with_verified_read(|_| {
+                replacement_pending.set(true);
+                Ok(VerifiedReadOutcome::for_test(VIEWER, true))
+            }),
+            Err(ReadContractError::Credential(
+                CredentialError::StorageUncertain
+            ))
+        );
+        assert_eq!(writes.get(), 0);
+        let record = manager.load_record().expect("record").expect("record");
+        assert_eq!(record.bytes, replacement);
+        assert_eq!(record.envelope.viewer_id.as_deref(), Some(OTHER_VIEWER));
+    }
+
+    #[test]
+    fn verified_read_rejects_replacement_before_first_viewer_binding() {
+        let initial = ready_bytes(1, READY_AT_MS);
+        let replacement = ready_bytes_with_viewer(2, READY_AT_MS, OTHER_VIEWER);
+        let replacement_pending = Rc::new(Cell::new(false));
+        let store = MemoryStore {
+            value: Some(initial),
+            replace_on_next_read: Some(Rc::clone(&replacement_pending)),
+            replacement: Some(replacement.clone()),
+            ..MemoryStore::default()
+        };
+        let writes = Rc::clone(&store.writes);
+        let mut manager = fake_manager(store, FakeTransport::new([]), NOW_MS, authorizer());
+        assert_eq!(
+            manager.with_verified_read(|_| {
+                replacement_pending.set(true);
+                Ok(VerifiedReadOutcome::for_test(VIEWER, true))
+            }),
+            Err(ReadContractError::Credential(
+                CredentialError::StorageUncertain
+            ))
+        );
+        assert_eq!(writes.get(), 0);
+        let record = manager.load_record().expect("record").expect("record");
+        assert_eq!(record.bytes, replacement);
+        assert_eq!(record.envelope.viewer_id.as_deref(), Some(OTHER_VIEWER));
+    }
+
+    #[test]
+    fn failed_or_invalid_verified_read_never_bootstraps_or_writes() {
+        let initial = ready_bytes(1, READY_AT_MS);
+        let store = MemoryStore {
+            value: Some(initial.clone()),
+            ..MemoryStore::default()
+        };
+        let writes = Rc::clone(&store.writes);
+        let mut manager = fake_manager(store, FakeTransport::new([]), NOW_MS, authorizer());
+        assert_eq!(
+            manager.with_verified_read(|_| Err(ReadContractError::ActorIdentityMismatch)),
+            Err(ReadContractError::ActorIdentityMismatch)
+        );
+        assert_eq!(writes.get(), 0);
+        assert_eq!(
+            manager
+                .load_record()
+                .expect("record")
+                .expect("record")
+                .bytes,
+            initial
+        );
+
+        assert_eq!(
+            manager.with_verified_read(|_| Ok(VerifiedReadOutcome::for_test(VIEWER, false))),
+            Err(ReadContractError::ReadFieldsInvalid)
+        );
+        assert_eq!(writes.get(), 0);
+
+        for viewer_id in ["", "   ", "bad\nviewer"] {
+            assert_eq!(
+                manager
+                    .with_verified_read(|_| { Ok(VerifiedReadOutcome::for_test(viewer_id, true)) }),
+                Err(ReadContractError::Credential(
+                    CredentialError::Configuration
+                ))
+            );
+            assert_eq!(writes.get(), 0);
+        }
+    }
+
+    #[test]
+    fn client_binding_mismatch_does_not_invoke_read_or_write() {
+        let mut envelope = ready_envelope(1, READY_AT_MS);
+        envelope.client_id = "different-client".to_owned();
+        let initial = serialize_envelope(&envelope).expect("bytes");
+        let store = MemoryStore {
+            value: Some(initial.clone()),
+            ..MemoryStore::default()
+        };
+        let writes = Rc::clone(&store.writes);
+        let callback_called = Rc::new(Cell::new(false));
+        let callback_called_in_closure = Rc::clone(&callback_called);
+        let mut manager = fake_manager(store, FakeTransport::new([]), NOW_MS, authorizer());
+        assert_eq!(
+            manager.with_verified_read(|_| {
+                callback_called_in_closure.set(true);
+                Ok(VerifiedReadOutcome::for_test(VIEWER, true))
+            }),
+            Err(ReadContractError::Credential(
+                CredentialError::Configuration
+            ))
+        );
+        assert!(!callback_called.get());
+        assert_eq!(writes.get(), 0);
+        assert_eq!(
+            manager
+                .load_record()
+                .expect("record")
+                .expect("record")
+                .bytes,
+            initial
+        );
+    }
+
+    #[test]
+    fn bind_write_failure_returns_no_report_and_preserves_record() {
+        let initial = ready_bytes(1, READY_AT_MS);
+        let store = MemoryStore {
+            value: Some(initial.clone()),
+            fail_write: true,
+            ..MemoryStore::default()
+        };
+        let writes = Rc::clone(&store.writes);
+        let mut manager = fake_manager(store, FakeTransport::new([]), NOW_MS, authorizer());
+        assert_eq!(
+            manager.with_verified_read(|_| Ok(VerifiedReadOutcome::for_test(VIEWER, true))),
+            Err(ReadContractError::Credential(CredentialError::Storage))
+        );
+        assert_eq!(writes.get(), 1);
+        let record = manager.load_record().expect("record").expect("record");
+        assert_eq!(record.bytes, initial);
+        assert_eq!(record.envelope.viewer_id, None);
     }
 
     #[test]
@@ -2359,6 +2726,53 @@ mod tests {
             .expect("refresh");
         assert_eq!(access, NEW_ACCESS);
         assert_eq!(manager.status(), CredentialStatus::Ready);
+    }
+
+    #[test]
+    fn refresh_and_ambiguous_refresh_preserve_verified_viewer_binding() {
+        let initial = ready_bytes_with_viewer(1, EXPIRED_AT_MS, VIEWER);
+        let mut manager = fake_manager(
+            MemoryStore {
+                value: Some(initial),
+                ..MemoryStore::default()
+            },
+            FakeTransport::new([FakeOutcome::Response(token_response(
+                NEW_ACCESS,
+                NEW_REFRESH,
+                60,
+            ))]),
+            NOW_MS,
+            authorizer(),
+        );
+        manager
+            .with_access_token(|token| token.to_owned())
+            .expect("refresh");
+        let record = manager.load_record().expect("record").expect("record");
+        assert_eq!(record.envelope.viewer_id.as_deref(), Some(VIEWER));
+
+        let initial = ready_bytes_with_viewer(1, EXPIRED_AT_MS, VIEWER);
+        let store = MemoryStore {
+            value: Some(initial.clone()),
+            ..MemoryStore::default()
+        };
+        let mut manager = fake_manager(
+            store,
+            FakeTransport::new([FakeOutcome::NoResponse]),
+            NOW_MS,
+            authorizer(),
+        );
+        assert_eq!(
+            manager.with_access_token(|_| ()),
+            Err(CredentialError::RefreshAmbiguous)
+        );
+        let pending = manager.load_record().expect("record").expect("record");
+        assert_eq!(pending.envelope.viewer_id.as_deref(), Some(VIEWER));
+        assert!(
+            pending
+                .bytes
+                .windows(VIEWER.len())
+                .any(|window| window == VIEWER.as_bytes())
+        );
     }
 
     #[test]
@@ -2734,6 +3148,7 @@ mod tests {
             replay_consumed: false,
         };
         let mut envelope = CredentialEnvelope::ready(
+            CLIENT_ID,
             1,
             Zeroizing::new(ACCESS.to_owned()),
             Zeroizing::new(REFRESH.to_owned()),
@@ -2751,6 +3166,7 @@ mod tests {
     #[test]
     fn replay_consumed_before_send_allows_no_third_request() {
         let mut envelope = CredentialEnvelope::ready(
+            CLIENT_ID,
             1,
             Zeroizing::new(ACCESS.to_owned()),
             Zeroizing::new(REFRESH.to_owned()),
@@ -2805,7 +3221,7 @@ mod tests {
         let calls = Rc::clone(&transport.revokes);
         let mut manager = fake_manager(
             MemoryStore {
-                value: Some(ready_bytes(1, READY_AT_MS)),
+                value: Some(ready_bytes_with_viewer(1, READY_AT_MS, VIEWER)),
                 ..MemoryStore::default()
             },
             transport,
@@ -2818,6 +3234,16 @@ mod tests {
         );
         assert_eq!(calls.get(), 1);
         assert_eq!(manager.status(), CredentialStatus::RevokePending);
+        assert_eq!(
+            manager
+                .load_record()
+                .expect("record")
+                .expect("record")
+                .envelope
+                .viewer_id
+                .as_deref(),
+            Some(VIEWER)
+        );
         assert_eq!(manager.logout(true), Err(CredentialError::PendingLifecycle));
         assert_eq!(calls.get(), 1);
     }

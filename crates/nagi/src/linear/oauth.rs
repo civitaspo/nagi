@@ -811,7 +811,7 @@ impl TokenBundle {
     /// Constructs a bundle after a crate-internal response validator has
     /// checked both token values and the positive lifetime.
     #[cfg_attr(
-        not(test),
+        all(not(test), not(target_os = "macos")),
         expect(
             dead_code,
             reason = "the credential refresh response parser is the future token-lease consumer"
