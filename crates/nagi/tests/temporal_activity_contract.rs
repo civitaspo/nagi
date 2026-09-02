@@ -73,6 +73,7 @@ struct ActivityState {
     latest_checkpoint: u32,
     heartbeat_count: u32,
     resumed_from_heartbeat: u32,
+    heartbeat_resume_attempt: u32,
     heartbeat_resumed: bool,
     activity_cancellation_observed: bool,
     workflow_cancellation_acknowledged: bool,
@@ -84,6 +85,7 @@ struct ActivityState {
 struct RecoveryResult {
     latest_attempt: u32,
     latest_checkpoint: u32,
+    heartbeat_resume_attempt: u32,
     heartbeat_resumed: bool,
     activity_cancelled: bool,
     workflow_cancellation_acknowledged: bool,
@@ -164,6 +166,7 @@ struct ActivityRecoveryWorkflow {
     latest_checkpoint: u32,
     heartbeat_count: u32,
     resumed_from_heartbeat: u32,
+    heartbeat_resume_attempt: u32,
     heartbeat_resumed: bool,
     activity_cancellation_observed: bool,
     workflow_cancellation_acknowledged: bool,
@@ -235,6 +238,7 @@ impl ActivityRecoveryWorkflow {
                     latest_checkpoint: state.latest_checkpoint,
                     heartbeat_count: state.heartbeat_count,
                     resumed_from_heartbeat: state.resumed_from_heartbeat,
+                    heartbeat_resume_attempt: state.heartbeat_resume_attempt,
                     heartbeat_resumed: state.heartbeat_resumed,
                     activity_cancellation_observed: state.activity_cancellation_observed,
                     workflow_cancellation_acknowledged: state.workflow_cancellation_acknowledged,
@@ -244,6 +248,7 @@ impl ActivityRecoveryWorkflow {
                 Ok(RecoveryResult {
                     latest_attempt: state.latest_attempt,
                     latest_checkpoint: state.latest_checkpoint,
+                    heartbeat_resume_attempt: state.heartbeat_resume_attempt,
                     heartbeat_resumed: state.heartbeat_resumed,
                     activity_cancelled: state.activity_cancellation_observed,
                     workflow_cancellation_acknowledged: state.workflow_cancellation_acknowledged,
@@ -262,13 +267,18 @@ impl ActivityRecoveryWorkflow {
         self.latest_attempt = self.latest_attempt.max(progress.attempt);
         self.latest_checkpoint = self.latest_checkpoint.max(progress.checkpoint);
         self.heartbeat_count = self.heartbeat_count.saturating_add(1);
-        self.resumed_from_heartbeat = self
-            .resumed_from_heartbeat
-            .max(progress.resumed_from_heartbeat);
-        self.heartbeat_resumed |= progress.resume_marker
+        let valid_resume_marker = progress.resume_marker
             && progress.heartbeat_seen
+            && progress.checkpoint != 0
+            && progress.checkpoint == progress.resumed_from_heartbeat
             && progress.resumed_from_heartbeat != 0
             && progress.attempt > 1;
+        if valid_resume_marker && progress.attempt >= self.heartbeat_resume_attempt {
+            self.resumed_from_heartbeat = progress.checkpoint;
+            self.heartbeat_resume_attempt = progress.attempt;
+        }
+        self.heartbeat_resumed = self.heartbeat_resume_attempt == self.latest_attempt
+            && self.resumed_from_heartbeat != 0;
     }
 
     #[query]
@@ -278,6 +288,7 @@ impl ActivityRecoveryWorkflow {
             latest_checkpoint: self.latest_checkpoint,
             heartbeat_count: self.heartbeat_count,
             resumed_from_heartbeat: self.resumed_from_heartbeat,
+            heartbeat_resume_attempt: self.heartbeat_resume_attempt,
             heartbeat_resumed: self.heartbeat_resumed,
             activity_cancellation_observed: self.activity_cancellation_observed,
             workflow_cancellation_acknowledged: self.workflow_cancellation_acknowledged,
@@ -552,6 +563,7 @@ async fn run_driver(phase: &str) {
         "after-worker" => {
             wait_for_state(&handle, |state| {
                 state.latest_attempt >= 2
+                    && state.heartbeat_resume_attempt == state.latest_attempt
                     && state.heartbeat_resumed
                     && state.resumed_from_heartbeat >= 1
             })
@@ -562,6 +574,7 @@ async fn run_driver(phase: &str) {
         "after-server" => {
             wait_for_state(&handle, |state| {
                 state.latest_attempt >= 3
+                    && state.heartbeat_resume_attempt == state.latest_attempt
                     && state.heartbeat_resumed
                     && state.resumed_from_heartbeat >= 1
             })
@@ -600,6 +613,11 @@ async fn run_driver(phase: &str) {
             .expect("workflow result deadline")
             .expect("completed Activity recovery workflow result");
             assert_eq!(result.latest_attempt, state.latest_attempt);
+            assert_eq!(
+                result.heartbeat_resume_attempt,
+                state.heartbeat_resume_attempt
+            );
+            assert_eq!(result.heartbeat_resume_attempt, result.latest_attempt);
             assert!(result.heartbeat_resumed);
             assert!(result.activity_cancelled);
             assert!(result.workflow_cancellation_acknowledged);

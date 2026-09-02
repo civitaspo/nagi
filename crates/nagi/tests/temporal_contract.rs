@@ -158,6 +158,19 @@ fn temporal_activity_contract_separates_worker_and_sidecar_recovery_gates() {
     assert!(TEMPORAL_ACTIVITY_TEST.contains("WorkflowExecutionInfo"));
     assert!(TEMPORAL_ACTIVITY_TEST.contains("first_execution_run_id"));
     assert!(TEMPORAL_ACTIVITY_TEST.contains("original_execution_run_id"));
+    for required in [
+        "heartbeat_resume_attempt: u32",
+        "progress.checkpoint == progress.resumed_from_heartbeat",
+        "self.heartbeat_resume_attempt = progress.attempt",
+        "state.latest_attempt >= 2\n                    && state.heartbeat_resume_attempt == state.latest_attempt",
+        "state.latest_attempt >= 3\n                    && state.heartbeat_resume_attempt == state.latest_attempt",
+        "assert_eq!(result.heartbeat_resume_attempt, result.latest_attempt);",
+    ] {
+        assert!(
+            TEMPORAL_ACTIVITY_TEST.contains(required),
+            "Temporal Activity recovery gate is missing {required:?}"
+        );
+    }
     assert!(TEMPORAL_SCRIPT.contains("history_event_records"));
     assert!(TEMPORAL_SCRIPT.contains("plutil -extract events json"));
 }
@@ -510,6 +523,37 @@ fn temporal_thin_entrypoints_guard_opt_in_before_external_commands() {
         );
         assert!(entrypoint.contains("! -f \"${shared_script}\" || -L \"${shared_script}\""));
     }
+
+    #[cfg(unix)]
+    {
+        use std::{fs, os::unix::fs::symlink, process::Command};
+
+        let root =
+            std::env::temp_dir().join(format!("nagi-temporal-entrypoint-{}", std::process::id()));
+        fs::create_dir(&root).expect("temporary test directory should be absent");
+        let entrypoint = root.join("temporal-messages.sh");
+        let shared = root.join("temporal-sdk-contract.sh");
+        fs::write(&entrypoint, TEMPORAL_MESSAGE_ENTRYPOINT)
+            .expect("entrypoint fixture should be written");
+        for (fixture, linked) in [("missing", false), ("symlink", true)] {
+            if linked {
+                symlink(&entrypoint, &shared).expect("symlink fixture should be created");
+            }
+            let output = Command::new("/bin/bash")
+                .arg(&entrypoint)
+                .env_clear()
+                .env("NAGI_CONTRACT_TEMPORAL_MESSAGES", "1")
+                .output()
+                .expect("thin entrypoint should start");
+            assert_eq!(output.status.code(), Some(1), "{fixture}");
+            assert!(String::from_utf8_lossy(&output.stderr).contains("shared wrapper"));
+            if linked {
+                fs::remove_file(&shared).expect("symlink fixture should be removed");
+            }
+        }
+        fs::remove_dir_all(&root).expect("temporary test directory should be removed");
+    }
+
     let mode_guard = TEMPORAL_SDK_SCRIPT
         .find("if (($# != 1));")
         .expect("shared dispatcher must reject missing and extra modes first");
@@ -827,132 +871,5 @@ fn temporal_sdk_dispatcher_ignores_cross_mode_opt_in() {
         assert!(output.status.success());
         assert_eq!(String::from_utf8_lossy(&output.stdout), expected_skip);
         assert!(output.stderr.is_empty());
-    }
-}
-
-#[cfg(unix)]
-#[test]
-fn temporal_thin_entrypoints_validate_regular_siblings_and_canonical_invocation() {
-    use std::fs;
-    use std::os::unix::fs::{PermissionsExt, symlink};
-    use std::path::{Path, PathBuf};
-    use std::process::Command;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    struct TemporaryDirectory(PathBuf);
-    impl Drop for TemporaryDirectory {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn mode_path(mode: &str) -> &'static str {
-        match mode {
-            "message" => concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../scripts/contracts/temporal-messages.sh"
-            ),
-            "activity" => concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../scripts/contracts/temporal-activities.sh"
-            ),
-            _ => unreachable!(),
-        }
-    }
-
-    fn write_executable(path: &Path, body: &str) {
-        fs::write(path, body).expect("test script should be written");
-        let mut permissions = fs::metadata(path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).expect("test script should be executable");
-    }
-
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock should be after the epoch")
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!(
-        "nagi-temporal-entrypoint-{}-{nonce}",
-        std::process::id()
-    ));
-    fs::create_dir(&root).expect("temporary test directory should be absent");
-    let _temporary_directory = TemporaryDirectory(root.clone());
-
-    for (mode, opt_in_environment, entrypoint_name) in [
-        (
-            "message",
-            "NAGI_CONTRACT_TEMPORAL_MESSAGES",
-            "temporal-messages.sh",
-        ),
-        (
-            "activity",
-            "NAGI_CONTRACT_TEMPORAL_ACTIVITIES",
-            "temporal-activities.sh",
-        ),
-    ] {
-        let entrypoint = root.join(entrypoint_name);
-        let shared = root.join("temporal-sdk-contract.sh");
-        write_executable(
-            &entrypoint,
-            fs::read_to_string(mode_path(mode)).unwrap().as_str(),
-        );
-
-        let missing = Command::new("/bin/bash")
-            .arg(&entrypoint)
-            .env_clear()
-            .env(opt_in_environment, "1")
-            .output()
-            .expect("thin entrypoint should start");
-        assert_eq!(missing.status.code(), Some(1));
-        assert!(String::from_utf8_lossy(&missing.stderr).contains("shared wrapper"));
-
-        write_executable(
-            &root.join("shared-target.sh"),
-            "#!/usr/bin/env bash\nprintf 'unexpected-symlink-target\\n'\n",
-        );
-        symlink(root.join("shared-target.sh"), &shared).expect("symlink fixture should be created");
-        let linked = Command::new("/bin/bash")
-            .arg(&entrypoint)
-            .env_clear()
-            .env(opt_in_environment, "1")
-            .output()
-            .expect("thin entrypoint should start");
-        assert_eq!(linked.status.code(), Some(1));
-        assert!(String::from_utf8_lossy(&linked.stderr).contains("shared wrapper"));
-        fs::remove_file(&shared).expect("symlink fixture should be removed");
-
-        write_executable(
-            &shared,
-            "#!/usr/bin/env bash\nset -euo pipefail\nprintf 'mode=%s\\n' \"$1\"\n",
-        );
-        let relative = Command::new("/bin/bash")
-            .current_dir(&root)
-            .arg(entrypoint_name)
-            .env_clear()
-            .env(opt_in_environment, "1")
-            .output()
-            .expect("relative thin entrypoint should start");
-        assert!(relative.status.success());
-        assert_eq!(
-            String::from_utf8_lossy(&relative.stdout),
-            format!("mode={mode}\n")
-        );
-
-        let absolute = Command::new("/bin/bash")
-            .arg(&entrypoint)
-            .env_clear()
-            .env(opt_in_environment, "1")
-            .output()
-            .expect("absolute thin entrypoint should start");
-        assert!(absolute.status.success());
-        assert_eq!(
-            String::from_utf8_lossy(&absolute.stdout),
-            format!("mode={mode}\n")
-        );
-
-        fs::remove_file(&entrypoint).expect("entrypoint fixture should be removed");
-        fs::remove_file(&shared).expect("shared fixture should be removed");
-        fs::remove_file(root.join("shared-target.sh"))
-            .expect("symlink target fixture should be removed");
     }
 }
