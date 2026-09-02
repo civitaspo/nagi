@@ -119,6 +119,35 @@ the gRPC status. The SDK and protoc are build-only contract dependencies; the
 standalone `nagi` binary and production runtime do not include this harness.
 No app bundle, provisioning profile, or signing identity is required.
 
+Temporal Activity recovery is a separate opt-in macOS contract, enabled with
+`NAGI_CONTRACT_TEMPORAL_ACTIVITIES=1 mise run contract:temporal-activities`.
+Its wrapper uses the same pinned Rust `1.98.0`, protoc `36.1`, and exact
+`temporalio-sdk = "=0.7.0"` offline build pattern as the message contract,
+including owner-only private Cargo/tool trees, bounded probes, one validated
+test binary, and exact cleanup. The standalone production artifact remains a
+single raw executable; SDK dependencies are test-only and feature-gated.
+The synthetic long-running Activity records progress with
+`ActivityContext::record_heartbeat` and the replacement attempt must resume
+from `ActivityContext::heartbeat_details`, without reading a filesystem
+checkpoint. The harness starts a Worker as a separate process, waits for a
+quiet heartbeat margin, force-kills it with SIGKILL, verifies the
+signal-derived wait status and reap, and starts a fresh Worker. It then repeats
+the Worker gate around a force-killed/restarted Temporal sidecar using the same
+file-backed SQLite store and no namespace declaration on restart. The exact
+workflow ID, original run ID, and current run ID remain bound; SDK history
+fetches and private CLI history snapshots require monotonic event IDs, no
+Continue-As-New/replacement, and a full canonical pre-restart event prefix in
+the final history. Cancellation is proved in two independent ways: the
+Activity returns a fixed cancellation witness through
+`ActivityError::cancelled_with_details`, and the workflow observes
+`ActivityExecutionError::Cancelled`, decodes that witness, runs independent
+cleanup, and records its terminal result. Every child has bounded waits,
+private capped output, redaction checks, and orphan/listener checks. The task
+is credential-free, loopback-only, and emits only the fixed sanitized evidence
+record; same-UID replacement races against private inputs remain a documented
+runtime-integrity limitation. Replay behavior belongs to P0-10 and is not
+covered here.
+
 The live runner resolves the repository from its own script path, requires a
 clean checked revision, and builds the ordinary raw
 `target/nagi-contract/debug/nagi` executable in that exact checkout with

@@ -17,9 +17,17 @@ const TEMPORAL_MESSAGE_SCRIPT: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../scripts/contracts/temporal-messages.sh"
 ));
+const TEMPORAL_ACTIVITY_SCRIPT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../scripts/contracts/temporal-activities.sh"
+));
 const TEMPORAL_MESSAGE_TEST: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/temporal_message_contract.rs"
+));
+const TEMPORAL_ACTIVITY_TEST: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/temporal_activity_contract.rs"
 ));
 const LIVE_HELPERS: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -74,6 +82,75 @@ fn temporal_message_contract_is_explicitly_opt_in_and_build_only() {
     }
     assert!(NAGI_MANIFEST.contains("temporalio-sdk = { version = \"=0.7.0\""));
     assert!(NAGI_MANIFEST.contains("temporal-message-contract"));
+}
+
+#[test]
+fn temporal_activity_contract_is_explicitly_opt_in_and_build_only() {
+    assert!(MISE.contains("[tasks.\"contract:temporal-activities\"]"));
+    assert!(MISE.contains("run = \"scripts/contracts/temporal-activities.sh\""));
+    assert!(TEMPORAL_ACTIVITY_SCRIPT.contains(
+        "SKIP: Temporal Activity contract is opt-in; set NAGI_CONTRACT_TEMPORAL_ACTIVITIES=1"
+    ));
+    assert!(TEMPORAL_ACTIVITY_SCRIPT.contains("target/nagi-temporal-activity-contract"));
+    assert!(TEMPORAL_ACTIVITY_SCRIPT.contains("temporal_activity_contract"));
+    assert!(TEMPORAL_ACTIVITY_SCRIPT.contains("--activity-contract"));
+    assert!(TEMPORAL_ACTIVITY_SCRIPT.contains("NAGI_CONTRACT_TEMPORAL_ACTIVITY_BINARY_SHA256"));
+    assert!(TEMPORAL_ACTIVITY_SCRIPT.contains("synthetic.temporal-activity.v1"));
+    assert!(NAGI_MANIFEST.contains("temporal-activity-contract"));
+    for required in [
+        "ActivityContext::heartbeat_details",
+        "record_heartbeat",
+        "heartbeat_details",
+        "cancelled_with_details",
+        "ActivityExecutionError::Cancelled(cancelled)",
+        "WorkflowExecutionStartedEventAttributes",
+        "WorkflowExecutionContinuedAsNewEventAttributes",
+        "fetch_history",
+        "do_not_eagerly_execute(true)",
+        "max_cached_workflows(0)",
+        "maximum_attempts(4)",
+        "HEARTBEAT_QUIET_MARGIN",
+        "follow_runs(false)",
+        "NAGI_TEMPORAL_ACTIVITY_RUN_ID",
+    ] {
+        assert!(
+            TEMPORAL_ACTIVITY_TEST.contains(required),
+            "Temporal Activity contract is missing {required:?}"
+        );
+    }
+}
+
+#[test]
+fn temporal_activity_contract_separates_worker_and_sidecar_recovery_gates() {
+    for required in [
+        "live_start_child",
+        "live_signal_child_group KILL",
+        "if ! live_signal_child_group KILL; then",
+        "wait \"${worker_pid}\"",
+        "[[ \"${wait_status}\" == \"137\" ]]",
+        "kill -0 \"${worker_pid}\"",
+        "force_kill_server",
+        "start_server_with_retry no",
+        "activity_history_before_server",
+        "activity_history_after_server",
+        "activity_history_final",
+        "assert_activity_history_prefix",
+        "same database",
+        "ACTIVITY_SERVER_PID",
+        "ACTIVITY_WORKER_PID",
+    ] {
+        assert!(
+            TEMPORAL_SCRIPT.contains(required),
+            "Temporal Activity sidecar harness is missing {required:?}"
+        );
+    }
+    assert!(!TEMPORAL_ACTIVITY_TEST.contains("std::fs"));
+    assert!(!TEMPORAL_ACTIVITY_TEST.contains("Worker::shutdown"));
+    assert!(TEMPORAL_ACTIVITY_TEST.contains("WorkflowExecutionInfo"));
+    assert!(TEMPORAL_ACTIVITY_TEST.contains("first_execution_run_id"));
+    assert!(TEMPORAL_ACTIVITY_TEST.contains("original_execution_run_id"));
+    assert!(TEMPORAL_SCRIPT.contains("history_event_records"));
+    assert!(TEMPORAL_SCRIPT.contains("plutil -extract events json"));
 }
 
 #[test]
@@ -509,6 +586,29 @@ fn temporal_message_contract_skips_without_running_external_tools() {
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
         "SKIP: Temporal message contract is opt-in; set NAGI_CONTRACT_TEMPORAL_MESSAGES=1 to request it.\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn temporal_activity_contract_skips_without_running_external_tools() {
+    use std::process::Command;
+
+    let output = Command::new("/bin/bash")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/contracts/temporal-activities.sh"
+        ))
+        .env_clear()
+        .env("PATH", "/nonexistent")
+        .output()
+        .expect("Temporal Activity contract preflight should start");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "SKIP: Temporal Activity contract is opt-in; set NAGI_CONTRACT_TEMPORAL_ACTIVITIES=1 to request it.\n"
     );
     assert!(output.stderr.is_empty());
 }

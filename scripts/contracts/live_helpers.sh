@@ -291,16 +291,16 @@ live_start_child_in_current_group_without_file_limit() {
 }
 
 live_signal_child_group() {
-  local signal="$1"
+  local signal="${1:-}"
+  [[ "${signal}" == "TERM" || "${signal}" == "KILL" ]] || return 2
   if [[ -z "${LIVE_CHILD_GROUP_ID:-}" ]]; then
-    if [[ -n "${LIVE_CHILD_PID:-}" ]]; then
-      if [[ "${signal}" == "TERM" ]]; then
-        kill -TERM "${LIVE_CHILD_PID}" 2>/dev/null || true
-      else
-        kill -KILL "${LIVE_CHILD_PID}" 2>/dev/null || true
-      fi
+    [[ -n "${LIVE_CHILD_PID:-}" ]] || return 1
+    if [[ "${signal}" == "TERM" ]]; then
+      kill -TERM "${LIVE_CHILD_PID}" 2>/dev/null
+    else
+      kill -KILL "${LIVE_CHILD_PID}" 2>/dev/null
     fi
-    return 0
+    return $?
   fi
   local group_status=0
   if [[ "${signal}" == "TERM" ]]; then
@@ -310,11 +310,16 @@ live_signal_child_group() {
   fi
   if ((group_status != 0)) && [[ -n "${LIVE_CHILD_PID:-}" ]]; then
     if [[ "${signal}" == "TERM" ]]; then
-      kill -TERM "${LIVE_CHILD_PID}" 2>/dev/null || true
+      if kill -TERM "${LIVE_CHILD_PID}" 2>/dev/null; then
+        group_status=0
+      fi
     else
-      kill -KILL "${LIVE_CHILD_PID}" 2>/dev/null || true
+      if kill -KILL "${LIVE_CHILD_PID}" 2>/dev/null; then
+        group_status=0
+      fi
     fi
   fi
+  return "${group_status}"
 }
 
 live_process_group_exists() {
@@ -338,11 +343,11 @@ live_cleanup_child_group() {
   if ! live_process_group_exists; then
     return 0
   fi
-  live_signal_child_group TERM
+  live_signal_child_group TERM || true
   if live_group_exited_within "${LIVE_TERM_GRACE_POLLS}"; then
     return 0
   fi
-  live_signal_child_group KILL
+  live_signal_child_group KILL || true
   live_group_exited_within "${LIVE_KILL_GRACE_POLLS}"
 }
 
@@ -387,11 +392,11 @@ live_reap_child_inner() {
 
   # A process group/session keeps forked descendants inside the containment
   # boundary. TERM gets a finite grace period; KILL is then sent to the group.
-  live_signal_child_group TERM
+  live_signal_child_group TERM || true
   if live_child_exited_within "${pid}" "${LIVE_TERM_GRACE_POLLS}"; then
     wait "${pid}" 2>/dev/null || true
   else
-    live_signal_child_group KILL
+    live_signal_child_group KILL || true
     # SIGKILL is final for a live process. Poll before the single wait so the
     # reap itself is bounded by the fixed grace window rather than TERM.
     if live_child_exited_within "${pid}" "${LIVE_KILL_GRACE_POLLS}"; then
@@ -493,7 +498,7 @@ live_supervise_child_inner() {
   # held. The direct child is already absent from `jobs -pr`; wait below only
   # reaps that known child, then the bounded group cleanup handles leftovers.
   if live_process_group_exists; then
-    live_signal_child_group TERM
+    live_signal_child_group TERM || true
   fi
   if wait "${LIVE_CHILD_PID}"; then
     command_status=0

@@ -16,6 +16,14 @@ temporal-message-contract = [
     "dep:futures-util",
     "dep:tokio",
 ]
+temporal-activity-contract = [
+    "dep:futures",
+    "dep:temporalio-client",
+    "dep:temporalio-common",
+    "dep:temporalio-sdk",
+    "dep:temporalio-workflow",
+    "dep:tokio",
+]
 
 [dependencies]
 base64 = "=0.22.1"
@@ -31,6 +39,7 @@ oauth2 = { version = "=5.0.0", default-features = false, features = [
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 zeroize = { version = "=1.9.0", features = ["alloc"] }
+futures = { version = "=0.3.34", optional = true }
 futures-util = { version = "=0.3.34", default-features = false, features = [
     "async-await-macro",
 ], optional = true }
@@ -62,3 +71,8 @@ required-features = ["macos-keychain-contract"]
 name = "temporal_message_contract"
 path = "tests/temporal_message_contract.rs"
 required-features = ["temporal-message-contract"]
+
+[[test]]
+name = "temporal_activity_contract"
+path = "tests/temporal_activity_contract.rs"
+required-features = ["temporal-activity-contract"]
