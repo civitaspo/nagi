@@ -542,20 +542,10 @@ fn copy_exact(
     destination: &mut std::fs::File,
     length: u64,
 ) -> Result<(), CodexError> {
-    let mut remaining = length;
-    let mut buffer = [0_u8; 64 * 1024];
-    while remaining > 0 {
-        let limit = remaining.min(buffer.len() as u64) as usize;
-        let count = source
-            .read(&mut buffer[..limit])
-            .map_err(|_| CodexError::ExecutableUntrusted)?;
-        if count == 0 {
-            return Err(CodexError::ExecutableUntrusted);
-        }
-        destination
-            .write_all(&buffer[..count])
-            .map_err(|_| CodexError::ExecutableUnavailable)?;
-        remaining -= count as u64;
+    let copied = io::copy(&mut std::io::Read::by_ref(source).take(length), destination)
+        .map_err(|_| CodexError::ExecutableUnavailable)?;
+    if copied != length {
+        return Err(CodexError::ExecutableUntrusted);
     }
     let mut trailing = [0_u8; 1];
     match source.read(&mut trailing) {
@@ -840,19 +830,6 @@ struct CommandSpec {
 }
 
 #[cfg(target_os = "macos")]
-impl fmt::Debug for CommandSpec {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("CommandSpec")
-            .field("executable", &"[redacted]")
-            .field("arguments", &self.arguments)
-            .field("environment", &"[redacted]")
-            .field("output_policy", &self.output_policy)
-            .finish()
-    }
-}
-
-#[cfg(target_os = "macos")]
 impl CommandSpec {
     fn new(
         executable: PathBuf,
@@ -890,7 +867,6 @@ impl CommandSpec {
                 environment.push((name, value));
             }
         }
-        environment.retain(|(name, _)| name != "HOME" && name != "PATH");
         environment.push((OsString::from("PATH"), OsString::from(SAFE_PATH)));
         environment.push((
             OsString::from("HOME"),
