@@ -69,7 +69,7 @@ if ! live_validate_home_directory "${home_directory}"; then
 fi
 
 umask 077
-contract_tmp="$(/usr/bin/mktemp -d /tmp/nagi-codex-auth-contract.XXXXXX)"
+contract_tmp="$(/usr/bin/mktemp -d /private/tmp/nagi-codex-auth-contract.XXXXXX)"
 if ! live_validate_path_components "${contract_tmp}"; then
   echo "Managed Codex authentication contract rejected its temporary store." >&2
   exit 1

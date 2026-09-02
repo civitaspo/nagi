@@ -629,6 +629,8 @@ fn codex_auth_contract_is_opt_in_and_status_only() {
     assert!(CODEX_AUTH_SCRIPT_SOURCE.contains("NAGI_CONTRACT_CODEX_AUTH_USE_REAL_HOME"));
     assert!(CODEX_AUTH_SCRIPT_SOURCE.contains("live_validate_clean_revision"));
     assert!(CODEX_AUTH_SCRIPT_SOURCE.contains("live_supervise_child_without_file_limit"));
+    assert!(CODEX_AUTH_SCRIPT_SOURCE.contains("/private/tmp/nagi-codex-auth-contract.XXXXXX"));
+    assert!(!CODEX_AUTH_SCRIPT_SOURCE.contains("mktemp -d /tmp/nagi-codex-auth-contract.XXXXXX"));
     assert!(CODEX_AUTH_SCRIPT_SOURCE.contains("CODEX_HOME=/nagi-codex-auth-caller-home"));
     assert!(CODEX_AUTH_SCRIPT_SOURCE.contains("auth codex status"));
     assert!(CODEX_AUTH_SCRIPT_SOURCE.contains("live_binary_sha256"));
