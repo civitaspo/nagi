@@ -72,10 +72,14 @@ SDK, run a production Worker, or contact a provider.
 
 Temporal message handling is a separate opt-in macOS contract, enabled with
 `NAGI_CONTRACT_TEMPORAL_MESSAGES=1 mise run contract:temporal-messages`. The
-wrapper requires a clean checked revision and builds the feature-gated
-`temporalio-sdk = "=0.7.0"` test with the locked `rust@1.98.0` and
-`aqua:protocolbuffers/protobuf/protoc@36.1` tools into the dedicated
-`target/nagi-temporal-message-contract` directory. The wrapper validates the
+thin public entrypoint delegates to the shared closed-mode
+`scripts/contracts/temporal-sdk-contract.sh` wrapper. Its literal `message`
+mode fixes the feature, test name, dedicated target, digest binding, inner
+sidecar flag, and evidence fixture; unknown or mixed modes fail before external
+commands run. The shared wrapper requires a clean checked revision and builds
+the feature-gated `temporalio-sdk = "=0.7.0"` test with the locked
+`rust@1.98.0` and `aqua:protocolbuffers/protobuf/protoc@36.1` tools into the
+dedicated `target/nagi-temporal-message-contract` directory. It validates the
 installed architecture-specific Rust `1.98.0` and protoc `36.1` trees as
 canonical current-user-owned trees containing only directories and single-link
 regular files with no group/other write bits, then APFS-clone-copies both
@@ -121,9 +125,12 @@ No app bundle, provisioning profile, or signing identity is required.
 
 Temporal Activity recovery is a separate opt-in macOS contract, enabled with
 `NAGI_CONTRACT_TEMPORAL_ACTIVITIES=1 mise run contract:temporal-activities`.
-Its wrapper uses the same pinned Rust `1.98.0`, protoc `36.1`, and exact
-`temporalio-sdk = "=0.7.0"` offline build pattern as the message contract,
-including owner-only private Cargo/tool trees, bounded probes, one validated
+Its thin public entrypoint selects only the shared wrapper's literal `activity`
+mode. That mode fixes the Activity feature, test name, dedicated target, digest
+binding, inner sidecar flag, evidence fixture, and extended outer cleanup grace
+while using the same pinned Rust `1.98.0`, protoc `36.1`, and exact
+`temporalio-sdk = "=0.7.0"` offline build pattern as the message mode. This
+includes owner-only private Cargo/tool trees, bounded probes, one validated
 test binary, and exact cleanup. The standalone production artifact remains a
 single raw executable; SDK dependencies are test-only and feature-gated.
 The synthetic long-running Activity records progress with
