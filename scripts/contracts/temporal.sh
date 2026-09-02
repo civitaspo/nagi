@@ -27,14 +27,17 @@ if [[ "$(/usr/bin/uname -s)" != "Darwin" ]]; then
   exit 2
 fi
 
-script_directory="$(cd "$(/usr/bin/dirname "${BASH_SOURCE[0]}")" && pwd -P 2>/dev/null || true)"
+script_directory="$(cd "$(/usr/bin/dirname "${BASH_SOURCE[0]}" 2>/dev/null)" 2>/dev/null && pwd -P 2>/dev/null || true)"
 helper_script="${script_directory}/live_helpers.sh"
 if [[ ! -f "${helper_script}" || -L "${helper_script}" ]]; then
   echo "Temporal contract layer could not load its checked process helper." >&2
   exit 1
 fi
 # shellcheck source=/dev/null
-. "${helper_script}"
+if ! . "${helper_script}" 2>/dev/null; then
+  echo "Temporal contract layer could not load its checked process helper." >&2
+  exit 1
+fi
 if ! live_validate_path_components "${script_directory}"; then
   echo "Temporal contract layer rejected its script path." >&2
   exit 1

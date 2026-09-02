@@ -21,6 +21,16 @@ const TEMPORAL_MESSAGE_TEST: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/temporal_message_contract.rs"
 ));
+const LIVE_HELPERS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../scripts/contracts/live_helpers.sh"
+));
+const CONTRACT_DOC: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../docs/contract-testing.md"
+));
+const REPOSITORY_GUIDELINES: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../AGENTS.md"));
 const MISE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../mise.toml"));
 const NAGI_MANIFEST: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
 
@@ -201,6 +211,9 @@ fn temporal_message_wrapper_binds_the_private_locked_toolchain() {
         "-type l",
         "-type f ! -links 1",
         "! -uid \"${current_uid}\"",
+        "-perm -020",
+        "-perm -002",
+        "-print -quit",
         "private_rust_toolchain",
         "private_protoc",
         "stat -f '%u %l'",
@@ -208,6 +221,10 @@ fn temporal_message_wrapper_binds_the_private_locked_toolchain() {
         "Mach-O 64-bit executable x86_64",
         "/bin/cp -cR",
         "/bin/chmod 700",
+        "private_truncate_file",
+        ": 2>/dev/null >\"$1\"",
+        "/usr/bin/mktemp -d /tmp/nagi-temporal-messages.XXXXXX 2>/dev/null",
+        ">/dev/null 2>&1",
         "PATH=\"${private_rust_toolchain}/bin:${private_protoc}/bin:/usr/bin:/bin\"",
         "message_tool_step",
         "HOME=\"${build_home}\"",
@@ -216,6 +233,7 @@ fn temporal_message_wrapper_binds_the_private_locked_toolchain() {
         "rustc 1.98.0 (88d9e12ae 2026-08-18)",
         "cargo 1.98.0 (797e8a9bc 2026-08-05)",
         "libprotoc 36.1",
+        "/bin/sh -c 'exec \"$@\" >/dev/null 2>&1' nagi-cargo-build cargo",
         "rustc_source_sha256",
         "cargo_source_sha256",
         "protoc_source_sha256",
@@ -254,6 +272,44 @@ fn temporal_message_wrapper_binds_the_private_locked_toolchain() {
         r#"if live_supervise_child_without_file_limit \
   "${sidecar_stdout}""#
     ));
+}
+
+#[test]
+fn temporal_contract_suppresses_setup_and_file_size_diagnostics() {
+    for (script, label) in [
+        (TEMPORAL_SCRIPT, "Temporal contract"),
+        (TEMPORAL_MESSAGE_SCRIPT, "Temporal message contract"),
+    ] {
+        for required in [
+            "$(/usr/bin/dirname \"${BASH_SOURCE[0]}\" 2>/dev/null)",
+            "cd \"$(/usr/bin/dirname \"${BASH_SOURCE[0]}\" 2>/dev/null)\" 2>/dev/null",
+            "if ! . \"${helper_script}\" 2>/dev/null; then",
+        ] {
+            assert!(
+                script.contains(required),
+                "{label} is missing diagnostic suppression invariant {required:?}"
+            );
+        }
+    }
+
+    assert!(LIVE_HELPERS.contains("live_file_size()"));
+    assert!(LIVE_HELPERS.contains("} 2>/dev/null"));
+    assert!(LIVE_HELPERS.contains("^[0-9]+$"));
+    assert!(!LIVE_HELPERS.contains("live_file_size() {\n  /usr/bin/wc"));
+
+    for (document, label) in [
+        (CONTRACT_DOC, "contract-testing documentation"),
+        (REPOSITORY_GUIDELINES, "repository guidelines"),
+    ] {
+        assert!(
+            document.contains("same-UID replacement"),
+            "{label} must disclose the same-UID replacement limitation"
+        );
+        assert!(
+            !document.contains("no mid-run substitution"),
+            "{label} must not claim absence of mid-run substitution"
+        );
+    }
 }
 
 #[test]

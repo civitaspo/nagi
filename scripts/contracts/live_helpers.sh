@@ -122,7 +122,21 @@ live_validate_home_directory() {
 }
 
 live_file_size() {
-  /usr/bin/wc -c <"$1" | /usr/bin/tr -d '[:space:]'
+  if (($# != 1)); then
+    return 1
+  fi
+  local size
+  if ! size="$(
+    {
+      /usr/bin/wc -c <"$1" | /usr/bin/tr -d '[:space:]'
+    } 2>/dev/null
+  )"; then
+    return 1
+  fi
+  if [[ ! "${size}" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+  printf '%s\n' "${size}"
 }
 
 live_binary_sha256() {

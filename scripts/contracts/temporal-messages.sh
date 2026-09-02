@@ -31,7 +31,7 @@ case "$(/usr/bin/uname -m)" in
     ;;
 esac
 
-script_directory="$(cd "$(/usr/bin/dirname "${BASH_SOURCE[0]}")" && pwd -P 2>/dev/null || true)"
+script_directory="$(cd "$(/usr/bin/dirname "${BASH_SOURCE[0]}" 2>/dev/null)" 2>/dev/null && pwd -P 2>/dev/null || true)"
 helper_script="${script_directory}/live_helpers.sh"
 temporal_script="${script_directory}/temporal.sh"
 if [[ ! -f "${helper_script}" || -L "${helper_script}" \
@@ -40,7 +40,10 @@ if [[ ! -f "${helper_script}" || -L "${helper_script}" \
   exit 1
 fi
 # shellcheck source=/dev/null
-. "${helper_script}"
+if ! . "${helper_script}" 2>/dev/null; then
+  echo "Temporal message contract could not load its checked process helper." >&2
+  exit 1
+fi
 if ! live_validate_path_components "${script_directory}" \
   || ! live_validate_path_components "${temporal_script}"; then
   echo "Temporal message contract rejected its script path." >&2
@@ -129,7 +132,8 @@ validate_tool_tree() {
   fi
   if ! invalid_entries="$(/usr/bin/find -P "${tree}" \
     \( -type l -o \( ! -type d ! -type f \) \
-      -o \( -type f ! -links 1 \) -o \( ! -uid "${current_uid}" \) \) \
+      -o \( -type f ! -links 1 \) -o \( ! -uid "${current_uid}" \) \
+      -o \( -perm -020 -o -perm -002 \) \) \
     -print -quit 2>/dev/null)"; then
     return 1
   fi
@@ -188,14 +192,17 @@ if ! live_validate_path_components "${contract_target}" \
   exit 1
 fi
 
-raw_contract_tmp="$(/usr/bin/mktemp -d /tmp/nagi-temporal-messages.XXXXXX)"
+if ! raw_contract_tmp="$(/usr/bin/mktemp -d /tmp/nagi-temporal-messages.XXXXXX 2>/dev/null)"; then
+  echo "Temporal message contract could not establish its private temporary directory." >&2
+  exit 1
+fi
 contract_tmp="$(cd "${raw_contract_tmp}" && pwd -P 2>/dev/null || true)"
 if [[ -z "${contract_tmp}" || "${contract_tmp}" != /* ]] \
   || ! live_validate_path_components "${contract_tmp}" \
   || [[ ! -d "${contract_tmp}" || -L "${contract_tmp}" ]] \
   || [[ "$(/usr/bin/stat -f '%u %Lp' "${contract_tmp}" 2>/dev/null || true)" \
     != "$(/usr/bin/id -u) 700" ]]; then
-  /bin/rm -rf -- "${raw_contract_tmp}"
+  /bin/rm -rf -- "${raw_contract_tmp}" 2>/dev/null || true
   echo "Temporal message contract could not establish its private temporary directory." >&2
   exit 1
 fi
@@ -208,17 +215,27 @@ expected_evidence="${contract_tmp}/expected-evidence"
 probe_stdout="${contract_tmp}/probe.stdout"
 probe_stderr="${contract_tmp}/probe.stderr"
 expected_tool_probe="${contract_tmp}/expected-tool-probe"
-: >"${build_stdout}"
-: >"${build_stderr}"
-: >"${sidecar_stdout}"
-: >"${sidecar_stderr}"
-: >"${probe_stdout}"
-: >"${probe_stderr}"
-/usr/bin/printf '%s\n' \
-  'rustc 1.98.0 (88d9e12ae 2026-08-18)' \
-  'cargo 1.98.0 (797e8a9bc 2026-08-05)' \
-  'libprotoc 36.1' \
-  >"${expected_tool_probe}"
+private_truncate_file() {
+  if (($# != 1)); then
+    return 1
+  fi
+  : 2>/dev/null >"$1"
+}
+
+if ! private_truncate_file "${build_stdout}" \
+  || ! private_truncate_file "${build_stderr}" \
+  || ! private_truncate_file "${sidecar_stdout}" \
+  || ! private_truncate_file "${sidecar_stderr}" \
+  || ! private_truncate_file "${probe_stdout}" \
+  || ! private_truncate_file "${probe_stderr}" \
+  || ! /usr/bin/printf '%s\n' \
+    'rustc 1.98.0 (88d9e12ae 2026-08-18)' \
+    'cargo 1.98.0 (797e8a9bc 2026-08-05)' \
+    'libprotoc 36.1' \
+    2>/dev/null >"${expected_tool_probe}"; then
+  echo "Temporal message contract could not establish its private evidence files." >&2
+  exit 1
+fi
 MAX_OUTPUT_BYTES=65536
 
 cleanup_status=0
@@ -231,13 +248,13 @@ cleanup() {
     # a link. Remove only this exact generated directory.
     if ! live_validate_path_components "${contract_target}" \
       || [[ -L "${contract_target}" ]] \
-      || ! /bin/rm -rf -- "${contract_target}" \
+      || ! /bin/rm -rf -- "${contract_target}" 2>/dev/null \
       || [[ -e "${contract_target}" || -L "${contract_target}" ]]; then
       cleanup_status=1
     fi
   fi
   if ((cleanup_status == 0)) && [[ -n "${contract_tmp:-}" ]]; then
-    if ! /bin/rm -rf -- "${contract_tmp}" \
+    if ! /bin/rm -rf -- "${contract_tmp}" 2>/dev/null \
       || [[ -e "${contract_tmp}" || -L "${contract_tmp}" ]]; then
       cleanup_status=1
     else
@@ -269,10 +286,15 @@ validate_registry_tree() {
   registry_real_path="$(cd "${registry_path}" 2>/dev/null && pwd -P 2>/dev/null)" \
     || return 1
   [[ "${registry_real_path}" == "${registry_path}" ]] || return 1
+  if [[ "$(/usr/bin/stat -f '%u' "${registry_path}" 2>/dev/null || true)" != "${current_uid}" ]]; then
+    return 1
+  fi
 
   if ! invalid_registry_entries="$(/usr/bin/find -P "${registry_path}" \
-    \( -type l -o \( ! -type d ! -type f \) -o \( -type f ! -links 1 \) \) \
-    -print 2>/dev/null)"; then
+    \( -type l -o \( ! -type d ! -type f \) \
+      -o \( -type f ! -links 1 \) -o ! -uid "${current_uid}" \
+      -o \( -perm -020 -o -perm -002 \) \) \
+    -print -quit 2>/dev/null)"; then
     return 1
   fi
   [[ -z "${invalid_registry_entries}" ]]
@@ -291,8 +313,8 @@ cargo_home="${contract_tmp}/cargo-home"
 cargo_registry="${cargo_home}/registry"
 private_registry_cache="${cargo_registry}/cache"
 private_registry_index="${cargo_registry}/index"
-if ! /bin/mkdir -m 700 "${build_home}" "${cargo_home}" \
-  || ! /bin/mkdir -m 700 "${cargo_registry}"; then
+if ! /bin/mkdir -m 700 "${build_home}" "${cargo_home}" >/dev/null 2>&1 \
+  || ! /bin/mkdir -m 700 "${cargo_registry}" >/dev/null 2>&1; then
   echo "Temporal message contract could not establish its private Cargo homes." >&2
   exit 1
 fi
@@ -310,8 +332,8 @@ if [[ -e "${private_registry_cache}" || -L "${private_registry_cache}" \
   echo "Temporal message contract found an unexpected private registry entry." >&2
   exit 1
 fi
-if ! /bin/cp -cR "${developer_registry_cache}" "${private_registry_cache}" \
-  || ! /bin/cp -cR "${developer_registry_index}" "${private_registry_index}" \
+if ! /bin/cp -cR "${developer_registry_cache}" "${private_registry_cache}" >/dev/null 2>&1 \
+  || ! /bin/cp -cR "${developer_registry_index}" "${private_registry_index}" >/dev/null 2>&1 \
   || ! validate_registry_tree "${private_registry_cache}" \
   || ! validate_registry_tree "${private_registry_index}"; then
   echo "Temporal message contract could not establish its private Cargo registry." >&2
@@ -330,8 +352,8 @@ clone_tool_tree() {
     || [[ -e "${destination}" || -L "${destination}" ]]; then
     return 1
   fi
-  /bin/cp -cR "${source}" "${destination}" \
-    && /bin/chmod 700 "${destination}" \
+  /bin/cp -cR "${source}" "${destination}" >/dev/null 2>&1 \
+    && /bin/chmod 700 "${destination}" >/dev/null 2>&1 \
     && validate_tool_tree "${destination}"
 }
 
@@ -377,8 +399,10 @@ message_tool_step() {
   if [[ "${file_limit_mode}" != "capped" && "${file_limit_mode}" != "unlimited" ]]; then
     return 125
   fi
-  : >"${stdout_file}"
-  : >"${stderr_file}"
+  if ! private_truncate_file "${stdout_file}" \
+    || ! private_truncate_file "${stderr_file}"; then
+    return 1
+  fi
   local supervise_command=live_supervise_child
   if [[ "${file_limit_mode}" == "unlimited" ]]; then
     supervise_command=live_supervise_child_without_file_limit
@@ -396,7 +420,11 @@ message_tool_step() {
 }
 
 message_build_step() {
-  message_tool_step unlimited "${build_stdout}" "${build_stderr}" 3600 cargo "$@"
+  # Cargo's normal progress and diagnostic streams are intentionally discarded
+  # inside the unlimited-file-limit child. The wrapper only needs the exit
+  # status; probe output remains captured and exact below.
+  message_tool_step unlimited "${build_stdout}" "${build_stderr}" 3600 \
+    /bin/sh -c 'exec "$@" >/dev/null 2>&1' nagi-cargo-build cargo "$@"
 }
 
 message_probe_step() {
@@ -510,7 +538,10 @@ fi
 
 /usr/bin/printf '%s\n' \
   "{\"schemaVersion\":1,\"layer\":\"macos\",\"gate\":\"temporal\",\"result\":\"pass\",\"revision\":\"${revision}\",\"fixture\":\"synthetic.temporal-message.v1\",\"versions\":{\"rust\":\"1.98.0\",\"temporalCli\":\"1.8.2\",\"temporalRustSdk\":\"0.7.0\",\"codex\":\"0.151.0\"},\"checks\":[{\"name\":\"fixture-provenance\",\"result\":\"pass\"},{\"name\":\"version-pins\",\"result\":\"pass\"},{\"name\":\"boundary\",\"result\":\"pass\"},{\"name\":\"redaction\",\"result\":\"pass\"},{\"name\":\"preflight\",\"result\":\"pass\"}]}" \
-  >"${expected_evidence}"
+  2>/dev/null >"${expected_evidence}" || {
+    echo "Temporal message contract could not establish its expected evidence." >&2
+    exit 1
+  }
 
 # temporal.sh owns sidecar provenance, loopback setup, test execution, and its
 # own cleanup. This wrapper supervises that complete child separately so the
@@ -536,18 +567,21 @@ if [[ "${sidecar_status}" -ne 0 || "${sidecar_stderr_size}" != "0" \
   echo "Temporal message contract sidecar witness did not complete cleanly." >&2
   exit 1
 fi
-if ! /usr/bin/cmp -s "${sidecar_stdout}" "${expected_evidence}"; then
+if ! /usr/bin/cmp -s "${sidecar_stdout}" "${expected_evidence}" 2>/dev/null; then
   echo "Temporal message contract returned unrecognized evidence." >&2
   exit 1
 fi
 if /usr/bin/grep -Eiq \
   '(authorization:|bearer[[:space:]]+|access[_-]?token|client[_-]?secret|password[=:])' \
-  "${sidecar_stdout}" "${sidecar_stderr}"; then
+  "${sidecar_stdout}" "${sidecar_stderr}" 2>/dev/null; then
   echo "Temporal message contract evidence failed redaction checks." >&2
   exit 1
 fi
 
-evidence_line="$(/bin/cat "${sidecar_stdout}")"
+if ! evidence_line="$(/bin/cat "${sidecar_stdout}" 2>/dev/null)"; then
+  echo "Temporal message contract could not read its private evidence." >&2
+  exit 1
+fi
 post_revision=""
 if ! post_revision="$(live_read_checked_revision "${git_path}" "${repo_root}")" \
   || ! live_validate_revision "${revision}" "${post_revision}" \
