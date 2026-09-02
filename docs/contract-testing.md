@@ -34,12 +34,15 @@ later durable SQLite/Temporal production poller.
 
 The Temporal sidecar boundary is an explicit macOS-only local contract, enabled
 only by `NAGI_CONTRACT_TEMPORAL=1` through `mise run contract:temporal`. It
-resolves the
-locked `aqua:temporalio/cli@1.8.2` binary, establishes its owner-only temporary
-directory and cleanup trap, and uses the mise-selected pathname only as a copy
-source. The copy is fixed inside that directory, made non-writable (`0500`),
-checked as a single-link regular file owned by the current user, and verified
-against the architecture-specific native description and reviewed SHA-256.
+uses the public mise task's exact `[tools]` entry from `mise.toml` and
+`mise.lock` to place `aqua:temporalio/cli@1.8.2` on `PATH`. The script resolves
+that `temporal` candidate with Bash's non-executing `type -P` builtin, then
+establishes its owner-only temporary directory and cleanup trap. The candidate
+is used only as a copy source; a shadowed or substituted candidate can only
+fail the provenance checks and is never executed. The copy is fixed inside
+that directory, made non-writable (`0500`), checked as a single-link regular
+file owned by the current user, and verified against the architecture-specific
+native description and reviewed SHA-256.
 The exact CLI version is then checked and every Temporal invocation and final
 digest read uses only that private copy. A same-UID replacement race against
 the private copy remains a runtime-integrity limitation for the later signed
@@ -50,9 +53,9 @@ crash-recovery details are owned by the later dual-database contract. The
 reviewed `contracts/temporal-cli-provenance.json` records the official
 architecture-specific release archive and executable digests. The runner
 cross-checks each archive URL and checksum against the matching `mise.lock`
-entry before accepting the executable, so a PATH-selected `mise` cannot replace
-the locked artifact with another stable binary.
-contract uses a unique owner-only temporary directory, randomized nonzero
+entry before accepting the executable, so a shadowed PATH candidate cannot
+replace the reviewed artifact with another stable binary. The contract uses a
+unique owner-only temporary directory, randomized nonzero
 loopback ports, and an
 environment with config-file and config-environment loading disabled. It asks
 the service to handle a bounded visibility request, starts one fixed synthetic

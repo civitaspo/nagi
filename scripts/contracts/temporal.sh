@@ -24,23 +24,18 @@ if ! live_validate_path_components "${script_directory}"; then
   exit 1
 fi
 
-if ! mise_path="$(type -P mise 2>/dev/null)" || ! live_trusted_executable "${mise_path}"; then
-  echo "Temporal contract layer requires a trusted mise executable." >&2
+# The public mise task activates the locked Temporal CLI on PATH. `type -P` is
+# a shell builtin lookup only; this candidate is never executed directly.
+if ! temporal_binary_source="$(type -P temporal 2>/dev/null)"; then
+  echo "Temporal contract layer could not resolve a Temporal CLI candidate." >&2
   exit 1
 fi
 
-# Selecting the explicit Aqua tool name makes the lockfile, rather than the
-# caller's PATH or an alias named temporal, the source of the sidecar binary.
-if ! temporal_binary_source="$("${mise_path}" which temporal \
-  --tool aqua:temporalio/cli@1.8.2 --locked --quiet 2>/dev/null)"; then
-  echo "Temporal contract layer could not resolve the locked Temporal CLI." >&2
-  exit 1
-fi
 if [[ "${temporal_binary_source}" != /* || "${temporal_binary_source}" == *$'\n'* \
   || "${temporal_binary_source}" == *$'\r'* || "${temporal_binary_source}" == *$'\t'* \
   || "${temporal_binary_source##*/}" != "temporal" ]] \
   || ! live_trusted_executable "${temporal_binary_source}"; then
-  echo "Temporal contract layer rejected the resolved Temporal CLI." >&2
+  echo "Temporal contract layer rejected the Temporal CLI candidate." >&2
   exit 1
 fi
 case "${temporal_binary_source}" in
@@ -237,9 +232,9 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 143' HUP INT TERM
 
-# The mise-selected pathname is used only as a copy source. All Temporal
-# execution and digest reads below use this fixed private copy, so a source
-# pathname replacement after this point cannot change the executable.
+# The PATH-resolved candidate is used only as a copy source. All Temporal
+# execution and digest reads below use this fixed private copy, so a shadowed
+# candidate can only fail the reviewed provenance checks and is never run.
 temporal_binary="${contract_tmp}/temporal"
 if ! /bin/cp -p "${temporal_binary_source}" "${temporal_binary}" 2>/dev/null \
   || ! /bin/chmod 500 "${temporal_binary}" 2>/dev/null; then
@@ -255,14 +250,12 @@ if [[ ! "${current_uid}" =~ ^[0-9]+$ ]] \
   echo "Temporal contract layer rejected its private Temporal CLI copy." >&2
   exit 1
 fi
-expected_file_prefix="Mach-O"
 file_description="$(/usr/bin/file -b "${temporal_binary}" 2>/dev/null || true)"
 binary_sha256_before="$(binary_sha256 "${temporal_binary}")" || {
   echo "Temporal contract layer could not bind the private Temporal CLI digest." >&2
   exit 1
 }
 if [[ "${file_description}" != "${expected_file_description}" ]] \
-  || [[ "${file_description}" != "${expected_file_prefix}"* ]] \
   || [[ "${binary_sha256_before}" != "${expected_binary_sha256}" ]]; then
   echo "Temporal contract layer rejected the private Temporal CLI provenance." >&2
   exit 1

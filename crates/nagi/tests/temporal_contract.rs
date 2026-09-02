@@ -27,7 +27,6 @@ fn temporal_contract_is_explicitly_opt_in() {
 #[test]
 fn temporal_contract_has_stable_boundary_invariants() {
     for required in [
-        "aqua:temporalio/cli@1.8.2",
         "provenance_manifest",
         "expected_binary_sha256",
         "--disable-config-env",
@@ -57,6 +56,7 @@ fn temporal_contract_has_stable_boundary_invariants() {
         );
     }
 
+    assert!(MISE.contains("\"aqua:temporalio/cli\" = \"1.8.2\""));
     assert!(TEMPORAL_SCRIPT.contains("Mach-O"));
     assert!(TEMPORAL_SCRIPT.contains("assert_loopback_listeners"));
     assert!(TEMPORAL_SCRIPT.contains("assert_sqlite_store_paths"));
@@ -65,10 +65,14 @@ fn temporal_contract_has_stable_boundary_invariants() {
     assert!(TEMPORAL_SCRIPT.contains("/bin/chmod 500"));
     assert!(TEMPORAL_SCRIPT.contains("'%u %Lp %l'"));
     assert!(TEMPORAL_SCRIPT.contains("${current_uid} 500 1"));
+    assert!(TEMPORAL_SCRIPT.contains("type -P temporal"));
+    assert!(!TEMPORAL_SCRIPT.contains("mise_path"));
+    assert!(!TEMPORAL_SCRIPT.contains("mise which"));
     assert!(
         !TEMPORAL_SCRIPT
             .contains(r#""${temporal_binary_source}" --disable-config-env --disable-config-file"#)
     );
+    assert!(!TEMPORAL_SCRIPT.contains(r#"exec "${temporal_binary_source}""#));
 
     // The contract must not silently use the default public-facing ports or a
     // caller-selected endpoint. Ports are selected per run and every listener
@@ -149,7 +153,7 @@ fn temporal_cli_provenance_is_architecture_specific_and_public() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn temporal_contract_fails_closed_when_opted_in_without_mise() {
+fn temporal_contract_fails_closed_when_opted_in_without_temporal_candidate() {
     use std::process::Command;
 
     let output = Command::new("/bin/bash")
@@ -166,7 +170,7 @@ fn temporal_contract_fails_closed_when_opted_in_without_mise() {
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("trusted mise executable"));
+    assert!(stderr.contains("Temporal CLI candidate"));
     assert!(!stderr.contains("/nonexistent"));
 }
 
