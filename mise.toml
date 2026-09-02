@@ -60,6 +60,10 @@ run = "scripts/contracts/temporal.sh"
 description = "Run the explicitly enabled local Temporal message contract"
 run = "scripts/contracts/temporal-messages.sh"
 
+[tasks."contract:temporal-activities"]
+description = "Run the explicitly enabled local Temporal Activity recovery contract"
+run = "scripts/contracts/temporal-activities.sh"
+
 [tasks."contract:live"]
 description = "Preflight explicitly enabled live-provider contract tests"
 run = "scripts/contracts/live.sh"

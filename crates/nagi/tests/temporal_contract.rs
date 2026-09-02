@@ -13,13 +13,25 @@ const TEMPORAL_PROVENANCE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../contracts/temporal-cli-provenance.json"
 ));
-const TEMPORAL_MESSAGE_SCRIPT: &str = include_str!(concat!(
+const TEMPORAL_SDK_SCRIPT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../scripts/contracts/temporal-sdk-contract.sh"
+));
+const TEMPORAL_MESSAGE_ENTRYPOINT: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../scripts/contracts/temporal-messages.sh"
+));
+const TEMPORAL_ACTIVITY_ENTRYPOINT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../scripts/contracts/temporal-activities.sh"
 ));
 const TEMPORAL_MESSAGE_TEST: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/temporal_message_contract.rs"
+));
+const TEMPORAL_ACTIVITY_TEST: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/temporal_activity_contract.rs"
 ));
 const LIVE_HELPERS: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -49,16 +61,20 @@ fn temporal_message_contract_is_explicitly_opt_in_and_build_only() {
     assert!(MISE.contains("[tasks.\"contract:temporal-messages\"]"));
     assert!(MISE.contains("run = \"scripts/contracts/temporal-messages.sh\""));
     assert!(MISE.contains("\"aqua:protocolbuffers/protobuf/protoc\" = \"36.1\""));
-    assert!(TEMPORAL_MESSAGE_SCRIPT.contains(
+    assert!(TEMPORAL_MESSAGE_ENTRYPOINT.contains(
         "SKIP: Temporal message contract is opt-in; set NAGI_CONTRACT_TEMPORAL_MESSAGES=1"
     ));
-    assert!(TEMPORAL_MESSAGE_SCRIPT.contains("temporal-message-contract"));
+    assert!(TEMPORAL_SDK_SCRIPT.contains("temporal-message-contract"));
     assert!(
-        TEMPORAL_MESSAGE_SCRIPT
+        TEMPORAL_SDK_SCRIPT
             .contains(".local/share/mise/installs/aqua-protocolbuffers-protobuf-protoc/36.1")
     );
-    assert!(TEMPORAL_MESSAGE_SCRIPT.contains("target/nagi-temporal-message-contract"));
-    assert!(TEMPORAL_MESSAGE_SCRIPT.contains("synthetic.temporal-message.v1"));
+    assert!(TEMPORAL_SDK_SCRIPT.contains(
+        "contract_target=\"${repo_root}/target/nagi-temporal-${contract_target_suffix}-contract\""
+    ));
+    assert!(TEMPORAL_SDK_SCRIPT.contains("contract_target_suffix=\"message\""));
+    assert!(TEMPORAL_SDK_SCRIPT.contains("contract_tmp_prefix=\"messages\""));
+    assert!(TEMPORAL_SDK_SCRIPT.contains("synthetic.temporal-message.v1"));
     for required in [
         "fn parse_loopback_address(value: &str) -> Option<Url>",
         "Url::parse(value).ok()?",
@@ -74,6 +90,142 @@ fn temporal_message_contract_is_explicitly_opt_in_and_build_only() {
     }
     assert!(NAGI_MANIFEST.contains("temporalio-sdk = { version = \"=0.7.0\""));
     assert!(NAGI_MANIFEST.contains("temporal-message-contract"));
+}
+
+#[test]
+fn temporal_activity_contract_is_explicitly_opt_in_and_build_only() {
+    assert!(MISE.contains("[tasks.\"contract:temporal-activities\"]"));
+    assert!(MISE.contains("run = \"scripts/contracts/temporal-activities.sh\""));
+    assert!(TEMPORAL_ACTIVITY_ENTRYPOINT.contains(
+        "SKIP: Temporal Activity contract is opt-in; set NAGI_CONTRACT_TEMPORAL_ACTIVITIES=1"
+    ));
+    assert!(TEMPORAL_SDK_SCRIPT.contains("contract_target_suffix=\"activity\""));
+    assert!(TEMPORAL_SDK_SCRIPT.contains("contract_tmp_prefix=\"activities\""));
+    assert!(TEMPORAL_SDK_SCRIPT.contains("temporal_activity_contract"));
+    assert!(TEMPORAL_SDK_SCRIPT.contains("--activity-contract"));
+    assert!(TEMPORAL_SDK_SCRIPT.contains("NAGI_CONTRACT_TEMPORAL_ACTIVITY_BINARY_SHA256"));
+    assert!(TEMPORAL_SDK_SCRIPT.contains("synthetic.temporal-activity.v1"));
+    assert!(NAGI_MANIFEST.contains("temporal-activity-contract"));
+    for required in [
+        "ActivityContext::heartbeat_details",
+        "record_heartbeat",
+        "heartbeat_details",
+        "cancelled_with_details",
+        "ActivityExecutionError::Cancelled(cancelled)",
+        "WorkflowExecutionStartedEventAttributes",
+        "WorkflowExecutionContinuedAsNewEventAttributes",
+        "fetch_history",
+        "do_not_eagerly_execute(true)",
+        "max_cached_workflows(0)",
+        "maximum_attempts(4)",
+        "HEARTBEAT_QUIET_MARGIN",
+        "follow_runs(false)",
+        "NAGI_TEMPORAL_ACTIVITY_RUN_ID",
+    ] {
+        assert!(
+            TEMPORAL_ACTIVITY_TEST.contains(required),
+            "Temporal Activity contract is missing {required:?}"
+        );
+    }
+}
+
+#[test]
+fn temporal_activity_contract_separates_worker_and_sidecar_recovery_gates() {
+    for required in [
+        "live_start_child",
+        "live_signal_child_group KILL",
+        "if ! live_signal_child_group KILL; then",
+        "wait \"${worker_pid}\"",
+        "[[ \"${wait_status}\" == \"137\" ]]",
+        "kill -0 \"${worker_pid}\"",
+        "force_kill_server",
+        "start_server_with_retry no",
+        "activity_history_before_server",
+        "activity_history_after_server",
+        "activity_history_final",
+        "assert_activity_history_prefix",
+        "same database",
+        "ACTIVITY_SERVER_PID",
+        "ACTIVITY_WORKER_PID",
+    ] {
+        assert!(
+            TEMPORAL_SCRIPT.contains(required),
+            "Temporal Activity sidecar harness is missing {required:?}"
+        );
+    }
+    assert!(!TEMPORAL_ACTIVITY_TEST.contains("std::fs"));
+    assert!(!TEMPORAL_ACTIVITY_TEST.contains("Worker::shutdown"));
+    assert!(TEMPORAL_ACTIVITY_TEST.contains("WorkflowExecutionInfo"));
+    assert!(TEMPORAL_ACTIVITY_TEST.contains("first_execution_run_id"));
+    assert!(TEMPORAL_ACTIVITY_TEST.contains("original_execution_run_id"));
+    for required in [
+        "heartbeat_resume_attempt: u32",
+        "progress.checkpoint == progress.resumed_from_heartbeat",
+        "self.heartbeat_resume_attempt = progress.attempt",
+        "state.latest_attempt >= 2\n                    && state.heartbeat_resume_attempt == state.latest_attempt",
+        "state.latest_attempt >= 3\n                    && state.heartbeat_resume_attempt == state.latest_attempt",
+        "assert_eq!(result.heartbeat_resume_attempt, result.latest_attempt);",
+    ] {
+        assert!(
+            TEMPORAL_ACTIVITY_TEST.contains(required),
+            "Temporal Activity recovery gate is missing {required:?}"
+        );
+    }
+    assert!(TEMPORAL_SCRIPT.contains("history_event_records"));
+    assert!(TEMPORAL_SCRIPT.contains("plutil -extract events json"));
+}
+
+#[test]
+fn temporal_activity_history_binds_worker_identity() {
+    assert!(
+        TEMPORAL_SCRIPT.contains(r#"grep -Fq '"identity": "nagi-contract-activity-worker-v1"'"#)
+    );
+    assert!(
+        TEMPORAL_ACTIVITY_TEST.contains("client_identity_override(WORKER_IDENTITY.to_owned())")
+    );
+}
+
+#[test]
+fn temporal_activity_private_output_and_public_evidence_redaction_are_separate() {
+    let private_output_check = TEMPORAL_SCRIPT
+        .find("assert_activity_output_safe()")
+        .and_then(|start| {
+            TEMPORAL_SCRIPT[start..]
+                .find("start_activity_worker()")
+                .map(|end| &TEMPORAL_SCRIPT[start..start + end])
+        })
+        .expect("Temporal Activity contract must define its private output check");
+    assert!(private_output_check.contains(
+        "(authorization:|bearer[[:space:]]+|access[_-]?token|client[_-]?secret|password[=:])"
+    ));
+    for local_path in ["/Users/", "/private/", "/home/"] {
+        assert!(
+            !private_output_check.contains(local_path),
+            "Private Activity output check must allow local path {local_path:?}"
+        );
+    }
+
+    assert!(TEMPORAL_SDK_SCRIPT.contains(
+        "(authorization:|bearer[[:space:]]+|access[_-]?token|client[_-]?secret|password[=:]|/Users/|/private/|/home/)"
+    ));
+    assert!(
+        TEMPORAL_SDK_SCRIPT.contains("if /usr/bin/grep -Eiq \"${contract_redaction_pattern}\"")
+    );
+    let message_mode = TEMPORAL_SDK_SCRIPT
+        .find("message)")
+        .and_then(|start| {
+            TEMPORAL_SDK_SCRIPT[start..]
+                .find("activity)")
+                .map(|end| &TEMPORAL_SDK_SCRIPT[start..start + end])
+        })
+        .expect("Temporal SDK contract must define separate message and activity modes");
+    assert!(!message_mode.contains("/Users/"));
+    assert!(!message_mode.contains("/private/"));
+    assert!(!message_mode.contains("/home/"));
+    assert!(
+        TEMPORAL_SDK_SCRIPT
+            .contains("if ! /usr/bin/cmp -s \"${sidecar_stdout}\" \"${expected_evidence}\"")
+    );
 }
 
 #[test]
@@ -218,12 +370,19 @@ fn temporal_contract_has_stable_boundary_invariants() {
 
 #[test]
 fn temporal_message_wrapper_passes_the_internal_mode_and_binary_digest() {
-    assert!(TEMPORAL_MESSAGE_SCRIPT.contains("live_binary_sha256"));
-    assert!(TEMPORAL_MESSAGE_SCRIPT.contains("NAGI_CONTRACT_TEMPORAL_MESSAGE_BINARY_SHA256"));
+    assert!(TEMPORAL_MESSAGE_ENTRYPOINT.contains("exec /bin/bash \"${shared_script}\" message"));
+    assert!(TEMPORAL_ACTIVITY_ENTRYPOINT.contains("exec /bin/bash \"${shared_script}\" activity"));
     assert!(
-        TEMPORAL_MESSAGE_SCRIPT.contains("/bin/bash \"${temporal_script}\" --message-contract")
+        TEMPORAL_MESSAGE_ENTRYPOINT
+            .contains("! -f \"${shared_script}\" || -L \"${shared_script}\"")
     );
-    assert!(!TEMPORAL_MESSAGE_SCRIPT.contains("NAGI_CONTRACT_TEMPORAL_MESSAGES_REVISION"));
+    assert!(TEMPORAL_SDK_SCRIPT.contains("live_binary_sha256"));
+    assert!(TEMPORAL_SDK_SCRIPT.contains("NAGI_CONTRACT_TEMPORAL_MESSAGE_BINARY_SHA256"));
+    assert!(
+        TEMPORAL_SDK_SCRIPT
+            .contains("/bin/bash \"${temporal_script}\" \"${contract_temporal_mode}\"")
+    );
+    assert!(!TEMPORAL_SDK_SCRIPT.contains("NAGI_CONTRACT_TEMPORAL_MESSAGES_REVISION"));
 
     let digest = TEMPORAL_SCRIPT
         .find("local expected_message_binary_sha256")
@@ -282,10 +441,10 @@ fn temporal_message_wrapper_binds_the_private_locked_toolchain() {
         "/bin/chmod 700",
         "private_truncate_file",
         ": 2>/dev/null >\"$1\"",
-        "/usr/bin/mktemp -d /tmp/nagi-temporal-messages.XXXXXX 2>/dev/null",
+        "/usr/bin/mktemp -d \"/tmp/nagi-temporal-${contract_tmp_prefix}.XXXXXX\" 2>/dev/null",
         ">/dev/null 2>&1",
         "PATH=\"${private_rust_toolchain}/bin:${private_protoc}/bin:/usr/bin:/bin\"",
-        "message_tool_step",
+        "contract_tool_step",
         "HOME=\"${build_home}\"",
         "CARGO_HOME=\"${cargo_home}\"",
         "rustc --version; cargo --version; protoc --version",
@@ -307,14 +466,14 @@ fn temporal_message_wrapper_binds_the_private_locked_toolchain() {
         "/usr/bin/cmp -s \"${probe_stdout}\" \"${expected_tool_probe}\"",
     ] {
         assert!(
-            TEMPORAL_MESSAGE_SCRIPT.contains(required),
+            TEMPORAL_SDK_SCRIPT.contains(required),
             "Temporal message wrapper is missing {required:?}"
         );
     }
-    assert!(!TEMPORAL_MESSAGE_SCRIPT.contains("validate_tool_tree"));
-    assert!(!TEMPORAL_MESSAGE_SCRIPT.contains("validate_registry_tree"));
-    assert!(!TEMPORAL_MESSAGE_SCRIPT.contains("-perm -111"));
-    assert!(!TEMPORAL_MESSAGE_SCRIPT.contains("$(/usr/bin/id -u) 755 1"));
+    assert!(!TEMPORAL_SDK_SCRIPT.contains("validate_tool_tree"));
+    assert!(!TEMPORAL_SDK_SCRIPT.contains("validate_registry_tree"));
+    assert!(!TEMPORAL_SDK_SCRIPT.contains("-perm -111"));
+    assert!(!TEMPORAL_SDK_SCRIPT.contains("$(/usr/bin/id -u) 755 1"));
     for obsolete in [
         "mise_path",
         "validate_mise_executable",
@@ -329,21 +488,113 @@ fn temporal_message_wrapper_binds_the_private_locked_toolchain() {
         "mise exec",
     ] {
         assert!(
-            !TEMPORAL_MESSAGE_SCRIPT.contains(obsolete),
+            !TEMPORAL_SDK_SCRIPT.contains(obsolete),
             "Temporal message wrapper still contains obsolete mise state {obsolete:?}"
         );
     }
-    assert!(TEMPORAL_MESSAGE_SCRIPT.contains(
+    assert!(TEMPORAL_SDK_SCRIPT.contains(
         r#"if live_supervise_child_without_file_limit \
   "${sidecar_stdout}""#
     ));
 }
 
 #[test]
+fn temporal_thin_entrypoints_guard_opt_in_before_external_commands() {
+    for (entrypoint, skip) in [
+        (
+            TEMPORAL_MESSAGE_ENTRYPOINT,
+            "SKIP: Temporal message contract is opt-in; set NAGI_CONTRACT_TEMPORAL_MESSAGES=1",
+        ),
+        (
+            TEMPORAL_ACTIVITY_ENTRYPOINT,
+            "SKIP: Temporal Activity contract is opt-in; set NAGI_CONTRACT_TEMPORAL_ACTIVITIES=1",
+        ),
+    ] {
+        let skip_offset = entrypoint
+            .find(skip)
+            .expect("thin entrypoint must retain its exact skip string");
+        let first_external_command = entrypoint
+            .find("$(/usr/bin/")
+            .expect("thin entrypoint must resolve its sibling after the opt-in guard");
+        assert!(skip_offset < first_external_command);
+        assert!(entrypoint.contains("script_directory=\"$(cd \"$(/usr/bin/dirname"));
+        assert!(
+            entrypoint.contains("shared_script=\"${script_directory}/temporal-sdk-contract.sh\"")
+        );
+        assert!(entrypoint.contains("! -f \"${shared_script}\" || -L \"${shared_script}\""));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::{fs, os::unix::fs::symlink, process::Command};
+
+        let root =
+            std::env::temp_dir().join(format!("nagi-temporal-entrypoint-{}", std::process::id()));
+        fs::create_dir(&root).expect("temporary test directory should be absent");
+        let entrypoint = root.join("temporal-messages.sh");
+        let shared = root.join("temporal-sdk-contract.sh");
+        fs::write(&entrypoint, TEMPORAL_MESSAGE_ENTRYPOINT)
+            .expect("entrypoint fixture should be written");
+        for (fixture, linked) in [("missing", false), ("symlink", true)] {
+            if linked {
+                symlink(&entrypoint, &shared).expect("symlink fixture should be created");
+            }
+            let output = Command::new("/bin/bash")
+                .arg(&entrypoint)
+                .env_clear()
+                .env("NAGI_CONTRACT_TEMPORAL_MESSAGES", "1")
+                .output()
+                .expect("thin entrypoint should start");
+            assert_eq!(output.status.code(), Some(1), "{fixture}");
+            assert!(String::from_utf8_lossy(&output.stderr).contains("shared wrapper"));
+            if linked {
+                fs::remove_file(&shared).expect("symlink fixture should be removed");
+            }
+        }
+        fs::remove_dir_all(&root).expect("temporary test directory should be removed");
+    }
+
+    let mode_guard = TEMPORAL_SDK_SCRIPT
+        .find("if (($# != 1));")
+        .expect("shared dispatcher must reject missing and extra modes first");
+    let first_external_command = TEMPORAL_SDK_SCRIPT
+        .find("$(/usr/bin/")
+        .expect("shared dispatcher must defer external commands until after opt-in");
+    assert!(mode_guard < first_external_command);
+}
+
+#[test]
+fn temporal_activity_term_grace_is_mode_specific_and_bounded() {
+    let activity_mode = TEMPORAL_SDK_SCRIPT
+        .find("activity)")
+        .map(|start| &TEMPORAL_SDK_SCRIPT[start..])
+        .expect("shared dispatcher must define activity mode");
+    assert!(activity_mode.contains("contract_extended_term_grace=1"));
+    assert!(TEMPORAL_SDK_SCRIPT.contains("ACTIVITY_SIDECAR_TERM_GRACE_POLLS=200"));
+    assert!(
+        TEMPORAL_SDK_SCRIPT
+            .contains("LIVE_TERM_GRACE_POLLS=\"${ACTIVITY_SIDECAR_TERM_GRACE_POLLS}\"")
+    );
+    assert!(
+        TEMPORAL_SDK_SCRIPT.contains("LIVE_TERM_GRACE_POLLS=\"${saved_sidecar_term_grace_polls}\"")
+    );
+    let message_mode = TEMPORAL_SDK_SCRIPT
+        .find("message)")
+        .and_then(|start| {
+            TEMPORAL_SDK_SCRIPT[start..]
+                .find("activity)")
+                .map(|end| &TEMPORAL_SDK_SCRIPT[start..start + end])
+        })
+        .expect("shared dispatcher must define message mode before activity mode");
+    assert!(message_mode.contains("contract_extended_term_grace=0"));
+    assert!(!message_mode.contains("ACTIVITY_SIDECAR_TERM_GRACE_POLLS=200"));
+}
+
+#[test]
 fn temporal_contract_suppresses_setup_and_file_size_diagnostics() {
     for (script, label) in [
         (TEMPORAL_SCRIPT, "Temporal contract"),
-        (TEMPORAL_MESSAGE_SCRIPT, "Temporal message contract"),
+        (TEMPORAL_SDK_SCRIPT, "Temporal SDK contract"),
     ] {
         for required in [
             "$(/usr/bin/dirname \"${BASH_SOURCE[0]}\" 2>/dev/null)",
@@ -515,6 +766,29 @@ fn temporal_message_contract_skips_without_running_external_tools() {
 
 #[cfg(unix)]
 #[test]
+fn temporal_activity_contract_skips_without_running_external_tools() {
+    use std::process::Command;
+
+    let output = Command::new("/bin/bash")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/contracts/temporal-activities.sh"
+        ))
+        .env_clear()
+        .env("PATH", "/nonexistent")
+        .output()
+        .expect("Temporal Activity contract preflight should start");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "SKIP: Temporal Activity contract is opt-in; set NAGI_CONTRACT_TEMPORAL_ACTIVITIES=1 to request it.\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
 fn temporal_contract_rejects_unrecognized_positional_arguments() {
     use std::process::Command;
 
@@ -532,4 +806,70 @@ fn temporal_contract_rejects_unrecognized_positional_arguments() {
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("--message-contract"));
+}
+
+#[cfg(unix)]
+#[test]
+fn temporal_sdk_dispatcher_rejects_missing_extra_and_malicious_modes() {
+    use std::process::Command;
+
+    let cases: &[&[&str]] = &[
+        &[],
+        &["message", "activity"],
+        &["--message-contract"],
+        &["message;uname"],
+    ];
+    for args in cases {
+        let mut command = Command::new("/bin/bash");
+        command.arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/contracts/temporal-sdk-contract.sh"
+        ));
+        command.args(*args).env_clear();
+        let output = command
+            .output()
+            .expect("Temporal SDK dispatcher preflight should start");
+
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert!(!output.stderr.is_empty());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("uname"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn temporal_sdk_dispatcher_ignores_cross_mode_opt_in() {
+    use std::process::Command;
+
+    for (mode, wrong_environment, expected_skip) in [
+        (
+            "message",
+            ("NAGI_CONTRACT_TEMPORAL_ACTIVITIES", "1"),
+            "SKIP: Temporal message contract is opt-in; set NAGI_CONTRACT_TEMPORAL_MESSAGES=1 to request it.\n",
+        ),
+        (
+            "activity",
+            ("NAGI_CONTRACT_TEMPORAL_MESSAGES", "1"),
+            "SKIP: Temporal Activity contract is opt-in; set NAGI_CONTRACT_TEMPORAL_ACTIVITIES=1 to request it.\n",
+        ),
+    ] {
+        let mut command = Command::new("/bin/bash");
+        command
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../scripts/contracts/temporal-sdk-contract.sh"
+            ))
+            .arg(mode)
+            .env_clear()
+            .env(wrong_environment.0, wrong_environment.1)
+            .env("PATH", "/nonexistent");
+        let output = command
+            .output()
+            .expect("Temporal SDK dispatcher preflight should start");
+
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), expected_skip);
+        assert!(output.stderr.is_empty());
+    }
 }

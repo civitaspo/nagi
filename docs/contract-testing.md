@@ -72,10 +72,14 @@ SDK, run a production Worker, or contact a provider.
 
 Temporal message handling is a separate opt-in macOS contract, enabled with
 `NAGI_CONTRACT_TEMPORAL_MESSAGES=1 mise run contract:temporal-messages`. The
-wrapper requires a clean checked revision and builds the feature-gated
-`temporalio-sdk = "=0.7.0"` test with the locked `rust@1.98.0` and
-`aqua:protocolbuffers/protobuf/protoc@36.1` tools into the dedicated
-`target/nagi-temporal-message-contract` directory. The wrapper validates the
+thin public entrypoint delegates to the shared closed-mode
+`scripts/contracts/temporal-sdk-contract.sh` wrapper. Its literal `message`
+mode fixes the feature, test name, dedicated target, digest binding, inner
+sidecar flag, and evidence fixture; unknown or mixed modes fail before external
+commands run. The shared wrapper requires a clean checked revision and builds
+the feature-gated `temporalio-sdk = "=0.7.0"` test with the locked
+`rust@1.98.0` and `aqua:protocolbuffers/protobuf/protoc@36.1` tools into the
+dedicated `target/nagi-temporal-message-contract` directory. It validates the
 installed architecture-specific Rust `1.98.0` and protoc `36.1` trees as
 canonical current-user-owned trees containing only directories and single-link
 regular files with no group/other write bits, then APFS-clone-copies both
@@ -118,6 +122,38 @@ temporalio-client 0.7.0, the ordinary `StartWorkflowExecution` path maps
 the gRPC status. The SDK and protoc are build-only contract dependencies; the
 standalone `nagi` binary and production runtime do not include this harness.
 No app bundle, provisioning profile, or signing identity is required.
+
+Temporal Activity recovery is a separate opt-in macOS contract, enabled with
+`NAGI_CONTRACT_TEMPORAL_ACTIVITIES=1 mise run contract:temporal-activities`.
+Its thin public entrypoint selects only the shared wrapper's literal `activity`
+mode. That mode fixes the Activity feature, test name, dedicated target, digest
+binding, inner sidecar flag, evidence fixture, and extended outer cleanup grace
+while using the same pinned Rust `1.98.0`, protoc `36.1`, and exact
+`temporalio-sdk = "=0.7.0"` offline build pattern as the message mode. This
+includes owner-only private Cargo/tool trees, bounded probes, one validated
+test binary, and exact cleanup. The standalone production artifact remains a
+single raw executable; SDK dependencies are test-only and feature-gated.
+The synthetic long-running Activity records progress with
+`ActivityContext::record_heartbeat` and the replacement attempt must resume
+from `ActivityContext::heartbeat_details`, without reading a filesystem
+checkpoint. The harness starts a Worker as a separate process, waits for a
+quiet heartbeat margin, force-kills it with SIGKILL, verifies the
+signal-derived wait status and reap, and starts a fresh Worker. It then repeats
+the Worker gate around a force-killed/restarted Temporal sidecar using the same
+file-backed SQLite store and no namespace declaration on restart. The exact
+workflow ID, original run ID, and current run ID remain bound; SDK history
+fetches and private CLI history snapshots require monotonic event IDs, no
+Continue-As-New/replacement, and a full canonical pre-restart event prefix in
+the final history. Cancellation is proved in two independent ways: the
+Activity returns a fixed cancellation witness through
+`ActivityError::cancelled_with_details`, and the workflow observes
+`ActivityExecutionError::Cancelled`, decodes that witness, runs independent
+cleanup, and records its terminal result. Every child has bounded waits,
+private capped output, redaction checks, and orphan/listener checks. The task
+is credential-free, loopback-only, and emits only the fixed sanitized evidence
+record; same-UID replacement races against private inputs remain a documented
+runtime-integrity limitation. Replay behavior belongs to P0-10 and is not
+covered here.
 
 The live runner resolves the repository from its own script path, requires a
 clean checked revision, and builds the ordinary raw

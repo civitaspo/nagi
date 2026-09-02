@@ -2,17 +2,25 @@
 set -euo pipefail
 
 message_contract_enabled=0
+activity_contract_enabled=0
 case "$#" in
   0) ;;
   1)
-    if [[ "$1" != "--message-contract" ]]; then
-      echo "Temporal contract layer accepts only the internal --message-contract mode." >&2
-      exit 2
-    fi
-    message_contract_enabled=1
+    case "$1" in
+      --message-contract)
+        message_contract_enabled=1
+        ;;
+      --activity-contract)
+        activity_contract_enabled=1
+        ;;
+      *)
+        echo "Temporal contract layer accepts only the internal --message-contract or --activity-contract mode." >&2
+        exit 2
+        ;;
+    esac
     ;;
   *)
-    echo "Temporal contract layer accepts no positional arguments except --message-contract." >&2
+    echo "Temporal contract layer accepts no positional arguments except --message-contract or --activity-contract." >&2
     exit 2
     ;;
 esac
@@ -213,19 +221,107 @@ cluster_before="${contract_tmp}/cluster-before.json"
 cluster_after="${contract_tmp}/cluster-after.json"
 message_stdout="${contract_tmp}/message.stdout"
 message_stderr="${contract_tmp}/message.stderr"
+activity_stdout="${contract_tmp}/activity.stdout"
+activity_stderr="${contract_tmp}/activity.stderr"
+activity_worker_stdout="${contract_tmp}/activity-worker.stdout"
+activity_worker_stderr="${contract_tmp}/activity-worker.stderr"
+activity_history_before_server="${contract_tmp}/activity-history-before-server.json"
+activity_history_after_server="${contract_tmp}/activity-history-after-server.json"
+activity_history_final="${contract_tmp}/activity-history-final.json"
+activity_describe_before="${contract_tmp}/activity-describe-before.json"
+activity_describe_after_server="${contract_tmp}/activity-describe-after-server.json"
+activity_cluster_after="${contract_tmp}/activity-cluster-after.json"
 : >"${stdout_file}"
 : >"${stderr_file}"
 : >"${message_stdout}"
 : >"${message_stderr}"
+: >"${activity_stdout}"
+: >"${activity_stderr}"
+: >"${activity_worker_stdout}"
+: >"${activity_worker_stderr}"
 MAX_CHILD_OUTPUT_BYTES=65536
+
+# Activity mode owns two independent child groups in addition to this
+# sidecar: the Worker is killed and reaped between attempts while the server
+# remains alive, then the server is force-killed and restarted against the
+# same database. Keep each exact PID/PGID so cleanup cannot accidentally
+# signal an unrelated process.
+ACTIVITY_SERVER_PID=""
+ACTIVITY_SERVER_GROUP_ID=""
+ACTIVITY_WORKER_PID=""
+ACTIVITY_WORKER_GROUP_ID=""
 
 cleanup_status=0
 preserve_temp=0
 cleanup() {
+  local active_pid active_group
   if [[ -n "${LIVE_CHILD_PID:-}" ]]; then
+    active_pid="${LIVE_CHILD_PID}"
+    active_group="${LIVE_CHILD_GROUP_ID:-}"
     if ! live_reap_child; then
       cleanup_status=1
+    else
+      # The active handle may also be one of the detached Activity handles.
+      # Drop that saved alias after the exact child has been reaped so the
+      # detached pass does not mistake an already-reaped child for an orphan.
+      if [[ "${ACTIVITY_WORKER_PID}" == "${active_pid}" \
+        && "${ACTIVITY_WORKER_GROUP_ID}" == "${active_group}" ]]; then
+        ACTIVITY_WORKER_PID=""
+        ACTIVITY_WORKER_GROUP_ID=""
+      fi
+      if [[ "${ACTIVITY_SERVER_PID}" == "${active_pid}" \
+        && "${ACTIVITY_SERVER_GROUP_ID}" == "${active_group}" ]]; then
+        ACTIVITY_SERVER_PID=""
+        ACTIVITY_SERVER_GROUP_ID=""
+      fi
     fi
+  fi
+  if live_process_group_exists; then
+    cleanup_status=1
+  fi
+  if [[ "${activity_contract_enabled}" == "1" ]]; then
+    local saved_pid saved_group child_kind
+    for child_kind in worker server; do
+      if [[ "${child_kind}" == "worker" ]]; then
+        saved_pid="${ACTIVITY_WORKER_PID}"
+        saved_group="${ACTIVITY_WORKER_GROUP_ID}"
+      else
+        saved_pid="${ACTIVITY_SERVER_PID}"
+        saved_group="${ACTIVITY_SERVER_GROUP_ID}"
+      fi
+      if [[ -n "${saved_pid}" ]]; then
+        LIVE_CHILD_PID="${saved_pid}"
+        LIVE_CHILD_GROUP_ID="${saved_group}"
+        if [[ "${saved_pid}" =~ ^[0-9]+$ && "${saved_group}" =~ ^[0-9]+$ ]] \
+          && kill -0 "${saved_pid}" 2>/dev/null \
+          && kill -0 -- "-${saved_group}" 2>/dev/null; then
+          if ! live_reap_child; then
+            cleanup_status=1
+          fi
+        else
+          # The exact child may already have exited. Do not signal a PID that
+          # no longer has its validated process-group ownership. A 127 wait
+          # means this shell no longer owns that PID, so cleanup cannot prove
+          # that the saved handle was reaped safely.
+          if wait "${saved_pid}" 2>/dev/null; then
+            wait_status=0
+          else
+            wait_status=$?
+          fi
+          [[ "${wait_status}" =~ ^[0-9]+$ ]] || cleanup_status=1
+          [[ "${wait_status}" == "127" ]] && cleanup_status=1
+        fi
+        if [[ "${child_kind}" == "worker" ]]; then
+          ACTIVITY_WORKER_PID=""
+          ACTIVITY_WORKER_GROUP_ID=""
+        else
+          ACTIVITY_SERVER_PID=""
+          ACTIVITY_SERVER_GROUP_ID=""
+        fi
+      fi
+    done
+    LIVE_CHILD_PID=""
+    LIVE_CHILD_GROUP_ID=""
   fi
   if live_process_group_exists; then
     cleanup_status=1
@@ -299,12 +395,21 @@ workflow_type="NagiContractPersistenceV1"
 task_queue="nagi-contract-persistence-v1"
 if [[ "${message_contract_enabled}" == "1" ]]; then
   namespace="synthetic-message-v1"
+elif [[ "${activity_contract_enabled}" == "1" ]]; then
+  namespace="synthetic-activity-v1"
+  workflow_id="nagi-contract-activity-workflow-v1"
+  workflow_type="ActivityRecoveryWorkflow"
+  task_queue="nagi-contract-activity-v1"
 else
   namespace="synthetic-persistence-v1"
 fi
 
 temporal_command() {
-  /usr/bin/env -i \
+  # CLI snapshots are redirected into private files by callers. Apply the
+  # same 64 KiB file-size cap to the CLI process so a malformed response is
+  # bounded at write time, not only after it has filled the temporary store.
+  /bin/sh -c 'ulimit -f 128 || exit 125; exec "$@"' temporal-cli-command \
+    /usr/bin/env -i \
     PATH=/usr/bin:/bin \
     HOME="${home_directory}" \
     TMPDIR="${temp_directory}" \
@@ -390,6 +495,10 @@ start_server() {
     server_args+=(--namespace "${namespace}")
   fi
 
+  if [[ "${activity_contract_enabled}" == "1" ]] \
+    && ! assert_activity_output_safe; then
+    return 1
+  fi
   : >"${stdout_file}"
   : >"${stderr_file}"
   # Temporal writes SQLite files, so the shared helper's output file-size
@@ -445,6 +554,10 @@ start_server_with_retry() {
   while ((attempt <= 8)); do
     grpc_port="$(choose_ports)" || return 1
     if start_server "${include_namespace}" "${grpc_port}" "${database}"; then
+      if [[ "${activity_contract_enabled}" == "1" ]]; then
+        ACTIVITY_SERVER_PID="${LIVE_CHILD_PID}"
+        ACTIVITY_SERVER_GROUP_ID="${LIVE_CHILD_GROUP_ID}"
+      fi
       return 0
     fi
     if [[ -n "${LIVE_CHILD_PID:-}" ]]; then
@@ -454,6 +567,29 @@ start_server_with_retry() {
     attempt=$((attempt + 1))
   done
   return 1
+}
+
+restore_activity_server_handles() {
+  [[ "${activity_contract_enabled}" == "1" ]] || return 1
+  [[ -n "${ACTIVITY_SERVER_PID}" ]] || return 1
+  LIVE_CHILD_PID="${ACTIVITY_SERVER_PID}"
+  LIVE_CHILD_GROUP_ID="${ACTIVITY_SERVER_GROUP_ID}"
+  validate_activity_handles
+}
+
+restore_activity_worker_handles() {
+  [[ "${activity_contract_enabled}" == "1" ]] || return 1
+  [[ -n "${ACTIVITY_WORKER_PID}" ]] || return 1
+  LIVE_CHILD_PID="${ACTIVITY_WORKER_PID}"
+  LIVE_CHILD_GROUP_ID="${ACTIVITY_WORKER_GROUP_ID}"
+  validate_activity_handles
+}
+
+validate_activity_handles() {
+  [[ "${LIVE_CHILD_PID:-}" =~ ^[0-9]+$ ]] \
+    && [[ "${LIVE_CHILD_GROUP_ID:-}" =~ ^[0-9]+$ ]] \
+    && kill -0 "${LIVE_CHILD_PID}" 2>/dev/null \
+    && kill -0 -- "-${LIVE_CHILD_GROUP_ID}" 2>/dev/null
 }
 
 assert_message_output_safe() {
@@ -540,26 +676,477 @@ run_message_contract() {
   fi
 }
 
-force_kill_server() {
-  local server_pid="${LIVE_CHILD_PID:-}"
-  [[ -n "${server_pid}" ]] || return 1
-  live_signal_child_group KILL
+assert_activity_output_safe() {
+  local path size
+  for path in "${activity_stdout}" "${activity_stderr}" \
+    "${activity_worker_stdout}" "${activity_worker_stderr}" \
+    "${stdout_file}" "${stderr_file}"; do
+    size="$(live_file_size "${path}")"
+    [[ "${size}" =~ ^[0-9]+$ ]] && ((size <= MAX_CHILD_OUTPUT_BYTES)) || return 1
+  done
+  if /usr/bin/grep -Eiq \
+    '(authorization:|bearer[[:space:]]+|access[_-]?token|client[_-]?secret|password[=:])' \
+    "${activity_stdout}" "${activity_stderr}" \
+    "${activity_worker_stdout}" "${activity_worker_stderr}" \
+    "${stdout_file}" "${stderr_file}"; then
+    return 1
+  fi
+}
+
+start_activity_worker() {
+  [[ "${activity_contract_enabled}" == "1" ]] || return 1
+  [[ -z "${ACTIVITY_WORKER_PID}" ]] || return 1
+  restore_activity_server_handles || return 1
+  assert_activity_output_safe || return 1
+  : >"${activity_worker_stdout}"
+  : >"${activity_worker_stderr}"
+  if ! live_start_child "${activity_worker_stdout}" "${activity_worker_stderr}" \
+    /usr/bin/env -i \
+    PATH=/usr/bin:/bin \
+    HOME="${home_directory}" \
+    TMPDIR="${temp_directory}" \
+    LANG=C \
+    NAGI_TEMPORAL_ACTIVITY_ADDRESS="http://127.0.0.1:${grpc_port}" \
+    NAGI_TEMPORAL_ACTIVITY_NAMESPACE="${namespace}" \
+    NAGI_TEMPORAL_ACTIVITY_ROLE=worker \
+    NAGI_TEMPORAL_ACTIVITY_PHASE=worker \
+    "${activity_binary}" --exact temporal_activity_contract_exercises_recovery --nocapture; then
+    restore_activity_server_handles || true
+    return 1
+  fi
+  ACTIVITY_WORKER_PID="${LIVE_CHILD_PID}"
+  ACTIVITY_WORKER_GROUP_ID="${LIVE_CHILD_GROUP_ID}"
+  restore_activity_server_handles
+}
+
+run_activity_driver() {
+  local phase="$1"
+  local saved_server_pid="${ACTIVITY_SERVER_PID}"
+  local saved_server_group="${ACTIVITY_SERVER_GROUP_ID}"
+  local saved_worker_pid="${ACTIVITY_WORKER_PID}"
+  local saved_worker_group="${ACTIVITY_WORKER_GROUP_ID}"
+  local driver_status
+  assert_activity_output_safe || return 1
+  : >"${activity_stdout}"
+  : >"${activity_stderr}"
+  if live_supervise_child "${activity_stdout}" "${activity_stderr}" 65536 1200 \
+    /usr/bin/env -i \
+    PATH=/usr/bin:/bin \
+    HOME="${home_directory}" \
+    TMPDIR="${temp_directory}" \
+    LANG=C \
+    NAGI_TEMPORAL_ACTIVITY_ADDRESS="http://127.0.0.1:${grpc_port}" \
+    NAGI_TEMPORAL_ACTIVITY_NAMESPACE="${namespace}" \
+    NAGI_TEMPORAL_ACTIVITY_ROLE=driver \
+    NAGI_TEMPORAL_ACTIVITY_PHASE="${phase}" \
+    NAGI_TEMPORAL_ACTIVITY_RUN_ID="${activity_run_id:-}" \
+    "${activity_binary}" --exact temporal_activity_contract_exercises_recovery --nocapture; then
+    driver_status=0
+  else
+    driver_status=$?
+  fi
+  if [[ "${driver_status}" -ne 0 ]] \
+    && ([[ -n "${LIVE_CHILD_PID:-}" ]] || live_process_group_exists); then
+    preserve_temp=1
+    return 1
+  fi
+  ACTIVITY_SERVER_PID="${saved_server_pid}"
+  ACTIVITY_SERVER_GROUP_ID="${saved_server_group}"
+  ACTIVITY_WORKER_PID="${saved_worker_pid}"
+  ACTIVITY_WORKER_GROUP_ID="${saved_worker_group}"
+  LIVE_CHILD_PID=""
+  LIVE_CHILD_GROUP_ID=""
+  if [[ "${driver_status}" -ne 0 ]]; then
+    return 1
+  fi
+  assert_activity_output_safe
+}
+
+kill_activity_worker() {
+  [[ "${activity_contract_enabled}" == "1" ]] || return 1
+  restore_activity_worker_handles || return 1
+  validate_activity_handles || return 1
+  local worker_pid="${LIVE_CHILD_PID}"
+  local wait_status
+  if ! live_signal_child_group KILL; then
+    preserve_temp=1
+    return 1
+  fi
   if ! live_group_exited_within "${LIVE_KILL_GRACE_POLLS}"; then
     preserve_temp=1
     return 1
   fi
-  wait "${server_pid}" 2>/dev/null || true
-  assert_child_output_bound || return 1
-  if live_process_group_exists || ! assert_no_listeners "${server_pid}"; then
+  if wait "${worker_pid}" 2>/dev/null; then
+    wait_status=0
+  else
+    wait_status=$?
+  fi
+  [[ "${wait_status}" == "137" ]] || return 1
+  # A real process termination is the recovery gate. The explicit wait above
+  # is the reap proof; kill -0 and the PGID check reject a surviving child.
+  if kill -0 "${worker_pid}" 2>/dev/null || live_process_group_exists; then
     preserve_temp=1
     return 1
   fi
   LIVE_CHILD_PID=""
+  LIVE_CHILD_GROUP_ID=""
+  ACTIVITY_WORKER_PID=""
+  ACTIVITY_WORKER_GROUP_ID=""
+  preserve_temp=0
+  restore_activity_server_handles
+}
+
+history_event_records() {
+  # Convert only the event array to compact JSON records. Insignificant
+  # whitespace outside strings is removed while every event payload/content
+  # byte is retained, so the prefix comparison cannot be satisfied by IDs
+  # alone or by a changed event body.
+  /usr/bin/plutil -extract events json -o - "$1" 2>/dev/null \
+    | /usr/bin/awk '
+      BEGIN { depth = 0; started = 0; in_string = 0; escaped = 0; record = "" }
+      {
+        for (i = 1; i <= length($0); i++) {
+          ch = substr($0, i, 1)
+          if (!started) {
+            if (ch == "{") {
+              started = 1
+              depth = 1
+              record = "{"
+            }
+            continue
+          }
+          if (in_string) {
+            record = record ch
+            if (escaped) {
+              escaped = 0
+            } else if (ch == "\\") {
+              escaped = 1
+            } else if (ch == "\"") {
+              in_string = 0
+            }
+            continue
+          }
+          if (ch == "\"") {
+            record = record ch
+            in_string = 1
+          } else if (ch == "{") {
+            record = record ch
+            depth++
+          } else if (ch == "}") {
+            record = record ch
+            depth--
+            if (depth == 0) {
+              print record
+              record = ""
+              started = 0
+            }
+          } else if (ch !~ /[[:space:]]/) {
+            record = record ch
+          }
+        }
+      }'
+}
+
+assert_activity_history_file() {
+  local history_file="$1"
+  local expected_run_id="$2"
+  local records_file="$3"
+  local event_count index event_id event_type first_execution_run_id original_execution_run_id
+  [[ -f "${history_file}" && ! -L "${history_file}" ]] || return 1
+  local history_size
+  history_size="$(live_file_size "${history_file}")" || return 1
+  [[ "${history_size}" =~ ^[0-9]+$ ]] && ((history_size <= MAX_CHILD_OUTPUT_BYTES)) || return 1
+  [[ "${expected_run_id}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || return 1
+  if ! history_event_records "${history_file}" >"${records_file}"; then
+    return 1
+  fi
+  event_count="$(/usr/bin/wc -l <"${records_file}" | /usr/bin/tr -d '[:space:]')" || return 1
+  [[ "${event_count}" =~ ^[0-9]+$ ]] \
+    && ((event_count > 0 && event_count <= 512)) || return 1
+  for ((index = 0; index < event_count; index++)); do
+    event_id="$(/usr/bin/plutil -extract "events.${index}.eventId" raw -o - \
+      "${history_file}" 2>/dev/null)" || return 1
+    [[ "${event_id}" == "$((index + 1))" ]] || return 1
+    event_type="$(/usr/bin/plutil -extract "events.${index}.eventType" raw -o - \
+      "${history_file}" 2>/dev/null)" || return 1
+    case "${event_type}" in
+      *WORKFLOW_EXECUTION_CONTINUED_AS_NEW*|*WORKFLOW_EXECUTION_RESET*)
+        return 1
+        ;;
+    esac
+  done
+  first_execution_run_id="$(/usr/bin/plutil -extract \
+    events.0.workflowExecutionStartedEventAttributes.firstExecutionRunId raw -o - \
+    "${history_file}" 2>/dev/null)" || return 1
+  original_execution_run_id="$(/usr/bin/plutil -extract \
+    events.0.workflowExecutionStartedEventAttributes.originalExecutionRunId raw -o - \
+    "${history_file}" 2>/dev/null)" || return 1
+  [[ "${first_execution_run_id}" == "${expected_run_id}" \
+    && "${original_execution_run_id}" == "${expected_run_id}" ]] || return 1
+  if /usr/bin/grep -Eiq '"newExecutionRunId":"[^"]+"' "${records_file}"; then
+    return 1
+  fi
+}
+
+assert_activity_history_prefix() {
+  local before_file="$1"
+  local after_file="$2"
+  local expected_run_id="$3"
+  local prefix_file="${contract_tmp}/activity-history-prefix"
+  local after_events_file="${contract_tmp}/activity-history-after-events"
+  local before_count after_count
+  if ! assert_activity_history_file "${before_file}" "${expected_run_id}" "${prefix_file}" \
+    || ! assert_activity_history_file "${after_file}" "${expected_run_id}" "${after_events_file}"; then
+    return 1
+  fi
+  before_count="$(/usr/bin/wc -l <"${prefix_file}" | /usr/bin/tr -d '[:space:]')" || return 1
+  after_count="$(/usr/bin/wc -l <"${after_events_file}" \
+    | /usr/bin/tr -d '[:space:]')" || return 1
+  [[ "${before_count}" =~ ^[0-9]+$ && "${after_count}" =~ ^[0-9]+$ ]] || return 1
+  ((before_count > 0 && after_count >= before_count)) || return 1
+  /usr/bin/head -n "${before_count}" "${after_events_file}" \
+    >"${contract_tmp}/activity-history-after-prefix" || return 1
+  /usr/bin/cmp -s "${prefix_file}" "${contract_tmp}/activity-history-after-prefix"
+}
+
+assert_activity_workflow_description() {
+  local description_file="$1"
+  local run_id history_length
+  /usr/bin/plutil -extract workflowExecutionInfo.execution.workflowId raw \
+    -expect string -o - "${description_file}" 2>/dev/null \
+    | /usr/bin/grep -Fxq "${workflow_id}" || return 1
+  /usr/bin/plutil -extract workflowExecutionInfo.type.name raw \
+    -expect string -o - "${description_file}" 2>/dev/null \
+    | /usr/bin/grep -Fxq "${workflow_type}" || return 1
+  /usr/bin/plutil -extract workflowExecutionInfo.status raw \
+    -expect string -o - "${description_file}" 2>/dev/null \
+    | /usr/bin/grep -Fxq WORKFLOW_EXECUTION_STATUS_RUNNING || return 1
+  /usr/bin/plutil -extract workflowExecutionInfo.taskQueue raw \
+    -expect string -o - "${description_file}" 2>/dev/null \
+    | /usr/bin/grep -Fxq "${task_queue}" || return 1
+  history_length="$(/usr/bin/plutil -extract workflowExecutionInfo.historyLength raw \
+    -expect string -o - "${description_file}" 2>/dev/null)" || return 1
+  [[ "${history_length}" =~ ^[0-9]+$ ]] && ((history_length >= 2)) || return 1
+  run_id="$(/usr/bin/plutil -extract workflowExecutionInfo.execution.runId raw \
+    -expect string -o - "${description_file}" 2>/dev/null)" || return 1
+  [[ "${run_id}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
+    || return 1
+  ACTIVITY_WORKFLOW_RUN_ID="${run_id}"
+}
+
+run_activity_contract() {
+  local activity_target expected_activity_binary_sha256
+  local activity_binary_candidates activity_binary_sha256_before activity_binary_sha256_after
+  activity_target="${repo_root}/target/nagi-temporal-activity-contract"
+  expected_activity_binary_sha256="${NAGI_CONTRACT_TEMPORAL_ACTIVITY_BINARY_SHA256:-}"
+  if ! live_validate_path_components "${activity_target}" \
+    || [[ ! -d "${activity_target}" || -L "${activity_target}" ]]; then
+    echo "Temporal Activity contract could not access its dedicated Cargo target." >&2
+    return 1
+  fi
+  activity_binary_candidates="$(/usr/bin/find "${activity_target}/debug/deps" \
+    -type f -name 'temporal_activity_contract-*' -perm -100 -links 1 -print 2>/dev/null || true)"
+  if [[ -z "${activity_binary_candidates}" || "${activity_binary_candidates}" == *$'\n'* \
+    || "${activity_binary_candidates}" == *$'\r'* || "${activity_binary_candidates}" == *$'\t'* ]]; then
+    echo "Temporal Activity contract did not produce exactly one test binary." >&2
+    return 1
+  fi
+  activity_binary="${activity_binary_candidates}"
+  if ! live_validate_path_components "${activity_binary}" \
+    || [[ "${activity_binary}" != "${activity_target}/debug/deps/temporal_activity_contract-"* ]] \
+    || [[ ! -f "${activity_binary}" || -L "${activity_binary}" || ! -x "${activity_binary}" ]] \
+    || [[ "$(/usr/bin/stat -f '%u %Lp %l' "${activity_binary}" 2>/dev/null || true)" \
+      != "$(/usr/bin/id -u) 700 1" ]] \
+    || [[ "$(/usr/bin/file -b "${activity_binary}" 2>/dev/null || true)" != "${expected_file_description}" ]]; then
+    echo "Temporal Activity contract rejected the built test binary." >&2
+    return 1
+  fi
+  activity_binary_sha256_before="$(binary_sha256 "${activity_binary}")" || return 1
+  if [[ ! "${expected_activity_binary_sha256}" =~ ^[0-9a-f]{64}$ ]] \
+    || [[ "${activity_binary_sha256_before}" != "${expected_activity_binary_sha256}" ]]; then
+    echo "Temporal Activity contract could not bind the test binary digest." >&2
+    return 1
+  fi
+
+  if ! start_activity_worker; then
+    echo "Temporal Activity contract could not start its Worker process." >&2
+    return 1
+  fi
+  if ! run_activity_driver start; then
+    echo "Temporal Activity contract could not establish its first heartbeat." >&2
+    return 1
+  fi
+  activity_run_id="$(/usr/bin/grep -E '^activity-run-id=[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' \
+    "${activity_stdout}" 2>/dev/null || true)"
+  if [[ "${activity_run_id}" != activity-run-id=* \
+    || "${activity_run_id}" == *$'\n'* || "${activity_run_id}" == *$'\r'* ]]; then
+    echo "Temporal Activity contract did not receive one exact run binding." >&2
+    return 1
+  fi
+  activity_run_id="${activity_run_id#activity-run-id=}"
+  if ! temporal_command workflow describe \
+    --address "127.0.0.1:${grpc_port}" \
+    --namespace "${namespace}" \
+    --workflow-id "${workflow_id}" \
+    --run-id "${activity_run_id}" \
+    --output json >"${activity_describe_before}" 2>/dev/null \
+    || ! assert_activity_workflow_description "${activity_describe_before}"; then
+    echo "Temporal Activity contract could not bind the running execution." >&2
+    return 1
+  fi
+  activity_run_id_before="${ACTIVITY_WORKFLOW_RUN_ID}"
+  if [[ "${activity_run_id_before}" != "${activity_run_id}" ]]; then
+    echo "Temporal Activity contract received a different initial workflow run." >&2
+    return 1
+  fi
+
+  if ! kill_activity_worker; then
+    echo "Temporal Activity contract could not force-kill and reap its Worker." >&2
+    return 1
+  fi
+  if ! start_activity_worker || ! run_activity_driver after-worker; then
+    echo "Temporal Activity contract did not resume from its heartbeat after Worker restart." >&2
+    return 1
+  fi
+  if ! kill_activity_worker; then
+    echo "Temporal Activity contract could not repeat the Worker termination gate." >&2
+    return 1
+  fi
+  if ! temporal_command workflow show \
+    --address "127.0.0.1:${grpc_port}" \
+    --namespace "${namespace}" \
+    --workflow-id "${workflow_id}" \
+    --run-id "${activity_run_id_before}" \
+    --output json >"${activity_history_before_server}" 2>/dev/null; then
+    echo "Temporal Activity contract could not capture its pre-restart history." >&2
+    return 1
+  fi
+  if ! assert_activity_history_file "${activity_history_before_server}" \
+    "${activity_run_id_before}" "${contract_tmp}/activity-history-before-events" \
+    || ! /usr/bin/grep -Fq '"identity": "nagi-contract-activity-worker-v1"' \
+    "${activity_history_before_server}" \
+    || /usr/bin/grep -Eiq '(authorization:|bearer[[:space:]]+|access[_-]?token|client[_-]?secret|password[=:])' \
+    "${activity_history_before_server}"; then
+    echo "Temporal Activity contract found unsafe or unbound history evidence." >&2
+    return 1
+  fi
+
+  if ! restore_activity_server_handles || ! force_kill_server; then
+    echo "Temporal Activity contract could not force-kill and reap the sidecar." >&2
+    return 1
+  fi
+  if ! assert_sqlite_store_paths "${database}"; then
+    echo "Temporal Activity contract found an unsafe SQLite companion path." >&2
+    return 1
+  fi
+  if ! start_server_with_retry no "${database}"; then
+    echo "Temporal Activity contract could not restart the persistent sidecar." >&2
+    return 1
+  fi
+  if ! temporal_command operator cluster describe \
+    --address "127.0.0.1:${grpc_port}" \
+    --output json >"${activity_cluster_after}" 2>/dev/null \
+    || ! assert_sqlite_cluster "${activity_cluster_after}" \
+    || ! temporal_command operator namespace describe \
+    --address "127.0.0.1:${grpc_port}" \
+    --namespace "${namespace}" \
+    --output json >"${command_output}" 2>/dev/null; then
+    echo "Temporal Activity contract could not recover the persistent sidecar state." >&2
+    return 1
+  fi
+  if ! temporal_command workflow describe \
+    --address "127.0.0.1:${grpc_port}" \
+    --namespace "${namespace}" \
+    --workflow-id "${workflow_id}" \
+    --run-id "${activity_run_id_before}" \
+    --output json >"${activity_describe_after_server}" 2>/dev/null \
+    || ! assert_activity_workflow_description "${activity_describe_after_server}" \
+    || [[ "${ACTIVITY_WORKFLOW_RUN_ID}" != "${activity_run_id_before}" ]]; then
+    echo "Temporal Activity contract recovered a different workflow run." >&2
+    return 1
+  fi
+  if ! temporal_command workflow show \
+    --address "127.0.0.1:${grpc_port}" \
+    --namespace "${namespace}" \
+    --workflow-id "${workflow_id}" \
+    --run-id "${activity_run_id_before}" \
+    --output json >"${activity_history_after_server}" 2>/dev/null \
+    || ! assert_activity_history_prefix "${activity_history_before_server}" \
+      "${activity_history_after_server}" "${activity_run_id_before}"; then
+    echo "Temporal Activity contract did not recover a contiguous history prefix." >&2
+    return 1
+  fi
+
+  if ! start_activity_worker || ! run_activity_driver after-server; then
+    echo "Temporal Activity contract did not continue recovery after sidecar restart." >&2
+    return 1
+  fi
+  if ! temporal_command workflow show \
+    --address "127.0.0.1:${grpc_port}" \
+    --namespace "${namespace}" \
+    --workflow-id "${workflow_id}" \
+    --run-id "${activity_run_id_before}" \
+    --output json >"${activity_history_final}" 2>/dev/null \
+    || ! assert_activity_history_prefix "${activity_history_before_server}" \
+      "${activity_history_final}" "${activity_run_id_before}"; then
+    echo "Temporal Activity contract did not preserve the final history prefix." >&2
+    return 1
+  fi
+  if ! kill_activity_worker || ! restore_activity_server_handles || ! stop_server; then
+    echo "Temporal Activity contract could not cleanly stop its children." >&2
+    return 1
+  fi
+  activity_binary_sha256_after="$(binary_sha256 "${activity_binary}")" || return 1
+  if [[ "${activity_binary_sha256_after}" != "${activity_binary_sha256_before}" ]] \
+    || [[ "${activity_binary_sha256_after}" != "${expected_activity_binary_sha256}" ]] \
+    || ! assert_activity_output_safe; then
+    echo "Temporal Activity contract found changed or unsafe witness output." >&2
+    return 1
+  fi
+}
+
+force_kill_server() {
+  if [[ "${activity_contract_enabled}" == "1" ]]; then
+    restore_activity_server_handles || return 1
+    validate_activity_handles || return 1
+  fi
+  local server_pid="${LIVE_CHILD_PID:-}"
+  local wait_status
+  [[ -n "${server_pid}" ]] || return 1
+  if ! live_signal_child_group KILL; then
+    preserve_temp=1
+    return 1
+  fi
+  if ! live_group_exited_within "${LIVE_KILL_GRACE_POLLS}"; then
+    preserve_temp=1
+    return 1
+  fi
+  if wait "${server_pid}" 2>/dev/null; then
+    wait_status=0
+  else
+    wait_status=$?
+  fi
+  [[ "${wait_status}" == "137" ]] || return 1
+  assert_child_output_bound || return 1
+  if kill -0 "${server_pid}" 2>/dev/null \
+    || live_process_group_exists || ! assert_no_listeners "${server_pid}"; then
+    preserve_temp=1
+    return 1
+  fi
+  LIVE_CHILD_PID=""
+  if [[ "${activity_contract_enabled}" == "1" ]]; then
+    ACTIVITY_SERVER_PID=""
+    ACTIVITY_SERVER_GROUP_ID=""
+  fi
   preserve_temp=0
   return 0
 }
 
 stop_server() {
+  if [[ "${activity_contract_enabled}" == "1" ]]; then
+    restore_activity_server_handles || return 1
+    validate_activity_handles || return 1
+  fi
   local server_pid="${LIVE_CHILD_PID:-}"
   [[ -n "${server_pid}" ]] || return 1
   if ! live_reap_child; then
@@ -570,6 +1157,10 @@ stop_server() {
     || ! assert_child_output_bound; then
     preserve_temp=1
     return 1
+  fi
+  if [[ "${activity_contract_enabled}" == "1" ]]; then
+    ACTIVITY_SERVER_PID=""
+    ACTIVITY_SERVER_GROUP_ID=""
   fi
   preserve_temp=0
   return 0
@@ -643,6 +1234,11 @@ if [[ "${message_contract_enabled}" == "1" ]]; then
   fi
   if ! assert_sqlite_store_paths "${database}"; then
     echo "Temporal message contract found an unsafe SQLite companion path." >&2
+    exit 1
+  fi
+elif [[ "${activity_contract_enabled}" == "1" ]]; then
+  if ! run_activity_contract; then
+    echo "Temporal Activity contract did not pass its bounded SDK witness." >&2
     exit 1
   fi
 else
@@ -772,6 +1368,8 @@ fi
 evidence_layer=macos
 if [[ "${message_contract_enabled}" == "1" ]]; then
   evidence_fixture="synthetic.temporal-message.v1"
+elif [[ "${activity_contract_enabled}" == "1" ]]; then
+  evidence_fixture="synthetic.temporal-activity.v1"
 else
   evidence_fixture="synthetic.temporal-sidecar.v1"
 fi

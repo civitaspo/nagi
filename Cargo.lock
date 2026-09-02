@@ -1164,6 +1164,7 @@ dependencies = [
  "base64",
  "chrono",
  "core-foundation",
+ "futures",
  "futures-util",
  "getrandom 0.4.3",
  "httparse",
