@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "tool": "aqua:openai/codex",
+  "version": "0.151.0",
+  "source": "https://github.com/openai/codex",
+  "tag": "rust-v0.151.0",
+  "revision": "78c290807ce710180111df227df3b7a4fe845452",
+  "artifacts": {
+    "macos-arm64": {
+      "archiveUrl": "https://github.com/openai/codex/releases/download/rust-v0.151.0/codex-package-aarch64-apple-darwin.tar.gz",
+      "archiveSha256": "cb6e78eba80c1bc310a533f6f1c6c948377733bc06f9e837949334e04abde9c6",
+      "binarySha256": "98491713ffb196061003ee148636e743997cc31d76144ba7c53462269896891d",
+      "fileDescription": "Mach-O 64-bit executable arm64",
+      "versionOutput": "codex-cli 0.151.0"
+    },
+    "macos-x64": {
+      "archiveUrl": "https://github.com/openai/codex/releases/download/rust-v0.151.0/codex-package-x86_64-apple-darwin.tar.gz",
+      "archiveSha256": "e8348e1192f155edb21bdbaaf3231c2321087910bb1472b1306f94fb1108ad70",
+      "binarySha256": "52e7b9519170c83ac9363d23e5d8b8ff116d211149614d098cb3ce10bef82d95",
+      "fileDescription": "Mach-O 64-bit executable x86_64",
+      "versionOutput": "codex-cli 0.151.0"
+    }
+  }
+}

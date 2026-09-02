@@ -29,7 +29,6 @@ temporal-replay-contract = [
     "dep:temporalio-common",
     "dep:temporalio-sdk",
     "dep:temporalio-workflow",
-    "dep:sha2",
     "dep:tokio",
 ]
 
@@ -46,6 +45,7 @@ oauth2 = { version = "=5.0.0", default-features = false, features = [
 ] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
+sha2 = "=0.10.9"
 zeroize = { version = "=1.9.0", features = ["alloc"] }
 futures = { version = "=0.3.34", optional = true }
 futures-util = { version = "=0.3.34", default-features = false, features = [
@@ -55,7 +55,6 @@ temporalio-client = { version = "=0.7.0", default-features = false, optional = t
 temporalio-common = { version = "=0.7.0", default-features = false, optional = true }
 temporalio-sdk = { version = "=0.7.0", default-features = false, optional = true }
 temporalio-workflow = { version = "=0.7.0", default-features = false, optional = true }
-sha2 = { version = "=0.10.9", optional = true }
 tokio = { version = "=1.47.0", default-features = false, features = [
     "macros",
     "parking_lot",

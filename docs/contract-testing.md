@@ -1,12 +1,33 @@
 # Contract test harness
 
-The Phase 0 harness has three deliberate layers:
+The Phase 0 harness has deliberate layers:
 
 - `mise run test` and `mise run contract:hermetic` run credential-free Rust tests against the committed synthetic fixture and redacted evidence schema. They are suitable for local development and CI.
 - `mise run contract:macos` is an opt-in preflight for host-only contracts. It skips when unset; an explicit request on a non-Darwin host or before the corresponding contract implementation has landed fails closed. The script enables only the default-off `macos-keychain-contract` feature and runs a separate integration test against the raw Cargo-built `nagi` executable. Fresh processes use only a synthetic service and fixed nonproduction account to verify absent, write-record-A, read-A, update-record-B, read-B, delete, and absent phases through the file-based `SecItem` path. The test uses a unique empty working directory, requires it to remain empty after every child, caps and scans child stdout/stderr for both synthetic records, and attempts exact cleanup on failures. Every child also has a short deadline followed by kill and reap to bound an unexpected Keychain interaction. The raw executable path is outside any `.app`, and the roundtrip succeeds without a provisioning profile supplied by the harness; these are the standalone runtime packaging checks, not ACL or signing-identity proof. It does not launch OAuth or contact a provider.
+- `mise run contract:codex-auth` is a status-only opt-in macOS contract. It requires `NAGI_CONTRACT_CODEX_AUTH=1`, an exact clean reviewed revision in `NAGI_CONTRACT_CODEX_AUTH_REVISION`, and explicit `NAGI_CONTRACT_CODEX_AUTH_USE_REAL_HOME=1`. It builds the raw standalone executable through the locked toolchain, runs only `nagi auth codex status` with an intentionally non-default caller `CODEX_HOME`, and captures all child output privately. The production boundary then resolves the pinned Codex CLI, verifies its native file and digest, selects the owner-only managed home, and checks only the coarse status result. This contract never invokes login/logout, opens a browser, prints provider output, or uses the caller's default `CODEX_HOME`; Nagi never parses, copies, or prints credential material and never accesses the user's normal Codex namespace. The explicitly authorized status call may consult only the managed Keychain namespace. It is intended for an operator who deliberately wants a status check against the managed home.
+- The Codex status smoke emits only a fixed pass/fail line and is not a Phase 0 evidence record; it carries no revision, path, status text, account, or provider data. The checked revision and private command captures remain local to the explicitly opted-in run.
 - `mise run contract:live` is an opt-in provider contract command. It rejects API-key, token, and client-secret environment credentials, requires local setup metadata and explicit administrator consent, validates a loopback callback and clean checked revision, and runs only the exact bounded Linear read contract through the P0-04 Keychain access lease. It never enumerates provider collections or performs domain-data writes. The runner builds and validates the ordinary raw executable in the exact checkout before starting the child.
 
 The opt-in layers are intentionally not part of the default test or CI path. An unset layer skips. An explicitly requested but not-yet-implemented layer fails, so a future gate cannot be reported as passing by accident.
+
+Managed Codex authentication is covered by the default credential-free Rust
+tests at the command boundary. The tests use a temporary closed executable and
+synthetic state to check the exact `login`, `login status`, and `logout`
+arguments, the dedicated `CODEX_HOME`, the deployment `HOME` needed for the
+macOS Keychain, environment clearing, foreground stream inheritance, bounded
+status capture, exact stderr classification, first creation, safe restart,
+the exact postcondition after foreground mutations, and fail-closed handling.
+These tests never access a real credential cache, start a browser, or require
+credentials. The production path accepts only the pinned Codex CLI `0.151.0`
+Mach-O executable and the fixed managed home; it uses the CLI's Keychain store
+with forced ChatGPT login and does not expose raw authentication output. After
+a successful foreground login or logout, Nagi runs the same exact status
+boundary in that managed home and reports success only when the expected coarse
+state is observed. Logout's remote revocation semantics remain delegated to
+the official CLI and may be opaque; the local signed-out state is still
+verified. There is no default live login contract: an operator must complete
+the official foreground browser flow explicitly, and no contract runner copies
+or uses the user's default `CODEX_HOME`.
 
 The Linear polling boundary is covered by a credential-free loopback GraphQL
 server in the Rust unit-test target. Each request is matched to a scripted

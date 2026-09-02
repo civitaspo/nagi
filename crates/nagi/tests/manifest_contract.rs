@@ -10,6 +10,7 @@ const FIXTURE: &str = include_str!("../../../tests/fixtures/phase-zero.toml");
 const EVIDENCE_SCHEMA: &str = include_str!("../../../tests/evidence/v1.schema.json");
 const EVIDENCE_EXAMPLE: &str = include_str!("../../../tests/evidence/example.json");
 const VERSIONS: &str = include_str!("../../../contracts/versions.toml");
+const CODEX_PROVENANCE: &str = include_str!("../../../contracts/codex-cli-provenance.json");
 const MISE: &str = include_str!("../../../mise.toml");
 const MISE_LOCK: &str = include_str!("../../../mise.lock");
 const WORKSPACE_CARGO: &str = include_str!("../../../Cargo.toml");
@@ -19,6 +20,16 @@ const MACOS_SCRIPT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../scripts/contracts/macos.sh"
 );
+#[cfg(unix)]
+const CODEX_AUTH_SCRIPT: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../scripts/contracts/codex-auth.sh"
+);
+#[cfg(unix)]
+const CODEX_AUTH_SCRIPT_SOURCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../scripts/contracts/codex-auth.sh"
+));
 #[cfg(unix)]
 const LIVE_SCRIPT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -376,6 +387,119 @@ fn versions_are_a_strict_source_and_revision_manifest() {
 }
 
 #[test]
+fn codex_cli_provenance_is_strict_and_matches_the_pinned_release() {
+    let parsed = parse_json("Codex CLI provenance", CODEX_PROVENANCE);
+    let provenance = json_object("Codex CLI provenance", &parsed);
+    assert!(exact_json_keys(
+        provenance,
+        &[
+            "schemaVersion",
+            "tool",
+            "version",
+            "source",
+            "tag",
+            "revision",
+            "artifacts",
+        ]
+    ));
+    assert_eq!(
+        provenance.get("schemaVersion").and_then(Value::as_i64),
+        Some(1)
+    );
+    assert_eq!(
+        provenance.get("tool").and_then(Value::as_str),
+        Some("aqua:openai/codex")
+    );
+    assert_eq!(
+        provenance.get("version").and_then(Value::as_str),
+        Some("0.151.0")
+    );
+    assert_eq!(
+        provenance.get("source").and_then(Value::as_str),
+        Some("https://github.com/openai/codex")
+    );
+    assert_eq!(
+        provenance.get("tag").and_then(Value::as_str),
+        Some("rust-v0.151.0")
+    );
+    assert_eq!(
+        provenance.get("revision").and_then(Value::as_str),
+        Some("78c290807ce710180111df227df3b7a4fe845452")
+    );
+
+    let artifacts = json_object(
+        "Codex CLI provenance artifacts",
+        provenance.get("artifacts").expect("Codex artifacts"),
+    );
+    assert_eq!(
+        artifacts.keys().cloned().collect::<BTreeSet<_>>(),
+        BTreeSet::from(["macos-arm64".to_owned(), "macos-x64".to_owned()])
+    );
+    for (platform, archive_url, archive_sha256, binary_sha256, file_description) in [
+        (
+            "macos-arm64",
+            "https://github.com/openai/codex/releases/download/rust-v0.151.0/codex-package-aarch64-apple-darwin.tar.gz",
+            "cb6e78eba80c1bc310a533f6f1c6c948377733bc06f9e837949334e04abde9c6",
+            "98491713ffb196061003ee148636e743997cc31d76144ba7c53462269896891d",
+            "Mach-O 64-bit executable arm64",
+        ),
+        (
+            "macos-x64",
+            "https://github.com/openai/codex/releases/download/rust-v0.151.0/codex-package-x86_64-apple-darwin.tar.gz",
+            "e8348e1192f155edb21bdbaaf3231c2321087910bb1472b1306f94fb1108ad70",
+            "52e7b9519170c83ac9363d23e5d8b8ff116d211149614d098cb3ce10bef82d95",
+            "Mach-O 64-bit executable x86_64",
+        ),
+    ] {
+        let artifact = json_object(
+            "Codex CLI provenance artifact",
+            artifacts.get(platform).expect("platform artifact"),
+        );
+        assert!(exact_json_keys(
+            artifact,
+            &[
+                "archiveUrl",
+                "archiveSha256",
+                "binarySha256",
+                "fileDescription",
+                "versionOutput",
+            ]
+        ));
+        assert_eq!(
+            artifact.get("archiveUrl").and_then(Value::as_str),
+            Some(archive_url)
+        );
+        assert_eq!(
+            artifact.get("archiveSha256").and_then(Value::as_str),
+            Some(archive_sha256)
+        );
+        assert_eq!(
+            artifact.get("binarySha256").and_then(Value::as_str),
+            Some(binary_sha256)
+        );
+        for key in ["archiveSha256", "binarySha256"] {
+            let digest = artifact
+                .get(key)
+                .and_then(Value::as_str)
+                .expect("artifact digest");
+            assert_eq!(digest.len(), 64, "{platform}.{key} must be SHA-256");
+            assert!(
+                digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "{platform}.{key} must be hexadecimal"
+            );
+        }
+        assert_eq!(
+            artifact.get("fileDescription").and_then(Value::as_str),
+            Some(file_description)
+        );
+        assert_eq!(
+            artifact.get("versionOutput").and_then(Value::as_str),
+            Some("codex-cli 0.151.0")
+        );
+    }
+}
+
+#[test]
 fn tool_manifests_cross_check_declared_versions_and_backends() {
     let parsed = parse_toml("workspace Cargo.toml", WORKSPACE_CARGO);
     let workspace = toml_table("workspace Cargo.toml", &parsed);
@@ -494,12 +618,41 @@ fn macos_preflight_is_opt_in_and_platform_gated() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn codex_auth_contract_is_opt_in_and_status_only() {
+    let skip = command_output(CODEX_AUTH_SCRIPT, &[]);
+    assert_eq!(skip.status.code(), Some(0));
+    assert!(bytes_contain(&skip.stdout, b"SKIP"));
+    assert!(skip.stderr.is_empty());
+    assert!(CODEX_AUTH_SCRIPT_SOURCE.contains("NAGI_CONTRACT_CODEX_AUTH_REVISION"));
+    assert!(CODEX_AUTH_SCRIPT_SOURCE.contains("NAGI_CONTRACT_CODEX_AUTH_USE_REAL_HOME"));
+    assert!(CODEX_AUTH_SCRIPT_SOURCE.contains("live_validate_clean_revision"));
+    assert!(CODEX_AUTH_SCRIPT_SOURCE.contains("live_supervise_child_without_file_limit"));
+    assert!(CODEX_AUTH_SCRIPT_SOURCE.contains("CODEX_HOME=/nagi-codex-auth-caller-home"));
+    assert!(CODEX_AUTH_SCRIPT_SOURCE.contains("auth codex status"));
+    assert!(CODEX_AUTH_SCRIPT_SOURCE.contains("live_binary_sha256"));
+    assert!(!CODEX_AUTH_SCRIPT_SOURCE.contains("auth codex login"));
+    assert!(!CODEX_AUTH_SCRIPT_SOURCE.contains("auth codex logout"));
+
+    if !cfg!(target_os = "macos") {
+        let explicit = command_output(CODEX_AUTH_SCRIPT, &[("NAGI_CONTRACT_CODEX_AUTH", "1")]);
+        assert_eq!(explicit.status.code(), Some(2));
+        assert!(!bytes_contain(&explicit.stdout, b"/"));
+        assert!(!bytes_contain(&explicit.stderr, b"/"));
+    }
+}
+
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn non_macos_build_keeps_error_boundary() {
     assert_eq!(
         nagi::linear::ReadContractError::UnsupportedPlatform.to_string(),
         "Linear read contract is unsupported on this host"
+    );
+    assert_eq!(
+        nagi::codex::CodexError::UnsupportedPlatform.to_string(),
+        "Codex authentication is unsupported on this host"
     );
 }
 
