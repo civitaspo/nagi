@@ -11,6 +11,7 @@ const EVIDENCE_SCHEMA: &str = include_str!("../../../tests/evidence/v1.schema.js
 const EVIDENCE_EXAMPLE: &str = include_str!("../../../tests/evidence/example.json");
 const VERSIONS: &str = include_str!("../../../contracts/versions.toml");
 const CODEX_PROVENANCE: &str = include_str!("../../../contracts/codex-cli-provenance.json");
+const CODEX_SOURCE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/codex.rs"));
 const MISE: &str = include_str!("../../../mise.toml");
 const MISE_LOCK: &str = include_str!("../../../mise.lock");
 const WORKSPACE_CARGO: &str = include_str!("../../../Cargo.toml");
@@ -388,6 +389,8 @@ fn versions_are_a_strict_source_and_revision_manifest() {
 
 #[test]
 fn codex_cli_provenance_is_strict_and_matches_the_pinned_release() {
+    let versions_source = parse_toml("version manifest", VERSIONS);
+    let versions = toml_table("version manifest", &versions_source);
     let parsed = parse_json("Codex CLI provenance", CODEX_PROVENANCE);
     let provenance = json_object("Codex CLI provenance", &parsed);
     assert!(exact_json_keys(
@@ -410,21 +413,51 @@ fn codex_cli_provenance_is_strict_and_matches_the_pinned_release() {
         provenance.get("tool").and_then(Value::as_str),
         Some("aqua:openai/codex")
     );
+    let version = toml_string("version manifest", versions, "codex");
+    let source = toml_string("version manifest", versions, "codex_source");
+    let tag = toml_string("version manifest", versions, "codex_tag");
+    let revision = toml_string("version manifest", versions, "codex_revision");
     assert_eq!(
         provenance.get("version").and_then(Value::as_str),
-        Some("0.151.0")
+        Some(version)
     );
     assert_eq!(
         provenance.get("source").and_then(Value::as_str),
-        Some("https://github.com/openai/codex")
+        Some(source)
     );
-    assert_eq!(
-        provenance.get("tag").and_then(Value::as_str),
-        Some("rust-v0.151.0")
-    );
+    assert_eq!(provenance.get("tag").and_then(Value::as_str), Some(tag));
     assert_eq!(
         provenance.get("revision").and_then(Value::as_str),
-        Some("78c290807ce710180111df227df3b7a4fe845452")
+        Some(revision)
+    );
+    assert_hex_revision(revision);
+
+    let mise_source = parse_toml("mise.toml", MISE);
+    let mise = toml_table("mise.toml", &mise_source);
+    let mise_tools = toml_table("mise tools", mise.get("tools").expect("mise tools"));
+    assert_eq!(
+        toml_string("mise Codex", mise_tools, "aqua:openai/codex"),
+        version
+    );
+    let lock_source = parse_toml("mise.lock", MISE_LOCK);
+    let lock = toml_table("mise.lock", &lock_source);
+    let lock_tools = toml_table(
+        "mise.lock tools",
+        lock.get("tools").expect("mise.lock tools"),
+    );
+    let lock_entries = lock_tools
+        .get("aqua:openai/codex")
+        .and_then(TomlValue::as_array)
+        .expect("mise.lock Codex entry");
+    assert_eq!(lock_entries.len(), 1);
+    let lock_entry = toml_table("mise.lock Codex", &lock_entries[0]);
+    assert_eq!(
+        toml_string("mise.lock Codex", lock_entry, "version"),
+        version
+    );
+    assert_eq!(
+        toml_string("mise.lock Codex", lock_entry, "backend"),
+        "aqua:openai/codex"
     );
 
     let artifacts = json_object(
@@ -435,22 +468,7 @@ fn codex_cli_provenance_is_strict_and_matches_the_pinned_release() {
         artifacts.keys().cloned().collect::<BTreeSet<_>>(),
         BTreeSet::from(["macos-arm64".to_owned(), "macos-x64".to_owned()])
     );
-    for (platform, archive_url, archive_sha256, binary_sha256, file_description) in [
-        (
-            "macos-arm64",
-            "https://github.com/openai/codex/releases/download/rust-v0.151.0/codex-package-aarch64-apple-darwin.tar.gz",
-            "cb6e78eba80c1bc310a533f6f1c6c948377733bc06f9e837949334e04abde9c6",
-            "98491713ffb196061003ee148636e743997cc31d76144ba7c53462269896891d",
-            "Mach-O 64-bit executable arm64",
-        ),
-        (
-            "macos-x64",
-            "https://github.com/openai/codex/releases/download/rust-v0.151.0/codex-package-x86_64-apple-darwin.tar.gz",
-            "e8348e1192f155edb21bdbaaf3231c2321087910bb1472b1306f94fb1108ad70",
-            "52e7b9519170c83ac9363d23e5d8b8ff116d211149614d098cb3ce10bef82d95",
-            "Mach-O 64-bit executable x86_64",
-        ),
-    ] {
+    for (platform, architecture) in [("macos-arm64", "arm64"), ("macos-x64", "x86_64")] {
         let artifact = json_object(
             "Codex CLI provenance artifact",
             artifacts.get(platform).expect("platform artifact"),
@@ -465,17 +483,37 @@ fn codex_cli_provenance_is_strict_and_matches_the_pinned_release() {
                 "versionOutput",
             ]
         ));
-        assert_eq!(
-            artifact.get("archiveUrl").and_then(Value::as_str),
-            Some(archive_url)
+        let archive_url = artifact
+            .get("archiveUrl")
+            .and_then(Value::as_str)
+            .expect("artifact archive URL");
+        assert!(
+            archive_url.starts_with(&format!("{source}/releases/download/{tag}/codex-package-"))
+        );
+        assert!(archive_url.ends_with(".tar.gz"));
+        let archive_sha256 = artifact
+            .get("archiveSha256")
+            .and_then(Value::as_str)
+            .expect("artifact archive digest");
+        let binary_sha256 = artifact
+            .get("binarySha256")
+            .and_then(Value::as_str)
+            .expect("artifact binary digest");
+        let lock_platform = toml_table(
+            "mise.lock Codex platform",
+            lock_entry
+                .get(&format!("platforms.{platform}"))
+                .expect("matching mise.lock Codex platform"),
         );
         assert_eq!(
-            artifact.get("archiveSha256").and_then(Value::as_str),
-            Some(archive_sha256)
+            archive_url,
+            toml_string("mise.lock Codex platform", lock_platform, "url")
         );
         assert_eq!(
-            artifact.get("binarySha256").and_then(Value::as_str),
-            Some(binary_sha256)
+            archive_sha256,
+            toml_string("mise.lock Codex platform", lock_platform, "checksum")
+                .strip_prefix("sha256:")
+                .expect("SHA-256 lock checksum")
         );
         for key in ["archiveSha256", "binarySha256"] {
             let digest = artifact
@@ -484,17 +522,23 @@ fn codex_cli_provenance_is_strict_and_matches_the_pinned_release() {
                 .expect("artifact digest");
             assert_eq!(digest.len(), 64, "{platform}.{key} must be SHA-256");
             assert!(
-                digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                digest
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')),
                 "{platform}.{key} must be hexadecimal"
             );
         }
+        assert!(
+            CODEX_SOURCE.contains(binary_sha256),
+            "runtime Codex code must bind {platform} binary digest"
+        );
         assert_eq!(
             artifact.get("fileDescription").and_then(Value::as_str),
-            Some(file_description)
+            Some(format!("Mach-O 64-bit executable {architecture}").as_str())
         );
         assert_eq!(
             artifact.get("versionOutput").and_then(Value::as_str),
-            Some("codex-cli 0.151.0")
+            Some(format!("codex-cli {version}").as_str())
         );
     }
 }

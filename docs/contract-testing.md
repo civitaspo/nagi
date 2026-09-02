@@ -10,24 +10,11 @@ The Phase 0 harness has deliberate layers:
 
 The opt-in layers are intentionally not part of the default test or CI path. An unset layer skips. An explicitly requested but not-yet-implemented layer fails, so a future gate cannot be reported as passing by accident.
 
-Managed Codex authentication is covered by the default credential-free Rust
-tests at the command boundary. The tests use a temporary closed executable and
-synthetic state to check the exact `login`, `login status`, and `logout`
-arguments, the dedicated `CODEX_HOME`, the deployment `HOME` needed for the
-macOS Keychain, environment clearing, foreground stream inheritance, bounded
-status capture, exact stderr classification, first creation, safe restart,
-the exact postcondition after foreground mutations, and fail-closed handling.
-These tests never access a real credential cache, start a browser, or require
-credentials. The production path accepts only the pinned Codex CLI `0.151.0`
-Mach-O executable and the fixed managed home; it uses the CLI's Keychain store
-with forced ChatGPT login and does not expose raw authentication output. After
-a successful foreground login or logout, Nagi runs the same exact status
-boundary in that managed home and reports success only when the expected coarse
-state is observed. Logout's remote revocation semantics remain delegated to
-the official CLI and may be opaque; the local signed-out state is still
-verified. There is no default live login contract: an operator must complete
-the official foreground browser flow explicitly, and no contract runner copies
-or uses the user's default `CODEX_HOME`.
+The managed Codex authentication boundary is specified in
+[ADR-0002](adr/0002-managed-codex-authentication.md). The default Rust tests
+remain credential-free and hermetic; the opt-in runner above is the only live
+status smoke, and it never invokes a browser login or uses the user's default
+`CODEX_HOME`.
 
 The Linear polling boundary is covered by a credential-free loopback GraphQL
 server in the Rust unit-test target. Each request is matched to a scripted

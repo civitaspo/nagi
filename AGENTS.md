@@ -62,6 +62,18 @@ The Rust tasks skip project commands until `Cargo.toml` exists. This keeps the f
 - P0-10 output handling keeps SDK test stdout/stderr path- and credential-redacted, while private Temporal sidecar stdout/stderr remain bounded and credential-redacted but may retain the expected run-private SQLite path emitted by the CLI startup banner.
 - P0-11 managed Codex authentication exposes only `nagi auth codex login|status|logout` on macOS. It invokes the exact pinned `codex login`, `codex login status`, and `codex logout` commands with a cleared environment, fixed ChatGPT login configuration, and `CODEX_HOME=~/Library/Application Support/nagi/codex-home`; the deployment `HOME` remains selected for the normal macOS Keychain. Login/logout retain the official foreground streams, while status captures bounded private output and accepts only exit 0 plus exact `Logged in using ChatGPT` on stderr or exit 1 plus exact `Not logged in` on stderr. All other output and modes fail closed without exposing raw authentication data. After a successful login/logout foreground command, the same exact status boundary in the managed home must verify the expected coarse state before Nagi reports success; logout's remote revoke semantics remain delegated and may be opaque. The managed directory is owner-only `0700`, requires an exact marker/configuration gate on restart, rejects unknown locations and symlinks, and leaves unknown files untouched; logout delegates to Codex and never recursively deletes the directory. The fixed config selects the keyring store and ChatGPT method; the pinned CLI's Keychain account namespace is derived from the canonical managed-home path with a 64-bit truncated SHA-256 prefix. Default tests use a closed fake executable and synthetic state only; they do not access a real credential cache, no browser is automated, and no live login is part of default CI. Nagi never parses, copies, or prints credential material and never accesses the user's normal Codex namespace; official status may consult only the managed Keychain namespace. The opt-in `mise run contract:codex-auth` checks only status against an explicitly approved real deployment home after a clean reviewed revision; it never runs a login flow. Same-UID replacement and legacy Keychain ACL limitations remain explicit residual risks.
 
+- P0-11's pinned executable is opened and verified through a POSIX source
+  boundary (current-user ownership, owner search permission, and no group/other
+  writes; ordinary non-writable source directories such as `0755` are valid),
+  copied from that descriptor to an ephemeral owner-only runtime directory,
+  and executed only from the verified private copy. Extended ACL grants are not
+  inspected, so cross-UID resistance through ACLs is unproven and deferred.
+  The directory and exact file are cleaned up after each operation without
+  recursive removal; a same-UID replacement between filesystem checks remains
+  a documented, deferred risk, as does exact runtime residue after a fatal
+  crash. This copy is runtime state, not a packaged or bundled helper
+  executable.
+
 ## GitHub Actions and credentials
 
 - Pin every GitHub Action to an immutable commit SHA and keep `persist-credentials: false` on checkout steps.

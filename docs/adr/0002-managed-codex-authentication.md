@@ -65,6 +65,21 @@ the macOS Keychain. The child `HOME` remains the validated deployment home so
 the normal login Keychain can be found; only `CODEX_HOME` selects Codex's
 managed namespace.
 
+Before each operation, Nagi opens the exact pinned source with `O_NOFOLLOW`,
+checks every source parent for current-user POSIX ownership, owner search
+permission, and no group/other write permission (ordinary non-writable modes
+such as `0755` are valid), and verifies the native header, metadata, and digest
+on that descriptor. These are POSIX ownership/mode checks only: Nagi does not
+inspect extended ACL grants, so cross-UID resistance in the presence of ACLs
+is unproven and deferred. It copies those bytes into a fresh owner-only `0700`
+per-invocation directory and `0500` executable, verifies the private copy, and
+checks its file identity and digest again immediately before each spawn.
+The guard removes only that exact file and empty directory after status,
+login, logout, or an error; it never recursively removes managed-home files.
+The standalone artifact therefore remains one executable: the private copy is
+an ephemeral runtime copy of the external pinned CLI, not a packaged or bundled
+helper executable, app, daemon, entitlement, or provisioning profile.
+
 This boundary is macOS-only. Other hosts return a typed unsupported result
 before resolving a path, reading local state, or spawning a process.
 
@@ -93,9 +108,14 @@ coarse result boundary and preserves restart persistence in the Keychain. The
 provenance manifest and executable digest bind the runtime to the reviewed
 Codex release. The keyring's path-derived namespace is a 64-bit truncated
 digest, not an independent OS identity; same-UID processes and legacy
-Keychain ACL behavior remain residual risks. A later release gate must address
-stronger identity/ACL and same-UID replacement guarantees. No app bundle,
-provisioning profile, entitlement, helper executable, daemon, or provider
+Keychain ACL behavior remain residual risks. The source parent checks and the
+last private-leaf identity check are preflight/boundary checks; a same-UID
+actor may still replace a path between validation and the next filesystem
+operation, and a fatal crash may leave an exact private runtime directory.
+The POSIX checks do not inspect extended ACL grants, so cross-UID resistance
+through ACLs is unproven and deferred. Those limits are explicitly deferred to
+a later identity/ACL and crash-cleanup gate. No app bundle, provisioning
+profile, entitlement, packaged/bundled helper executable, daemon, or provider
 fallback is introduced here.
 
 ## References
