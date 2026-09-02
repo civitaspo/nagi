@@ -234,6 +234,8 @@ fn temporal_message_wrapper_binds_the_private_locked_toolchain() {
         "cargo 1.98.0 (797e8a9bc 2026-08-05)",
         "libprotoc 36.1",
         "/bin/sh -c 'exec \"$@\" >/dev/null 2>&1' nagi-cargo-build cargo",
+        "-perm -100",
+        "$(/usr/bin/id -u) 700 1",
         "rustc_source_sha256",
         "cargo_source_sha256",
         "protoc_source_sha256",
@@ -250,6 +252,8 @@ fn temporal_message_wrapper_binds_the_private_locked_toolchain() {
             "Temporal message wrapper is missing {required:?}"
         );
     }
+    assert!(!TEMPORAL_MESSAGE_SCRIPT.contains("-perm -111"));
+    assert!(!TEMPORAL_MESSAGE_SCRIPT.contains("$(/usr/bin/id -u) 755 1"));
     for obsolete in [
         "mise_path",
         "validate_mise_executable",
