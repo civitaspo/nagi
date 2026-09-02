@@ -154,6 +154,16 @@ fn temporal_activity_contract_separates_worker_and_sidecar_recovery_gates() {
 }
 
 #[test]
+fn temporal_activity_history_binds_worker_identity() {
+    assert!(
+        TEMPORAL_SCRIPT.contains(r#"grep -Fq '"identity": "nagi-contract-activity-worker-v1"'"#)
+    );
+    assert!(
+        TEMPORAL_ACTIVITY_TEST.contains("client_identity_override(WORKER_IDENTITY.to_owned())")
+    );
+}
+
+#[test]
 fn temporal_activity_private_output_and_public_evidence_redaction_are_separate() {
     let private_output_check = TEMPORAL_SCRIPT
         .find("assert_activity_output_safe()")

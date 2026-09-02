@@ -1023,7 +1023,7 @@ run_activity_contract() {
   fi
   if ! assert_activity_history_file "${activity_history_before_server}" \
     "${activity_run_id_before}" "${contract_tmp}/activity-history-before-events" \
-    || ! /usr/bin/grep -Fq '"identity": "nagi-contract-activity-client-v1"' \
+    || ! /usr/bin/grep -Fq '"identity": "nagi-contract-activity-worker-v1"' \
     "${activity_history_before_server}" \
     || /usr/bin/grep -Eiq '(authorization:|bearer[[:space:]]+|access[_-]?token|client[_-]?secret|password[=:])' \
     "${activity_history_before_server}"; then
