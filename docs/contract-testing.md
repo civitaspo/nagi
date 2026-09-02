@@ -70,6 +70,55 @@ contract passes a fixed Temporal client identity so a host name cannot enter
 synthetic history. It does not open the SQLite file itself, use a Temporal Rust
 SDK, run a production Worker, or contact a provider.
 
+Temporal message handling is a separate opt-in macOS contract, enabled with
+`NAGI_CONTRACT_TEMPORAL_MESSAGES=1 mise run contract:temporal-messages`. The
+wrapper requires a clean checked revision and builds the feature-gated
+`temporalio-sdk = "=0.7.0"` test with the locked `rust@1.98.0` and
+`aqua:protocolbuffers/protobuf/protoc@36.1` tools into the dedicated
+`target/nagi-temporal-message-contract` directory. The wrapper validates the
+installed architecture-specific Rust `1.98.0` and protoc `36.1` trees as
+canonical current-user-owned trees containing only directories and single-link
+regular files with no group/other write bits, then APFS-clone-copies both
+complete distributions (including protoc includes) into a private store. These
+installed Rust and protoc distributions are trusted local inputs: this contract
+verifies exact versions, clone integrity, and unchanged private executable
+digests across the build, but does not prove absence of same-UID replacement
+races or immutable official-archive provenance. It does not claim that mise
+provides a stronger provenance guarantee. The build uses only the private Rust and protoc
+`PATH`, mode-0700 `HOME` and `CARGO_HOME`, and clone-copied Cargo registry cache
+and index trees, then invokes Cargo offline with the lockfile. Developer Cargo
+configuration, credentials, unpacked sources, and mise read/write state are not
+used. Exact `rustc`, `cargo`, and `protoc` probes must match before and after
+the build; each source executable SHA-256 is bound before cloning, the private
+copies must match it, and the private hashes must remain unchanged across the
+build. Cargo build output is discarded inside the unlimited-file-limit build
+child. Probe output is capped and matched exactly. The outer supervisor for
+`temporal.sh` intentionally has no child file-size limit: `temporal.sh` emits
+only fixed generic diagnostics/evidence, while the provider sidecar's own
+output is captured and checked privately by `temporal.sh`; the wrapper checks
+its resulting private files but does not claim an OS-level hard limit for
+arbitrary raw sidecar output. The wrapper runs exactly one validated test binary
+through the sidecar harness and removes the generated target only after bounded
+cleanup. The synthetic Workflow covers
+Signal-With-Start bootstrap, full-payload signal idempotency and conflicting
+payload rejection, Update validation and stable update IDs, Query reads, and a
+post-commit response-loss recovery that queries state before retrying the same
+ID. Because temporalio-client 0.7.0 generates the Signal-With-Start transport
+request ID internally and does not expose it through `WorkflowStartOptions`, the
+resend witness uses a stable application logical message ID and full canonical
+signal payload, rejects any changed payload field for an existing logical ID,
+and queries the workflow state to prove the resend reached the Workflow before
+deduplication. Every Signal-With-Start request explicitly combines `UseExisting`
+for a running execution with `RejectDuplicate` for a closed execution. After
+the synthetic Workflow completes, a same-ID retry must return
+`WorkflowStartError::Rpc` carrying `tonic::Code::AlreadyExists` and leave the
+queried state unchanged. This exact status match is intentional: in
+temporalio-client 0.7.0, the ordinary `StartWorkflowExecution` path maps
+`AlreadyExists` to `AlreadyStarted`, while the Signal-With-Start path preserves
+the gRPC status. The SDK and protoc are build-only contract dependencies; the
+standalone `nagi` binary and production runtime do not include this harness.
+No app bundle, provisioning profile, or signing identity is required.
+
 The live runner resolves the repository from its own script path, requires a
 clean checked revision, and builds the ordinary raw
 `target/nagi-contract/debug/nagi` executable in that exact checkout with

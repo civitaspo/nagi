@@ -122,7 +122,21 @@ live_validate_home_directory() {
 }
 
 live_file_size() {
-  /usr/bin/wc -c <"$1" | /usr/bin/tr -d '[:space:]'
+  if (($# != 1)); then
+    return 1
+  fi
+  local size
+  if ! size="$(
+    {
+      /usr/bin/wc -c <"$1" | /usr/bin/tr -d '[:space:]'
+    } 2>/dev/null
+  )"; then
+    return 1
+  fi
+  if [[ ! "${size}" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+  printf '%s\n' "${size}"
 }
 
 live_binary_sha256() {
@@ -245,15 +259,54 @@ live_start_child_without_file_limit() {
   live_start_child_inner unlimited "$@"
 }
 
+# The Temporal message wrapper already places temporal.sh in the process group
+# it supervises. This narrowly scoped launcher keeps the message sidecar in
+# that inherited group while still clearing the defensive file-size limit that
+# would prevent SQLite and Temporal from writing ordinary state. The empty
+# group handle is intentional: inner cleanup must address this exact PID, and
+# the outer supervisor owns the complete process-tree kill on timeout.
+live_start_child_in_current_group_without_file_limit() {
+  if (($# < 3)); then
+    return 1
+  fi
+  local stdout_file="$1"
+  local stderr_file="$2"
+  shift 2
+  local monitor_state
+  monitor_state="$(set -o monitor)"
+  # Job-control mode creates a new process group for asynchronous jobs. Keep
+  # it disabled only across this spawn, then restore the caller's state.
+  set +m
+  (
+    ulimit -f unlimited || exit 125
+    exec "$@"
+  ) >"${stdout_file}" 2>"${stderr_file}" &
+  LIVE_CHILD_PID=$!
+  if [[ "${monitor_state}" == *on ]]; then
+    set -m
+  fi
+  LIVE_CHILD_GROUP_ID=""
+  LIVE_CHILD_REAP_FAILED=0
+  return 0
+}
+
 live_signal_child_group() {
   local signal="$1"
-  local group_status=0
-  if [[ -n "${LIVE_CHILD_GROUP_ID:-}" ]]; then
-    if [[ "${signal}" == "TERM" ]]; then
-      kill -TERM -- "-${LIVE_CHILD_GROUP_ID}" 2>/dev/null || group_status=$?
-    else
-      kill -KILL -- "-${LIVE_CHILD_GROUP_ID}" 2>/dev/null || group_status=$?
+  if [[ -z "${LIVE_CHILD_GROUP_ID:-}" ]]; then
+    if [[ -n "${LIVE_CHILD_PID:-}" ]]; then
+      if [[ "${signal}" == "TERM" ]]; then
+        kill -TERM "${LIVE_CHILD_PID}" 2>/dev/null || true
+      else
+        kill -KILL "${LIVE_CHILD_PID}" 2>/dev/null || true
+      fi
     fi
+    return 0
+  fi
+  local group_status=0
+  if [[ "${signal}" == "TERM" ]]; then
+    kill -TERM -- "-${LIVE_CHILD_GROUP_ID}" 2>/dev/null || group_status=$?
+  else
+    kill -KILL -- "-${LIVE_CHILD_GROUP_ID}" 2>/dev/null || group_status=$?
   fi
   if ((group_status != 0)) && [[ -n "${LIVE_CHILD_PID:-}" ]]; then
     if [[ "${signal}" == "TERM" ]]; then
@@ -593,6 +646,39 @@ if [[ "${BASH_SOURCE[0]:-}" == "$0" ]]; then
     exit 1
   fi
   if [[ "$(/bin/cat "${stdout_file}")" != "child-output" ]]; then
+    exit 1
+  fi
+
+  # The current-group launcher must leave the child in this shell's process
+  # group, then reap that exact PID without attempting a group-wide signal.
+  : >"${stdout_file}"
+  : >"${stderr_file}"
+  if ! live_start_child_in_current_group_without_file_limit \
+    "${stdout_file}" "${stderr_file}" /bin/sh -c 'trap "" TERM; while :; do :; done'; then
+    exit 1
+  fi
+  current_group_child_pid="${LIVE_CHILD_PID}"
+  if [[ ! "${current_group_child_pid}" =~ ^[0-9]+$ || -n "${LIVE_CHILD_GROUP_ID}" ]]; then
+    exit 1
+  fi
+  if ! live_child_running "${current_group_child_pid}"; then
+    exit 1
+  fi
+  if ! live_reap_child; then
+    exit 1
+  fi
+  if [[ -n "${LIVE_CHILD_PID}" || -n "${LIVE_CHILD_GROUP_ID}" ]]; then
+    exit 1
+  fi
+  current_group_child_gone=0
+  for ((poll = 0; poll < 20; poll++)); do
+    if ! kill -0 "${current_group_child_pid}" 2>/dev/null; then
+      current_group_child_gone=1
+      break
+    fi
+    /bin/sleep 0.1
+  done
+  if ((current_group_child_gone == 0)); then
     exit 1
   fi
 

@@ -6,6 +6,7 @@ rust = { version = "1.98.0", components = ["clippy", "rustfmt"] }
 "aqua:suzuki-shunsuke/pinact" = "4.1.1"
 "aqua:openai/codex" = "0.151.0"
 "aqua:temporalio/cli" = "1.8.2"
+"aqua:protocolbuffers/protobuf/protoc" = "36.1"
 
 [tasks.lint]
 description = "Run repository and Rust lint checks"
@@ -54,6 +55,10 @@ run = "scripts/contracts/macos.sh"
 [tasks."contract:temporal"]
 description = "Run the explicitly enabled local Temporal persistence contract"
 run = "scripts/contracts/temporal.sh"
+
+[tasks."contract:temporal-messages"]
+description = "Run the explicitly enabled local Temporal message contract"
+run = "scripts/contracts/temporal-messages.sh"
 
 [tasks."contract:live"]
 description = "Preflight explicitly enabled live-provider contract tests"

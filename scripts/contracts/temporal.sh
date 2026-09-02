@@ -1,6 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+message_contract_enabled=0
+case "$#" in
+  0) ;;
+  1)
+    if [[ "$1" != "--message-contract" ]]; then
+      echo "Temporal contract layer accepts only the internal --message-contract mode." >&2
+      exit 2
+    fi
+    message_contract_enabled=1
+    ;;
+  *)
+    echo "Temporal contract layer accepts no positional arguments except --message-contract." >&2
+    exit 2
+    ;;
+esac
+
 if [[ "${NAGI_CONTRACT_TEMPORAL:-0}" != "1" ]]; then
   echo "SKIP: Temporal contract layer is opt-in; set NAGI_CONTRACT_TEMPORAL=1 to request it."
   exit 0
@@ -11,19 +27,21 @@ if [[ "$(/usr/bin/uname -s)" != "Darwin" ]]; then
   exit 2
 fi
 
-script_directory="$(cd "$(/usr/bin/dirname "${BASH_SOURCE[0]}")" && pwd -P 2>/dev/null || true)"
+script_directory="$(cd "$(/usr/bin/dirname "${BASH_SOURCE[0]}" 2>/dev/null)" 2>/dev/null && pwd -P 2>/dev/null || true)"
 helper_script="${script_directory}/live_helpers.sh"
 if [[ ! -f "${helper_script}" || -L "${helper_script}" ]]; then
   echo "Temporal contract layer could not load its checked process helper." >&2
   exit 1
 fi
 # shellcheck source=/dev/null
-. "${helper_script}"
+if ! . "${helper_script}" 2>/dev/null; then
+  echo "Temporal contract layer could not load its checked process helper." >&2
+  exit 1
+fi
 if ! live_validate_path_components "${script_directory}"; then
   echo "Temporal contract layer rejected its script path." >&2
   exit 1
 fi
-
 # The public mise task activates the locked Temporal CLI on PATH. `type -P` is
 # a shell builtin lookup only; this candidate is never executed directly.
 if ! temporal_binary_source="$(type -P temporal 2>/dev/null)"; then
@@ -183,7 +201,7 @@ fi
 raw_contract_tmp=""
 home_directory="${contract_tmp}/home"
 temp_directory="${contract_tmp}/tmp"
-mkdir -p "${home_directory}" "${temp_directory}"
+/bin/mkdir -p "${home_directory}" "${temp_directory}"
 stdout_file="${contract_tmp}/temporal.stdout"
 stderr_file="${contract_tmp}/temporal.stderr"
 describe_before="${contract_tmp}/describe-before.json"
@@ -193,8 +211,12 @@ history_after="${contract_tmp}/history-after.json"
 command_output="${contract_tmp}/command-output"
 cluster_before="${contract_tmp}/cluster-before.json"
 cluster_after="${contract_tmp}/cluster-after.json"
+message_stdout="${contract_tmp}/message.stdout"
+message_stderr="${contract_tmp}/message.stderr"
 : >"${stdout_file}"
 : >"${stderr_file}"
+: >"${message_stdout}"
+: >"${message_stderr}"
 MAX_CHILD_OUTPUT_BYTES=65536
 
 cleanup_status=0
@@ -275,7 +297,11 @@ fi
 workflow_id="nagi-contract-persistence-v1"
 workflow_type="NagiContractPersistenceV1"
 task_queue="nagi-contract-persistence-v1"
-namespace="synthetic-persistence-v1"
+if [[ "${message_contract_enabled}" == "1" ]]; then
+  namespace="synthetic-message-v1"
+else
+  namespace="synthetic-persistence-v1"
+fi
 
 temporal_command() {
   /usr/bin/env -i \
@@ -322,7 +348,7 @@ assert_sqlite_store_paths() {
   local suffix path
   for suffix in "" "-journal" "-wal" "-shm"; do
     path="${database}${suffix}"
-    if [[ -e "${path}" && -L "${path}" ]]; then
+    if [[ -L "${path}" ]]; then
       return 1
     fi
   done
@@ -368,14 +394,26 @@ start_server() {
   : >"${stderr_file}"
   # Temporal writes SQLite files, so the shared helper's output file-size
   # ulimit cannot be applied to this child. Output files are still checked on
-  # every readiness iteration and before evidence is emitted.
-  live_start_child_without_file_limit "${stdout_file}" "${stderr_file}" \
-    /usr/bin/env -i \
-    PATH=/usr/bin:/bin \
-    HOME="${home_directory}" \
-    TMPDIR="${temp_directory}" \
-    LANG=C \
-    "${temporal_binary}" "${server_args[@]}"
+  # every readiness iteration and before evidence is emitted. The message
+  # wrapper already owns the complete process group, so keep that sidecar in
+  # the current group; P0-07 retains the helper-created group.
+  if [[ "${message_contract_enabled}" == "1" ]]; then
+    live_start_child_in_current_group_without_file_limit "${stdout_file}" "${stderr_file}" \
+      /usr/bin/env -i \
+      PATH=/usr/bin:/bin \
+      HOME="${home_directory}" \
+      TMPDIR="${temp_directory}" \
+      LANG=C \
+      "${temporal_binary}" "${server_args[@]}"
+  else
+    live_start_child_without_file_limit "${stdout_file}" "${stderr_file}" \
+      /usr/bin/env -i \
+      PATH=/usr/bin:/bin \
+      HOME="${home_directory}" \
+      TMPDIR="${temp_directory}" \
+      LANG=C \
+      "${temporal_binary}" "${server_args[@]}"
+  fi
   local server_pid="${LIVE_CHILD_PID}"
 
   # A successful TCP connect is not enough: ask the Temporal service to serve
@@ -418,6 +456,90 @@ start_server_with_retry() {
   return 1
 }
 
+assert_message_output_safe() {
+  local stdout_size stderr_size
+  stdout_size="$(live_file_size "${message_stdout}")"
+  stderr_size="$(live_file_size "${message_stderr}")"
+  [[ "${stdout_size}" =~ ^[0-9]+$ && "${stderr_size}" =~ ^[0-9]+$ ]] \
+    && ((stdout_size <= MAX_CHILD_OUTPUT_BYTES && stderr_size <= MAX_CHILD_OUTPUT_BYTES)) \
+    || return 1
+  if /usr/bin/grep -Eiq \
+    '(authorization:|bearer[[:space:]]+|access[_-]?token|client[_-]?secret|password[=:])' \
+    "${message_stdout}" "${message_stderr}"; then
+    return 1
+  fi
+}
+
+run_message_contract() {
+  local message_target message_binary_candidates message_binary
+  local message_binary_sha256_before message_binary_sha256_after
+  local expected_message_binary_sha256="${NAGI_CONTRACT_TEMPORAL_MESSAGE_BINARY_SHA256:-}"
+  local message_status
+  message_target="${repo_root}/target/nagi-temporal-message-contract"
+  if ! live_validate_path_components "${message_target}" \
+    || [[ ! -d "${message_target}" || -L "${message_target}" ]]; then
+    echo "Temporal message contract could not access its dedicated Cargo target." >&2
+    return 1
+  fi
+  message_binary_candidates="$(/usr/bin/find "${message_target}/debug/deps" \
+    -type f -name 'temporal_message_contract-*' -perm -100 -links 1 -print 2>/dev/null || true)"
+  if [[ -z "${message_binary_candidates}" || "${message_binary_candidates}" == *$'\n'* \
+    || "${message_binary_candidates}" == *$'\r'* || "${message_binary_candidates}" == *$'\t'* ]]; then
+    echo "Temporal message contract did not produce exactly one test binary." >&2
+    return 1
+  fi
+  message_binary="${message_binary_candidates}"
+  if ! live_validate_path_components "${message_binary}" \
+    || [[ "${message_binary}" != "${message_target}/debug/deps/temporal_message_contract-"* ]] \
+    || [[ ! -f "${message_binary}" || -L "${message_binary}" || ! -x "${message_binary}" ]] \
+    || [[ "$(/usr/bin/stat -f '%u %Lp %l' "${message_binary}" 2>/dev/null || true)" \
+      != "$(/usr/bin/id -u) 700 1" ]] \
+    || [[ "$(/usr/bin/file -b "${message_binary}" 2>/dev/null || true)" != "${expected_file_description}" ]]; then
+    echo "Temporal message contract rejected the built test binary." >&2
+    return 1
+  fi
+  message_binary_sha256_before="$(binary_sha256 "${message_binary}")" || return 1
+  if [[ ! "${expected_message_binary_sha256}" =~ ^[0-9a-f]{64}$ ]] \
+    || [[ "${message_binary_sha256_before}" != "${expected_message_binary_sha256}" ]]; then
+    echo "Temporal message contract could not bind the test binary digest." >&2
+    return 1
+  fi
+
+  : >"${message_stdout}"
+  : >"${message_stderr}"
+  # Execute only the exact regular binary just built. The test receives a
+  # private HOME and only fixed loopback/synthetic bindings, never the build
+  # HOME or any caller environment.
+  # The outer temporal-messages wrapper owns the bounded process group for
+  # this complete sidecar/test child. Keep the sidecar's helper handles intact
+  # and cap this foreground test's files with the same 64 KiB limit.
+  if /bin/sh -c 'ulimit -f 128 || exit 125; exec "$@"' temporal-message-test \
+    /usr/bin/env -i \
+    PATH=/usr/bin:/bin \
+    HOME="${home_directory}" \
+    TMPDIR="${temp_directory}" \
+    LANG=C \
+    NAGI_TEMPORAL_MESSAGE_ADDRESS="http://127.0.0.1:${grpc_port}" \
+    NAGI_TEMPORAL_MESSAGE_NAMESPACE="${namespace}" \
+    "${message_binary}" --exact temporal_message_contract_exercises_messages \
+    >"${message_stdout}" 2>"${message_stderr}"; then
+    message_status=0
+  else
+    message_status=$?
+  fi
+  if [[ "${message_status}" -ne 0 ]]; then
+    echo "Temporal message contract test did not complete successfully." >&2
+    return 1
+  fi
+  message_binary_sha256_after="$(binary_sha256 "${message_binary}")" || return 1
+  if [[ "${message_binary_sha256_after}" != "${expected_message_binary_sha256}" ]] \
+    || [[ "${message_binary_sha256_after}" != "${message_binary_sha256_before}" ]] \
+    || ! assert_message_output_safe; then
+    echo "Temporal message contract found changed or unsafe test output." >&2
+    return 1
+  fi
+}
+
 force_kill_server() {
   local server_pid="${LIVE_CHILD_PID:-}"
   [[ -n "${server_pid}" ]] || return 1
@@ -444,7 +566,8 @@ stop_server() {
     preserve_temp=1
     return 1
   fi
-  if live_process_group_exists || ! assert_no_listeners "${server_pid}"; then
+  if live_process_group_exists || ! assert_no_listeners "${server_pid}" \
+    || ! assert_child_output_bound; then
     preserve_temp=1
     return 1
   fi
@@ -509,6 +632,20 @@ if ! temporal_command operator cluster describe \
   exit 1
 fi
 
+if [[ "${message_contract_enabled}" == "1" ]]; then
+  if ! run_message_contract; then
+    echo "Temporal message contract did not pass its bounded SDK witness." >&2
+    exit 1
+  fi
+  if ! stop_server; then
+    echo "Temporal message contract could not stop and reap the sidecar." >&2
+    exit 1
+  fi
+  if ! assert_sqlite_store_paths "${database}"; then
+    echo "Temporal message contract found an unsafe SQLite companion path." >&2
+    exit 1
+  fi
+else
 if ! temporal_command workflow start \
   --address "127.0.0.1:${grpc_port}" \
   --namespace "${namespace}" \
@@ -594,7 +731,7 @@ if ! temporal_command workflow show \
   echo "Temporal contract layer could not recover the synthetic history." >&2
   exit 1
 fi
-if ! cmp -s "${history_before}" "${history_after}" \
+if ! /usr/bin/cmp -s "${history_before}" "${history_after}" \
   || ! /usr/bin/grep -Fq '"identity": "nagi-contract-temporal-v1"' "${history_after}" \
   || /usr/bin/grep -Fq '"identity": "temporal-cli:' "${history_after}"; then
   echo "Temporal contract layer recovered a different history or unsafe identity." >&2
@@ -608,6 +745,7 @@ fi
 if ! assert_sqlite_store_paths "${database}"; then
   echo "Temporal contract layer found an unsafe SQLite companion path." >&2
   exit 1
+fi
 fi
 
 binary_sha256_after="$(binary_sha256 "${temporal_binary}")" || {
@@ -632,4 +770,9 @@ if ! cleanup; then
 fi
 
 evidence_layer=macos
-printf '%s\n' "{\"schemaVersion\":1,\"layer\":\"${evidence_layer}\",\"gate\":\"temporal\",\"result\":\"pass\",\"revision\":\"${revision}\",\"fixture\":\"synthetic.temporal-sidecar.v1\",\"versions\":{\"rust\":\"1.98.0\",\"temporalCli\":\"1.8.2\",\"temporalRustSdk\":\"0.7.0\",\"codex\":\"0.151.0\"},\"checks\":[{\"name\":\"fixture-provenance\",\"result\":\"pass\"},{\"name\":\"version-pins\",\"result\":\"pass\"},{\"name\":\"boundary\",\"result\":\"pass\"},{\"name\":\"redaction\",\"result\":\"pass\"},{\"name\":\"preflight\",\"result\":\"pass\"}]}"
+if [[ "${message_contract_enabled}" == "1" ]]; then
+  evidence_fixture="synthetic.temporal-message.v1"
+else
+  evidence_fixture="synthetic.temporal-sidecar.v1"
+fi
+printf '%s\n' "{\"schemaVersion\":1,\"layer\":\"${evidence_layer}\",\"gate\":\"temporal\",\"result\":\"pass\",\"revision\":\"${revision}\",\"fixture\":\"${evidence_fixture}\",\"versions\":{\"rust\":\"1.98.0\",\"temporalCli\":\"1.8.2\",\"temporalRustSdk\":\"0.7.0\",\"codex\":\"0.151.0\"},\"checks\":[{\"name\":\"fixture-provenance\",\"result\":\"pass\"},{\"name\":\"version-pins\",\"result\":\"pass\"},{\"name\":\"boundary\",\"result\":\"pass\"},{\"name\":\"redaction\",\"result\":\"pass\"},{\"name\":\"preflight\",\"result\":\"pass\"}]}"

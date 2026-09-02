@@ -404,6 +404,7 @@ fn tool_manifests_cross_check_declared_versions_and_backends() {
     for (tool, version) in [
         ("aqua:openai/codex", "0.151.0"),
         ("aqua:temporalio/cli", "1.8.2"),
+        ("aqua:protocolbuffers/protobuf/protoc", "36.1"),
     ] {
         assert_eq!(toml_string("mise tool", tools, tool), version);
     }
@@ -414,6 +415,11 @@ fn tool_manifests_cross_check_declared_versions_and_backends() {
     for (tool, version, backend) in [
         ("aqua:openai/codex", "0.151.0", "aqua:openai/codex"),
         ("aqua:temporalio/cli", "1.8.2", "aqua:temporalio/cli"),
+        (
+            "aqua:protocolbuffers/protobuf/protoc",
+            "36.1",
+            "aqua:protocolbuffers/protobuf/protoc",
+        ),
     ] {
         let entries = lock_tools
             .get(tool)

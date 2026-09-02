@@ -8,6 +8,14 @@ rust-version.workspace = true
 [features]
 default = []
 macos-keychain-contract = []
+temporal-message-contract = [
+    "dep:temporalio-client",
+    "dep:temporalio-common",
+    "dep:temporalio-sdk",
+    "dep:temporalio-workflow",
+    "dep:futures-util",
+    "dep:tokio",
+]
 
 [dependencies]
 base64 = "=0.22.1"
@@ -23,6 +31,19 @@ oauth2 = { version = "=5.0.0", default-features = false, features = [
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 zeroize = { version = "=1.9.0", features = ["alloc"] }
+futures-util = { version = "=0.3.34", default-features = false, features = [
+    "async-await-macro",
+], optional = true }
+temporalio-client = { version = "=0.7.0", default-features = false, optional = true }
+temporalio-common = { version = "=0.7.0", default-features = false, optional = true }
+temporalio-sdk = { version = "=0.7.0", default-features = false, optional = true }
+temporalio-workflow = { version = "=0.7.0", default-features = false, optional = true }
+tokio = { version = "=1.47.0", default-features = false, features = [
+    "macros",
+    "parking_lot",
+    "rt-multi-thread",
+    "time",
+], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "=0.10.1"
@@ -36,3 +57,8 @@ toml = "=1.1.4"
 name = "macos_keychain_contract"
 path = "tests/macos_keychain_contract.rs"
 required-features = ["macos-keychain-contract"]
+
+[[test]]
+name = "temporal_message_contract"
+path = "tests/temporal_message_contract.rs"
+required-features = ["temporal-message-contract"]
