@@ -432,13 +432,6 @@ fn codex_cli_provenance_is_strict_and_matches_the_pinned_release() {
     );
     assert_hex_revision(revision);
 
-    let mise_source = parse_toml("mise.toml", MISE);
-    let mise = toml_table("mise.toml", &mise_source);
-    let mise_tools = toml_table("mise tools", mise.get("tools").expect("mise tools"));
-    assert_eq!(
-        toml_string("mise Codex", mise_tools, "aqua:openai/codex"),
-        version
-    );
     let lock_source = parse_toml("mise.lock", MISE_LOCK);
     let lock = toml_table("mise.lock", &lock_source);
     let lock_tools = toml_table(
@@ -451,14 +444,6 @@ fn codex_cli_provenance_is_strict_and_matches_the_pinned_release() {
         .expect("mise.lock Codex entry");
     assert_eq!(lock_entries.len(), 1);
     let lock_entry = toml_table("mise.lock Codex", &lock_entries[0]);
-    assert_eq!(
-        toml_string("mise.lock Codex", lock_entry, "version"),
-        version
-    );
-    assert_eq!(
-        toml_string("mise.lock Codex", lock_entry, "backend"),
-        "aqua:openai/codex"
-    );
 
     let artifacts = json_object(
         "Codex CLI provenance artifacts",

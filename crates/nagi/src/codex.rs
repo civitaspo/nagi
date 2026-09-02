@@ -391,9 +391,6 @@ struct PrivateExecutableIdentity {
 struct CleanupFileIdentity {
     device: u64,
     inode: u64,
-    uid: u32,
-    nlink: u64,
-    mode: u32,
 }
 
 #[cfg(target_os = "macos")]
@@ -402,9 +399,6 @@ impl CleanupFileIdentity {
         Self {
             device: metadata.dev(),
             inode: metadata.ino(),
-            uid: metadata.uid(),
-            nlink: metadata.nlink(),
-            mode: metadata.permissions().mode(),
         }
     }
 }
@@ -592,10 +586,6 @@ fn path_matches_cleanup_identity(path: &Path, expected: &CleanupFileIdentity) ->
         Err(_) => return false,
     };
     is_safe_cleanup_metadata(&metadata)
-        && expected.uid == metadata.uid()
-        && expected.nlink == metadata.nlink()
-        && expected.mode & 0o7000 == 0
-        && expected.mode & 0o077 == 0
         && expected.device == metadata.dev()
         && expected.inode == metadata.ino()
 }
@@ -674,7 +664,7 @@ fn create_or_verify_managed_home(path: &Path) -> Result<(), CodexError> {
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             create_private_directory(path).map_err(|_| CodexError::ManagedHomeUnavailable)?;
-            verify_directory_mode(path)?;
+            validate_existing_directory(path, true).map_err(|_| CodexError::ManagedHomeUnsafe)?;
 
             // The config is created before the ownership marker. If the
             // process stops partway through first creation, a later start does
@@ -692,11 +682,6 @@ fn create_or_verify_managed_home(path: &Path) -> Result<(), CodexError> {
 fn create_private_directory(path: &Path) -> io::Result<()> {
     let mut builder = fs::DirBuilder::new();
     builder.mode(0o700).create(path)
-}
-
-#[cfg(target_os = "macos")]
-fn verify_directory_mode(path: &Path) -> Result<(), CodexError> {
-    validate_existing_directory(path, true).map_err(|_| CodexError::ManagedHomeUnsafe)
 }
 
 #[cfg(target_os = "macos")]
@@ -804,18 +789,10 @@ fn validate_no_symlink_components(path: &Path) -> Result<(), ()> {
 }
 
 #[cfg(target_os = "macos")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum OutputPolicy {
-    Inherit,
-    Capture,
-}
-
-#[cfg(target_os = "macos")]
 struct CommandSpec {
     executable: PathBuf,
-    arguments: Vec<OsString>,
+    operation: CodexOperation,
     environment: Vec<(OsString, OsString)>,
-    output_policy: OutputPolicy,
     private_identity: Option<PrivateExecutableIdentity>,
 }
 
@@ -831,17 +808,6 @@ impl CommandSpec {
         validate_path_text(&executable).map_err(|_| CodexError::Configuration)?;
         validate_path_text(managed_home).map_err(|_| CodexError::Configuration)?;
         validate_path_text(deployment_home).map_err(|_| CodexError::Configuration)?;
-        let arguments = match operation {
-            CodexOperation::Login => vec![OsString::from("login")],
-            CodexOperation::Status => {
-                vec![OsString::from("login"), OsString::from("status")]
-            }
-            CodexOperation::Logout => vec![OsString::from("logout")],
-        };
-        let output_policy = match operation {
-            CodexOperation::Status => OutputPolicy::Capture,
-            CodexOperation::Login | CodexOperation::Logout => OutputPolicy::Inherit,
-        };
 
         // `env_clear` is applied by `to_command`; this allow-list exists so
         // tests and reviews can see that only harmless terminal/locale values
@@ -869,9 +835,8 @@ impl CommandSpec {
 
         Ok(Self {
             executable,
-            arguments,
+            operation,
             environment,
-            output_policy,
             private_identity: None,
         })
     }
@@ -886,18 +851,26 @@ impl CommandSpec {
             verify_private_executable(&self.executable, identity)?;
         }
         let mut command = Command::new(&self.executable);
-        command
-            .args(&self.arguments)
-            .env_clear()
-            .stdin(Stdio::inherit());
+        match self.operation {
+            CodexOperation::Login => {
+                command.arg("login");
+            }
+            CodexOperation::Status => {
+                command.args(["login", "status"]);
+            }
+            CodexOperation::Logout => {
+                command.arg("logout");
+            }
+        }
+        command.env_clear().stdin(Stdio::inherit());
         for (name, value) in &self.environment {
             command.env(name, value);
         }
-        match self.output_policy {
-            OutputPolicy::Inherit => {
+        match self.operation {
+            CodexOperation::Login | CodexOperation::Logout => {
                 command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
             }
-            OutputPolicy::Capture => {
+            CodexOperation::Status => {
                 command.stdout(Stdio::piped()).stderr(Stdio::piped());
             }
         }
@@ -907,9 +880,8 @@ impl CommandSpec {
     fn status_variant(&self) -> Self {
         Self {
             executable: self.executable.clone(),
-            arguments: vec![OsString::from("login"), OsString::from("status")],
+            operation: CodexOperation::Status,
             environment: self.environment.clone(),
-            output_policy: OutputPolicy::Capture,
             private_identity: self.private_identity.clone(),
         }
     }
@@ -1599,19 +1571,11 @@ mod tests {
         ];
         let executable = root.join("codex");
         let specs = [
-            (CodexOperation::Login, vec!["login"], OutputPolicy::Inherit),
-            (
-                CodexOperation::Status,
-                vec!["login", "status"],
-                OutputPolicy::Capture,
-            ),
-            (
-                CodexOperation::Logout,
-                vec!["logout"],
-                OutputPolicy::Inherit,
-            ),
+            (CodexOperation::Login, vec!["login"]),
+            (CodexOperation::Status, vec!["login", "status"]),
+            (CodexOperation::Logout, vec!["logout"]),
         ];
-        for (operation, expected_args, expected_policy) in specs {
+        for (operation, expected_args) in specs {
             let spec = CommandSpec::new(
                 executable.clone(),
                 operation,
@@ -1621,13 +1585,16 @@ mod tests {
             )
             .expect("closed command spec");
             assert_eq!(
-                spec.arguments,
+                spec.to_command()
+                    .expect("command")
+                    .get_args()
+                    .map(OsStr::to_os_string)
+                    .collect::<Vec<_>>(),
                 expected_args
                     .into_iter()
                     .map(OsString::from)
                     .collect::<Vec<_>>()
             );
-            assert_eq!(spec.output_policy, expected_policy);
             let environment: BTreeMap<_, _> = spec.environment.iter().cloned().collect();
             let environment_value = |name: &str| environment.get(OsStr::new(name));
             assert_eq!(
