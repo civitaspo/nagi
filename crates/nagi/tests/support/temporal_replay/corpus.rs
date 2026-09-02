@@ -102,21 +102,17 @@ fn assert_path_components_are_not_symlinks(path: &Path, leaf_may_be_absent: bool
     }
 }
 
-fn assert_private_metadata(metadata: &fs::Metadata, expected_mode: u32) {
-    assert!(metadata.is_file() || metadata.is_dir());
-    assert!(!metadata.file_type().is_symlink());
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        assert_eq!(metadata.uid(), current_uid());
-        if metadata.is_file() {
-            assert_eq!(metadata.nlink(), 1);
-        }
-        assert_eq!(metadata.permissions().mode() & 0o777, expected_mode);
-    }
+#[derive(Clone, Copy)]
+enum CorpusMetadataPolicy {
+    ExactPrivate,
+    CheckedCheckout,
 }
 
-fn assert_checked_metadata(metadata: &fs::Metadata, expected_mode: u32) {
+fn assert_corpus_metadata(
+    metadata: &fs::Metadata,
+    expected_mode: u32,
+    policy: CorpusMetadataPolicy,
+) {
     assert!(metadata.is_file() || metadata.is_dir());
     assert!(!metadata.file_type().is_symlink());
     #[cfg(unix)]
@@ -127,11 +123,17 @@ fn assert_checked_metadata(metadata: &fs::Metadata, expected_mode: u32) {
             assert_eq!(metadata.nlink(), 1);
         }
         let mode = metadata.permissions().mode() & 0o777;
-        // Git checkouts cannot represent 0600/0700 exactly: the checked
-        // corpus is therefore accepted with repository read bits, but never
-        // with group/other write bits or with weaker owner permissions.
-        assert_eq!(mode & 0o700, expected_mode);
-        assert_eq!(mode & 0o022, 0);
+        match policy {
+            CorpusMetadataPolicy::ExactPrivate => assert_eq!(mode, expected_mode),
+            CorpusMetadataPolicy::CheckedCheckout => {
+                // Git checkouts cannot represent 0600/0700 exactly: the
+                // checked corpus is therefore accepted with repository read
+                // bits, but never with group/other write bits or with weaker
+                // owner permissions.
+                assert_eq!(mode & 0o700, expected_mode);
+                assert_eq!(mode & 0o022, 0);
+            }
+        }
     }
 }
 
@@ -152,7 +154,7 @@ fn ensure_private_directory(path: &Path) {
     }
     fs::set_permissions(path, permissions).expect("set private corpus directory mode");
     let metadata = fs::symlink_metadata(path).expect("restat private corpus directory");
-    assert_private_metadata(&metadata, 0o700);
+    assert_corpus_metadata(&metadata, 0o700, CorpusMetadataPolicy::ExactPrivate);
 }
 
 fn write_private_file(path: &Path, bytes: &[u8]) {
@@ -186,10 +188,10 @@ fn write_private_file(path: &Path, bytes: &[u8]) {
     file.flush().expect("flush private corpus file");
     file.sync_all().expect("sync private corpus file");
     let metadata = file.metadata().expect("restat opened corpus file");
-    assert_private_metadata(&metadata, 0o600);
+    assert_corpus_metadata(&metadata, 0o600, CorpusMetadataPolicy::ExactPrivate);
 }
 
-fn bounded_file_bytes(path: &Path, checked_corpus: bool) -> Vec<u8> {
+fn bounded_file_bytes(path: &Path, metadata_policy: CorpusMetadataPolicy) -> Vec<u8> {
     // The final path component is opened with O_NOFOLLOW on Unix. The
     // component walk above remains a preflight check only: a same-UID actor
     // can replace a parent component after that check, so this helper does
@@ -203,11 +205,7 @@ fn bounded_file_bytes(path: &Path, checked_corpus: bool) -> Vec<u8> {
     }
     let mut file = options.open(path).expect("open bounded corpus file");
     let before = file.metadata().expect("stat opened bounded corpus file");
-    if checked_corpus {
-        assert_checked_metadata(&before, 0o600);
-    } else {
-        assert_private_metadata(&before, 0o600);
-    }
+    assert_corpus_metadata(&before, 0o600, metadata_policy);
     assert!(before.len() <= MAX_CORPUS_FILE_BYTES as u64);
     let mut bytes = Vec::new();
     Read::by_ref(&mut file)
@@ -216,11 +214,7 @@ fn bounded_file_bytes(path: &Path, checked_corpus: bool) -> Vec<u8> {
         .expect("read bounded corpus file");
     assert!(bytes.len() <= MAX_CORPUS_FILE_BYTES);
     let after = file.metadata().expect("restat opened bounded corpus file");
-    if checked_corpus {
-        assert_checked_metadata(&after, 0o600);
-    } else {
-        assert_private_metadata(&after, 0o600);
-    }
+    assert_corpus_metadata(&after, 0o600, metadata_policy);
     assert_eq!(before.len(), after.len());
     bytes
 }
@@ -279,13 +273,13 @@ fn expected_history_names() -> BTreeSet<String> {
 
 fn validate_private_corpus_directory(directory: &Path) -> BTreeMap<String, Vec<u8>> {
     assert_path_components_are_not_symlinks(directory, false);
-    let checked_corpus = directory == checked_corpus_directory();
-    let metadata = fs::symlink_metadata(directory).expect("stat replay corpus");
-    if checked_corpus {
-        assert_checked_metadata(&metadata, 0o700);
+    let metadata_policy = if directory == checked_corpus_directory() {
+        CorpusMetadataPolicy::CheckedCheckout
     } else {
-        assert_private_metadata(&metadata, 0o700);
-    }
+        CorpusMetadataPolicy::ExactPrivate
+    };
+    let metadata = fs::symlink_metadata(directory).expect("stat replay corpus");
+    assert_corpus_metadata(&metadata, 0o700, metadata_policy);
     let expected_names = expected_history_names();
     let mut names = BTreeSet::new();
     let mut total_bytes = 0usize;
@@ -298,7 +292,7 @@ fn validate_private_corpus_directory(directory: &Path) -> BTreeMap<String, Vec<u
             .expect("corpus file names must be UTF-8");
         assert!(name == MANIFEST_FILE || expected_names.contains(&name));
         assert!(names.insert(name.clone()), "duplicate corpus file name");
-        let bytes = bounded_file_bytes(&entry.path(), checked_corpus);
+        let bytes = bounded_file_bytes(&entry.path(), metadata_policy);
         total_bytes = total_bytes
             .checked_add(bytes.len())
             .expect("corpus size overflow");

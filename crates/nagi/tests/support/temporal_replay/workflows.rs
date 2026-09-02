@@ -159,6 +159,12 @@ pub(crate) struct RunChain {
     pub(crate) history_b: WorkflowHistory,
 }
 
+struct ChainExpectation {
+    workflow_id: &'static str,
+    carried_state: &'static str,
+    patch_active: bool,
+}
+
 fn bounded_rpc_options() -> RpcOptions {
     RpcOptions::builder()
         .timeout(Duration::from_secs(5))
@@ -453,6 +459,75 @@ pub(crate) fn assert_chain(
     );
 }
 
+async fn complete_chain<W>(
+    client: &Client,
+    namespace: &str,
+    handle: WorkflowHandle<Client, W>,
+    shutdown: impl Fn(),
+    worker_task: tokio::task::JoinHandle<Result<(), temporalio_sdk::WorkerRunError>>,
+    expectation: ChainExpectation,
+) -> RunChain
+where
+    W: temporalio_workflow::common::HasWorkflowDefinition<Output = ReplayResult>,
+{
+    let run_a = handle.run_id().expect("run A ID").to_owned();
+    let result_a = tokio::time::timeout(
+        Duration::from_secs(20),
+        handle.get_result(
+            WorkflowGetResultOptions::builder()
+                .follow_runs(false)
+                .rpc_options(bounded_rpc_options())
+                .build(),
+        ),
+    )
+    .await
+    .expect("run A result deadline");
+    assert!(matches!(
+        result_a,
+        Err(WorkflowGetResultError::ContinuedAsNew)
+    ));
+    let history_a = fetch_exact_history(&handle).await;
+    let run_b = continue_as_new_run_id(&history_a);
+    let continued: WorkflowHandle<Client, W> = WorkflowHandle::new(
+        client.clone(),
+        WorkflowExecutionInfo {
+            namespace: namespace.to_owned(),
+            workflow_id: expectation.workflow_id.to_owned(),
+            run_id: Some(run_b.clone()),
+            first_execution_run_id: Some(run_a.clone()),
+        },
+    );
+    let result_b = tokio::time::timeout(
+        Duration::from_secs(20),
+        continued.get_result(
+            WorkflowGetResultOptions::builder()
+                .follow_runs(false)
+                .rpc_options(bounded_rpc_options())
+                .build(),
+        ),
+    )
+    .await
+    .expect("run B result deadline")
+    .expect("run B should complete");
+    assert_eq!(result_b.carried_state, expectation.carried_state);
+    assert_eq!(result_b.patch_active, expectation.patch_active);
+    assert_eq!(result_b.build_id, SANITIZED_BUILD_ID);
+    let history_b = fetch_exact_history(&continued).await;
+    shutdown();
+    tokio::time::timeout(Duration::from_secs(10), worker_task)
+        .await
+        .expect("worker shutdown deadline")
+        .expect("worker task join")
+        .expect("worker shutdown");
+    RunChain {
+        workflow_id: expectation.workflow_id,
+        run_a,
+        run_b,
+        history_a,
+        history_b,
+    }
+}
+
 pub(crate) async fn run_legacy_chain(
     client: &Client,
     namespace: &str,
@@ -489,62 +564,19 @@ pub(crate) async fn run_legacy_chain(
         )
         .await
         .expect("start legacy replay workflow");
-    let run_a = handle.run_id().expect("legacy run A ID").to_owned();
-    let result_a = tokio::time::timeout(
-        Duration::from_secs(20),
-        handle.get_result(
-            WorkflowGetResultOptions::builder()
-                .follow_runs(false)
-                .rpc_options(bounded_rpc_options())
-                .build(),
-        ),
-    )
-    .await
-    .expect("legacy run A result deadline");
-    assert!(matches!(
-        result_a,
-        Err(WorkflowGetResultError::ContinuedAsNew)
-    ));
-    let history_a = fetch_exact_history(&handle).await;
-    let run_b = continue_as_new_run_id(&history_a);
-    let continued: WorkflowHandle<Client, legacy_replay_workflow::Run> = WorkflowHandle::new(
-        client.clone(),
-        WorkflowExecutionInfo {
-            namespace: namespace.to_owned(),
-            workflow_id: LEGACY_WORKFLOW_ID.to_owned(),
-            run_id: Some(run_b.clone()),
-            first_execution_run_id: Some(run_a.clone()),
+    complete_chain(
+        client,
+        namespace,
+        handle,
+        shutdown,
+        worker_task,
+        ChainExpectation {
+            workflow_id: LEGACY_WORKFLOW_ID,
+            carried_state: "synthetic:legacy",
+            patch_active: false,
         },
-    );
-    let result_b = tokio::time::timeout(
-        Duration::from_secs(20),
-        continued.get_result(
-            WorkflowGetResultOptions::builder()
-                .follow_runs(false)
-                .rpc_options(bounded_rpc_options())
-                .build(),
-        ),
     )
     .await
-    .expect("legacy run B result deadline")
-    .expect("legacy run B should complete");
-    assert_eq!(result_b.carried_state, "synthetic:legacy");
-    assert!(!result_b.patch_active);
-    assert_eq!(result_b.build_id, SANITIZED_BUILD_ID);
-    let history_b = fetch_exact_history(&continued).await;
-    shutdown();
-    tokio::time::timeout(Duration::from_secs(10), worker_task)
-        .await
-        .expect("legacy worker shutdown deadline")
-        .expect("legacy worker task join")
-        .expect("legacy worker shutdown");
-    RunChain {
-        workflow_id: LEGACY_WORKFLOW_ID,
-        run_a,
-        run_b,
-        history_a,
-        history_b,
-    }
 }
 
 pub(crate) async fn run_current_chain(
@@ -582,60 +614,17 @@ pub(crate) async fn run_current_chain(
         )
         .await
         .expect("start current replay workflow");
-    let run_a = handle.run_id().expect("current run A ID").to_owned();
-    let result_a = tokio::time::timeout(
-        Duration::from_secs(20),
-        handle.get_result(
-            WorkflowGetResultOptions::builder()
-                .follow_runs(false)
-                .rpc_options(bounded_rpc_options())
-                .build(),
-        ),
-    )
-    .await
-    .expect("current run A result deadline");
-    assert!(matches!(
-        result_a,
-        Err(WorkflowGetResultError::ContinuedAsNew)
-    ));
-    let history_a = fetch_exact_history(&handle).await;
-    let run_b = continue_as_new_run_id(&history_a);
-    let continued: WorkflowHandle<Client, replay_compatibility_workflow::Run> = WorkflowHandle::new(
-        client.clone(),
-        WorkflowExecutionInfo {
-            namespace: namespace.to_owned(),
-            workflow_id: CURRENT_WORKFLOW_ID.to_owned(),
-            run_id: Some(run_b.clone()),
-            first_execution_run_id: Some(run_a.clone()),
+    complete_chain(
+        client,
+        namespace,
+        handle,
+        shutdown,
+        worker_task,
+        ChainExpectation {
+            workflow_id: CURRENT_WORKFLOW_ID,
+            carried_state: "synthetic:current",
+            patch_active: true,
         },
-    );
-    let result_b = tokio::time::timeout(
-        Duration::from_secs(20),
-        continued.get_result(
-            WorkflowGetResultOptions::builder()
-                .follow_runs(false)
-                .rpc_options(bounded_rpc_options())
-                .build(),
-        ),
     )
     .await
-    .expect("current run B result deadline")
-    .expect("current run B should complete");
-    assert_eq!(result_b.carried_state, "synthetic:current");
-    assert!(result_b.patch_active);
-    assert_eq!(result_b.build_id, SANITIZED_BUILD_ID);
-    let history_b = fetch_exact_history(&continued).await;
-    shutdown();
-    tokio::time::timeout(Duration::from_secs(10), worker_task)
-        .await
-        .expect("current worker shutdown deadline")
-        .expect("current worker task join")
-        .expect("current worker shutdown");
-    RunChain {
-        workflow_id: CURRENT_WORKFLOW_ID,
-        run_a,
-        run_b,
-        history_a,
-        history_b,
-    }
 }
