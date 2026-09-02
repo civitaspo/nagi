@@ -60,6 +60,15 @@ fn temporal_contract_has_stable_boundary_invariants() {
     assert!(TEMPORAL_SCRIPT.contains("Mach-O"));
     assert!(TEMPORAL_SCRIPT.contains("assert_loopback_listeners"));
     assert!(TEMPORAL_SCRIPT.contains("assert_sqlite_store_paths"));
+    assert!(TEMPORAL_SCRIPT.contains("temporal_binary_source"));
+    assert!(TEMPORAL_SCRIPT.contains("/bin/cp -p"));
+    assert!(TEMPORAL_SCRIPT.contains("/bin/chmod 500"));
+    assert!(TEMPORAL_SCRIPT.contains("'%u %Lp %l'"));
+    assert!(TEMPORAL_SCRIPT.contains("${current_uid} 500 1"));
+    assert!(
+        !TEMPORAL_SCRIPT
+            .contains(r#""${temporal_binary_source}" --disable-config-env --disable-config-file"#)
+    );
 
     // The contract must not silently use the default public-facing ports or a
     // caller-selected endpoint. Ports are selected per run and every listener
@@ -123,12 +132,16 @@ fn temporal_cli_provenance_is_architecture_specific_and_public() {
     let digest_guard = TEMPORAL_SCRIPT
         .find(r#"[[ "${binary_sha256_before}" != "${expected_binary_sha256}" ]]"#)
         .expect("Temporal contract must reject an unexpected executable digest");
+    let private_copy = TEMPORAL_SCRIPT
+        .find(r#"/bin/cp -p "${temporal_binary_source}" "${temporal_binary}""#)
+        .expect("Temporal contract must copy the resolved executable into its private store");
     let version_query = TEMPORAL_SCRIPT
         .find(r#""${temporal_binary}" --disable-config-env --disable-config-file --version"#)
         .expect("Temporal contract must query the executable version");
     let server_start = TEMPORAL_SCRIPT
         .find("start_server_with_retry yes")
         .expect("Temporal contract must start the sidecar after provenance checks");
+    assert!(private_copy < digest_guard);
     assert!(digest_guard < version_query);
     assert!(version_query < server_start);
     assert!(digest_guard < server_start);

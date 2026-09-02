@@ -31,31 +31,25 @@ fi
 
 # Selecting the explicit Aqua tool name makes the lockfile, rather than the
 # caller's PATH or an alias named temporal, the source of the sidecar binary.
-if ! temporal_binary="$("${mise_path}" which temporal \
+if ! temporal_binary_source="$("${mise_path}" which temporal \
   --tool aqua:temporalio/cli@1.8.2 --locked --quiet 2>/dev/null)"; then
   echo "Temporal contract layer could not resolve the locked Temporal CLI." >&2
   exit 1
 fi
-if [[ "${temporal_binary}" != /* || "${temporal_binary}" == *$'\n'* \
-  || "${temporal_binary}" == *$'\r'* || "${temporal_binary}" == *$'\t'* \
-  || "${temporal_binary##*/}" != "temporal" ]] \
-  || ! live_trusted_executable "${temporal_binary}"; then
+if [[ "${temporal_binary_source}" != /* || "${temporal_binary_source}" == *$'\n'* \
+  || "${temporal_binary_source}" == *$'\r'* || "${temporal_binary_source}" == *$'\t'* \
+  || "${temporal_binary_source##*/}" != "temporal" ]] \
+  || ! live_trusted_executable "${temporal_binary_source}"; then
   echo "Temporal contract layer rejected the resolved Temporal CLI." >&2
   exit 1
 fi
-case "${temporal_binary}" in
+case "${temporal_binary_source}" in
   *.app|*.app/*|*/Contents|*/Contents/*)
     echo "Temporal contract layer rejected an app-like Temporal executable." >&2
     exit 1
     ;;
 esac
 
-expected_file_prefix="Mach-O"
-file_description="$(/usr/bin/file -b "${temporal_binary}" 2>/dev/null || true)"
-if [[ "${file_description}" != "${expected_file_prefix}"* ]]; then
-  echo "Temporal contract layer found a non-native Temporal CLI executable." >&2
-  exit 1
-fi
 
 binary_sha256() {
   local digest
@@ -70,10 +64,6 @@ binary_sha256() {
   printf '%s\n' "${digest}"
 }
 
-binary_sha256_before="$(binary_sha256 "${temporal_binary}")" || {
-  echo "Temporal contract layer could not bind the Temporal CLI digest." >&2
-  exit 1
-}
 
 if [[ ! -x /usr/sbin/lsof && ! -x /usr/bin/lsof ]]; then
   echo "Temporal contract layer requires lsof to verify loopback listeners." >&2
@@ -182,20 +172,6 @@ if [[ "${lock_archive_sha256}" != "${expected_archive_sha256}" ]] \
   echo "Temporal contract layer rejected its locked Temporal archive provenance." >&2
   exit 1
 fi
-if [[ "${file_description}" != "${expected_file_description}" ]] \
-  || [[ "${binary_sha256_before}" != "${expected_binary_sha256}" ]]; then
-  echo "Temporal contract layer rejected the Temporal CLI provenance." >&2
-  exit 1
-fi
-if ! version_output="$(/usr/bin/env -i PATH=/usr/bin:/bin HOME=/ TMPDIR=/tmp LANG=C \
-  "${temporal_binary}" --disable-config-env --disable-config-file --version 2>/dev/null)"; then
-  echo "Temporal contract layer could not query the Temporal CLI version." >&2
-  exit 1
-fi
-if [[ "${version_output}" != "${expected_version_output}" ]]; then
-  echo "Temporal contract layer found an unexpected Temporal CLI version." >&2
-  exit 1
-fi
 
 umask 077
 raw_contract_tmp="$(/usr/bin/mktemp -d /tmp/nagi-temporal-contract.XXXXXX)"
@@ -260,6 +236,48 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 143' HUP INT TERM
+
+# The mise-selected pathname is used only as a copy source. All Temporal
+# execution and digest reads below use this fixed private copy, so a source
+# pathname replacement after this point cannot change the executable.
+temporal_binary="${contract_tmp}/temporal"
+if ! /bin/cp -p "${temporal_binary_source}" "${temporal_binary}" 2>/dev/null \
+  || ! /bin/chmod 500 "${temporal_binary}" 2>/dev/null; then
+  echo "Temporal contract layer could not copy the locked Temporal CLI." >&2
+  exit 1
+fi
+current_uid="$(/usr/bin/id -u 2>/dev/null || true)"
+destination_metadata="$(/usr/bin/stat -f '%u %Lp %l' "${temporal_binary}" 2>/dev/null || true)"
+if [[ ! "${current_uid}" =~ ^[0-9]+$ ]] \
+  || ! live_validate_path_components "${temporal_binary}" \
+  || [[ ! -f "${temporal_binary}" || -L "${temporal_binary}" || ! -x "${temporal_binary}" ]] \
+  || [[ "${destination_metadata}" != "${current_uid} 500 1" ]]; then
+  echo "Temporal contract layer rejected its private Temporal CLI copy." >&2
+  exit 1
+fi
+expected_file_prefix="Mach-O"
+file_description="$(/usr/bin/file -b "${temporal_binary}" 2>/dev/null || true)"
+binary_sha256_before="$(binary_sha256 "${temporal_binary}")" || {
+  echo "Temporal contract layer could not bind the private Temporal CLI digest." >&2
+  exit 1
+}
+if [[ "${file_description}" != "${expected_file_description}" ]] \
+  || [[ "${file_description}" != "${expected_file_prefix}"* ]] \
+  || [[ "${binary_sha256_before}" != "${expected_binary_sha256}" ]]; then
+  echo "Temporal contract layer rejected the private Temporal CLI provenance." >&2
+  exit 1
+fi
+unset temporal_binary_source
+
+if ! version_output="$(/usr/bin/env -i PATH=/usr/bin:/bin HOME=/ TMPDIR=/tmp LANG=C \
+  "${temporal_binary}" --disable-config-env --disable-config-file --version 2>/dev/null)"; then
+  echo "Temporal contract layer could not query the Temporal CLI version." >&2
+  exit 1
+fi
+if [[ "${version_output}" != "${expected_version_output}" ]]; then
+  echo "Temporal contract layer found an unexpected Temporal CLI version." >&2
+  exit 1
+fi
 
 workflow_id="nagi-contract-persistence-v1"
 workflow_type="NagiContractPersistenceV1"
