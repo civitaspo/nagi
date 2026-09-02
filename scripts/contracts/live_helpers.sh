@@ -352,12 +352,16 @@ live_cleanup_child_group() {
 }
 
 live_child_running() {
+  (($# == 1)) || return 1
   local pid="$1"
+  [[ "${pid}" =~ ^[0-9]+$ ]] || return 1
   local jobs_output
   jobs_output="$(jobs -pr 2>/dev/null || true)"
-  case " ${jobs_output} " in
-    *" ${pid} "*) return 0 ;;
-  esac
+  while IFS= read -r job_pid; do
+    if [[ "${job_pid}" == "${pid}" ]]; then
+      return 0
+    fi
+  done <<<"${jobs_output}"
   return 1
 }
 
@@ -592,6 +596,22 @@ if [[ "${BASH_SOURCE[0]:-}" == "$0" ]]; then
       exit 1
     fi
   done
+
+  # `jobs -pr` emits one PID per line. Stub the builtin with a deterministic
+  # multiline fixture so this regression proves exact membership without
+  # relying on background-job scheduling.
+  # shellcheck disable=SC2329
+  jobs() {
+    [[ "$#" -eq 1 && "$1" == "-pr" ]] || return 1
+    printf '%s\n' 10001 20002 30003
+  }
+  if ! live_child_running 20002 || ! live_child_running 30003; then
+    exit 1
+  fi
+  if live_child_running 2000 || live_child_running 300030; then
+    exit 1
+  fi
+  unset -f jobs
 
   /bin/cp "${expected_pass}" "${stdout_file}"
   : >"${stderr_file}"
