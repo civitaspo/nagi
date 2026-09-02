@@ -462,9 +462,12 @@ async fn temporal_message_contract_exercises_messages() {
             assert_eq!(result, 7);
 
             // A closed workflow ID cannot be reused, even when a Signal-With-Start
-            // request asks to use an existing running execution. The explicit
-            // AlreadyStarted error proves that no new run or start-signal mutation
-            // was created after completion.
+            // request asks to use an existing running execution. In temporalio-client
+            // 0.7.0, the ordinary StartWorkflowExecution path maps AlreadyExists to
+            // WorkflowStartError::AlreadyStarted, but the Signal-With-Start path
+            // preserves the gRPC status as WorkflowStartError::Rpc. Match that
+            // specific status to prove that no new run or start-signal mutation was
+            // created after completion.
             let closed_retry = client
                 .start_workflow(
                     MessageWorkflow::run,
@@ -478,8 +481,12 @@ async fn temporal_message_contract_exercises_messages() {
                 )
                 .await;
             assert!(
-                matches!(closed_retry, Err(WorkflowStartError::AlreadyStarted { .. })),
-                "closed Signal-With-Start retry must return AlreadyStarted"
+                matches!(
+                    closed_retry,
+                    Err(WorkflowStartError::Rpc(status))
+                        if status.code() == temporalio_client::tonic::Code::AlreadyExists
+                ),
+                "closed Signal-With-Start retry must return Rpc(AlreadyExists)"
             );
             assert_eq!(
                 query_state(&handle)

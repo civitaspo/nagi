@@ -88,7 +88,9 @@ fn temporal_message_contract_uses_full_signal_payload_and_one_state_query() {
         "wait_for_state(&handle, (1, 1, 0, 2, 0, false)).await",
         "WorkflowIdConflictPolicy::UseExisting",
         "WorkflowIdReusePolicy::RejectDuplicate",
-        "WorkflowStartError::AlreadyStarted",
+        "WorkflowStartError::Rpc(status)",
+        "status.code() == temporalio_client::tonic::Code::AlreadyExists",
+        "ordinary StartWorkflowExecution path maps AlreadyExists",
         "closed_retry",
         "no new run or start-signal mutation",
     ] {

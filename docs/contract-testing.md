@@ -110,9 +110,12 @@ signal payload, rejects any changed payload field for an existing logical ID,
 and queries the workflow state to prove the resend reached the Workflow before
 deduplication. Every Signal-With-Start request explicitly combines `UseExisting`
 for a running execution with `RejectDuplicate` for a closed execution. After
-the synthetic Workflow completes, a same-ID retry must return the SDK's
-`AlreadyStarted` error and leave the queried state unchanged. The SDK and protoc
-are build-only contract dependencies; the
+the synthetic Workflow completes, a same-ID retry must return
+`WorkflowStartError::Rpc` carrying `tonic::Code::AlreadyExists` and leave the
+queried state unchanged. This exact status match is intentional: in
+temporalio-client 0.7.0, the ordinary `StartWorkflowExecution` path maps
+`AlreadyExists` to `AlreadyStarted`, while the Signal-With-Start path preserves
+the gRPC status. The SDK and protoc are build-only contract dependencies; the
 standalone `nagi` binary and production runtime do not include this harness.
 No app bundle, provisioning profile, or signing identity is required.
 
