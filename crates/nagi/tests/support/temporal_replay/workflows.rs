@@ -1,10 +1,14 @@
+#[cfg(target_os = "macos")]
 use std::time::Duration;
 
+#[cfg(target_os = "macos")]
 use sha2::{Digest, Sha256};
+use temporalio_client::WorkflowHistory;
+#[cfg(target_os = "macos")]
 use temporalio_client::{
     Client, ClientOptions, Connection, ConnectionOptions, RetryOptions, RpcOptions, Url,
     WorkflowExecutionInfo, WorkflowFetchHistoryOptions, WorkflowGetResultOptions, WorkflowHandle,
-    WorkflowHistory, WorkflowStartOptions, errors::WorkflowGetResultError,
+    WorkflowStartOptions, errors::WorkflowGetResultError,
 };
 use temporalio_common::{
     protos::temporal::api::history::v1::{
@@ -12,21 +16,24 @@ use temporalio_common::{
         history_event::Attributes,
     },
     protos::{
-        PATCHED_MARKER_DETAILS_KEY,
-        constants::PATCH_MARKER_NAME,
+        PATCHED_MARKER_DETAILS_KEY, constants::PATCH_MARKER_NAME,
         coresdk::common::decode_change_marker_details,
-        temporal::api::{
-            enums::v1::{
-                ContinueAsNewInitiator, TaskQueueKind, TaskQueueType, WorkerVersioningMode,
-            },
-            taskqueue::v1::TaskQueue,
-            workflowservice::v1::DescribeTaskQueueRequest,
-        },
+        temporal::api::enums::v1::ContinueAsNewInitiator,
+    },
+};
+#[cfg(target_os = "macos")]
+use temporalio_common::{
+    protos::temporal::api::{
+        enums::v1::{TaskQueueKind, TaskQueueType, WorkerVersioningMode},
+        taskqueue::v1::TaskQueue,
+        workflowservice::v1::DescribeTaskQueueRequest,
     },
     worker::WorkerDeploymentOptions,
 };
+#[cfg(target_os = "macos")]
+use temporalio_sdk::{Runtime, Worker, WorkerOptions};
 use temporalio_sdk::{
-    Runtime, Worker, WorkerOptions, WorkflowContext, WorkflowResult,
+    WorkflowContext, WorkflowResult,
     workflows::{workflow, workflow_methods},
 };
 
@@ -35,6 +42,7 @@ use super::*;
 #[path = "replay.rs"]
 pub(crate) mod replay;
 
+#[cfg(target_os = "macos")]
 pub(crate) fn workflow_build_id() -> String {
     let digest = Sha256::digest(include_bytes!("workflows.rs"));
     let mut encoded = String::with_capacity(64);
@@ -150,6 +158,7 @@ impl MismatchedPatchReplayWorkflow {
     }
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Clone, Debug)]
 pub(crate) struct RunChain {
     pub(crate) workflow_id: &'static str,
@@ -159,12 +168,14 @@ pub(crate) struct RunChain {
     pub(crate) history_b: WorkflowHistory,
 }
 
+#[cfg(target_os = "macos")]
 struct ChainExpectation {
     workflow_id: &'static str,
     carried_state: &'static str,
     patch_active: bool,
 }
 
+#[cfg(target_os = "macos")]
 fn bounded_rpc_options() -> RpcOptions {
     RpcOptions::builder()
         .timeout(Duration::from_secs(5))
@@ -172,10 +183,12 @@ fn bounded_rpc_options() -> RpcOptions {
         .build()
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) fn required_env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("{name} must be supplied by the contract task"))
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) fn parse_loopback_address(value: &str) -> Option<Url> {
     let url = Url::parse(value).ok()?;
     let port = url.port()?;
@@ -204,6 +217,7 @@ pub(crate) fn valid_run_id(value: &str) -> bool {
         })
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) async fn connect_client() -> (Client, String) {
     let address = parse_loopback_address(&required_env(ADDRESS_ENV))
         .expect("contract task must supply the exact IPv4 loopback URL");
@@ -223,6 +237,7 @@ pub(crate) async fn connect_client() -> (Client, String) {
 }
 
 #[allow(deprecated)]
+#[cfg(target_os = "macos")]
 pub(crate) async fn assert_worker_pollers(
     client: &Client,
     namespace: &str,
@@ -277,6 +292,7 @@ pub(crate) async fn assert_worker_pollers(
     }
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) async fn fetch_exact_history<W>(handle: &WorkflowHandle<Client, W>) -> WorkflowHistory
 where
     W: temporalio_workflow::common::HasWorkflowDefinition,
@@ -412,6 +428,7 @@ pub(crate) fn patch_markers(history: &WorkflowHistory) -> Vec<(String, bool)> {
         .collect()
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) fn assert_chain(
     chain: &RunChain,
     expected_first_run_id: &str,
@@ -459,6 +476,7 @@ pub(crate) fn assert_chain(
     );
 }
 
+#[cfg(target_os = "macos")]
 async fn complete_chain<W>(
     client: &Client,
     namespace: &str,
@@ -528,6 +546,7 @@ where
     }
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) async fn run_legacy_chain(
     client: &Client,
     namespace: &str,
@@ -579,6 +598,7 @@ pub(crate) async fn run_legacy_chain(
     .await
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) async fn run_current_chain(
     client: &Client,
     namespace: &str,

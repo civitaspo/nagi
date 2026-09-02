@@ -1,11 +1,16 @@
+#[cfg(target_os = "macos")]
 pub(crate) const ADDRESS_ENV: &str = "NAGI_TEMPORAL_REPLAY_ADDRESS";
+#[cfg(target_os = "macos")]
 pub(crate) const NAMESPACE_ENV: &str = "NAGI_TEMPORAL_REPLAY_NAMESPACE";
+#[cfg(target_os = "macos")]
 pub(crate) const CORPUS_DIR_ENV: &str = "NAGI_TEMPORAL_REPLAY_CORPUS_DIR";
+#[cfg(target_os = "macos")]
 pub(crate) const PHASE_ENV: &str = "NAGI_TEMPORAL_REPLAY_PHASE";
 pub(crate) const PRODUCER_REVISION_ENV: &str = "NAGI_TEMPORAL_REPLAY_PRODUCER_REVISION";
 pub(crate) const TEST_BINARY_SHA256_ENV: &str = "NAGI_TEMPORAL_REPLAY_TEST_BINARY_SHA256";
 pub(crate) const TEMPORAL_CLI_SHA256_ENV: &str = "NAGI_TEMPORAL_REPLAY_TEMPORAL_CLI_SHA256";
 pub(crate) const TEMPORAL_CLI_VERSION_ENV: &str = "NAGI_TEMPORAL_REPLAY_TEMPORAL_CLI_VERSION";
+#[cfg(target_os = "macos")]
 pub(crate) const BOOTSTRAP_DIR_ENV: &str = "NAGI_TEMPORAL_REPLAY_BOOTSTRAP_DIR";
 pub(crate) const TEMPORAL_CLI_PLATFORM_ENV: &str = "NAGI_TEMPORAL_REPLAY_TEMPORAL_CLI_PLATFORM";
 pub(crate) const TEMPORAL_CLI_PROVENANCE: &str = include_str!(concat!(
@@ -13,11 +18,15 @@ pub(crate) const TEMPORAL_CLI_PROVENANCE: &str = include_str!(concat!(
     "/../../contracts/temporal-cli-provenance.json"
 ));
 
+#[cfg(target_os = "macos")]
 pub(crate) const CLIENT_IDENTITY: &str = "nagi-contract-replay-client-v1";
+#[cfg(target_os = "macos")]
 pub(crate) const WORKER_IDENTITY: &str = "nagi-contract-replay-worker-v1";
 pub(crate) const WORKFLOW_TYPE: &str = "ReplayCompatibilityWorkflow";
 pub(crate) const TASK_QUEUE: &str = "nagi-contract-replay-v1";
+#[cfg(target_os = "macos")]
 pub(crate) const LEGACY_WORKFLOW_ID: &str = "nagi-contract-replay-legacy-v1";
+#[cfg(target_os = "macos")]
 pub(crate) const CURRENT_WORKFLOW_ID: &str = "nagi-contract-replay-current-v1";
 pub(crate) const PATCH_ID: &str = "nagi-replay-patch-v1";
 pub(crate) const MISMATCHED_PATCH_ID: &str = "nagi-replay-patch-mismatched-v1";
@@ -68,8 +77,11 @@ mod corpus;
 mod sanitizer;
 mod workflows;
 
-pub(crate) use corpus::{checked_corpus_directory, export_corpus};
+pub(crate) use corpus::checked_corpus_directory;
+#[cfg(target_os = "macos")]
+pub(crate) use corpus::export_corpus;
 pub(crate) use workflows::replay::replay_private_corpus;
+#[cfg(target_os = "macos")]
 pub(crate) use workflows::{
     assert_chain, connect_client, required_env, run_current_chain, run_legacy_chain,
 };

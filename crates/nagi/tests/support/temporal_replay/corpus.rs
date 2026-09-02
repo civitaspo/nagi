@@ -2,14 +2,20 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
     fs::{self, OpenOptions},
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
 };
+
+#[cfg(target_os = "macos")]
+use std::io::Write;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::sanitizer::{assert_history_json_sanitized_with_build_id, sanitized_history};
+use super::sanitizer::assert_history_json_sanitized_with_build_id;
+#[cfg(target_os = "macos")]
+use super::sanitizer::sanitized_history;
+#[cfg(target_os = "macos")]
 use super::workflows::{RunChain, workflow_build_id};
 use super::*;
 
@@ -137,6 +143,7 @@ fn assert_corpus_metadata(
     }
 }
 
+#[cfg(target_os = "macos")]
 fn ensure_private_directory(path: &Path) {
     assert_path_components_are_not_symlinks(path, true);
     assert!(
@@ -157,6 +164,7 @@ fn ensure_private_directory(path: &Path) {
     assert_corpus_metadata(&metadata, 0o700, CorpusMetadataPolicy::ExactPrivate);
 }
 
+#[cfg(target_os = "macos")]
 fn write_private_file(path: &Path, bytes: &[u8]) {
     assert!(bytes.len() <= MAX_CORPUS_FILE_BYTES);
     let parent = path.parent().expect("corpus file parent");
@@ -398,9 +406,15 @@ fn validate_manifest(
     // A live export must bind the manifest to the exact source-derived Build
     // ID advertised by its workers. Checked corpora intentionally retain
     // historical Build IDs so they remain replayable after source changes.
+    #[cfg(target_os = "macos")]
     if require_current_build_id {
         assert_eq!(manifest.build_id, workflow_build_id());
     }
+    #[cfg(not(target_os = "macos"))]
+    assert!(
+        !require_current_build_id,
+        "current Build ID validation is only available on macOS"
+    );
 }
 
 pub(crate) fn load_private_corpus(
@@ -440,6 +454,7 @@ pub(crate) fn load_private_corpus(
     (manifest, history_files)
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) fn export_corpus(directory: &Path, legacy: &RunChain, current: &RunChain) {
     ensure_private_directory(directory);
     let history_bytes = [

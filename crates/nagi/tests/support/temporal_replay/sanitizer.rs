@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::DateTime;
 use serde_json::Value;
+#[cfg(target_os = "macos")]
 use temporalio_client::WorkflowHistory;
 
 use super::{
@@ -799,6 +800,7 @@ fn sanitize_json(
     }
 }
 
+#[cfg(target_os = "macos")]
 fn event_numeric_fields(value: &Value) -> Vec<(i64, i32, i64, i64)> {
     value
         .get("events")
@@ -847,6 +849,7 @@ pub(crate) fn assert_history_json_canonical(value: &Value) {
     }
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) fn sanitized_history(
     history: &WorkflowHistory,
     run_a: &str,
