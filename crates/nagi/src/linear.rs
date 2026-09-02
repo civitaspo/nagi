@@ -7,6 +7,9 @@ pub mod credentials;
 #[cfg(any(test, target_os = "macos"))]
 pub(crate) mod read;
 
+#[cfg(test)]
+mod polling;
+
 /// Coarse failures for the Linear read verifier. No provider response or
 /// deployment-local value is retained in an error.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

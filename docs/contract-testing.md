@@ -8,6 +8,27 @@ The Phase 0 harness has three deliberate layers:
 
 The two opt-in layers are intentionally not part of the default test or CI path. An unset layer skips. An explicitly requested but unsupported or not-yet-implemented layer fails, so a future gate cannot be reported as passing by accident.
 
+The Linear polling boundary is covered by a credential-free loopback GraphQL
+server in the Rust unit-test target. Each request is matched to a scripted
+operation and cursor, so tests never enumerate a provider collection or need a
+network credential. The head and scan documents each carry the synthetic team
+binding and `includeArchived: true`; the server records and rejects a missing
+team filter or an unbounded `first` value. The harness fixes a provider-derived
+inclusive upper bound, uses an inclusive `updatedAt` lower bound with a bounded
+overlap, and dedupes by the `(issue_id, updated_at)` observation key (a
+conflicting payload for the same key fails closed). Consequently, records
+sharing a timestamp are retained and a later revision of an issue is not hidden
+by overlap deduplication. Root and nested Relay cursors are bounded and
+must progress; incomplete nested label pages, malformed timestamps (including
+`archivedAt`) and an exact `issue: null` response fail closed with the
+watermark unchanged; archive observations are retained as explicit transitions.
+Exact-issue enrichment uses the same configured bounded label page size and
+canonicalizes label IDs before comparison.
+HTTP 429 and GraphQL `RATELIMITED` are
+typed rate-limit failures with no automatic retry or partial watermark commit.
+The server is test-only and binds to loopback; it does not change the
+standalone executable or expose a configurable production endpoint.
+
 The live runner resolves the repository from its own script path, requires a
 clean checked revision, and builds the ordinary raw
 `target/nagi-contract/debug/nagi` executable in that exact checkout with
