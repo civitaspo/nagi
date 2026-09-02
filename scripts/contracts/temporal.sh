@@ -685,7 +685,7 @@ assert_activity_output_safe() {
     [[ "${size}" =~ ^[0-9]+$ ]] && ((size <= MAX_CHILD_OUTPUT_BYTES)) || return 1
   done
   if /usr/bin/grep -Eiq \
-    '(authorization:|bearer[[:space:]]+|access[_-]?token|client[_-]?secret|password[=:]|/Users/|/private/|/home/)' \
+    '(authorization:|bearer[[:space:]]+|access[_-]?token|client[_-]?secret|password[=:])' \
     "${activity_stdout}" "${activity_stderr}" \
     "${activity_worker_stdout}" "${activity_worker_stderr}" \
     "${stdout_file}" "${stderr_file}"; then

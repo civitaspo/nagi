@@ -154,6 +154,35 @@ fn temporal_activity_contract_separates_worker_and_sidecar_recovery_gates() {
 }
 
 #[test]
+fn temporal_activity_private_output_and_public_evidence_redaction_are_separate() {
+    let private_output_check = TEMPORAL_SCRIPT
+        .find("assert_activity_output_safe()")
+        .and_then(|start| {
+            TEMPORAL_SCRIPT[start..]
+                .find("start_activity_worker()")
+                .map(|end| &TEMPORAL_SCRIPT[start..start + end])
+        })
+        .expect("Temporal Activity contract must define its private output check");
+    assert!(private_output_check.contains(
+        "(authorization:|bearer[[:space:]]+|access[_-]?token|client[_-]?secret|password[=:])"
+    ));
+    for local_path in ["/Users/", "/private/", "/home/"] {
+        assert!(
+            !private_output_check.contains(local_path),
+            "Private Activity output check must allow local path {local_path:?}"
+        );
+    }
+
+    assert!(TEMPORAL_ACTIVITY_SCRIPT.contains(
+        "(authorization:|bearer[[:space:]]+|access[_-]?token|client[_-]?secret|password[=:]|/Users/|/private/|/home/)"
+    ));
+    assert!(
+        TEMPORAL_ACTIVITY_SCRIPT
+            .contains("if ! /usr/bin/cmp -s \"${sidecar_stdout}\" \"${expected_evidence}\"")
+    );
+}
+
+#[test]
 fn temporal_message_contract_uses_full_signal_payload_and_one_state_query() {
     for required in [
         "derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)",
