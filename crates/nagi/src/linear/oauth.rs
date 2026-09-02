@@ -1745,9 +1745,15 @@ mod tests {
         request_bytes(&format!("{CALLBACK_PATH}?{query}"))
     }
 
-    fn ephemeral_port() -> u16 {
+    fn ephemeral_listener() -> LoopbackCallbackListener {
         let listener = TcpListener::bind((CALLBACK_HOST, 0)).expect("ephemeral listener");
-        listener.local_addr().expect("listener address").port()
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        LoopbackCallbackListener {
+            listener,
+            consumed: false,
+        }
     }
 
     fn run_callback(
@@ -2093,9 +2099,7 @@ mod tests {
 
     #[test]
     fn loopback_listener_is_single_use_and_writes_fixed_response() {
-        let port = ephemeral_port();
-        let uri = callback_uri(port);
-        let mut listener = LoopbackCallbackListener::bind(&uri).expect("listener");
+        let mut listener = ephemeral_listener();
         let expected_state = b"synthetic-state";
         let clock = MonotonicClock;
         let (result, response) = run_callback(
@@ -2123,9 +2127,7 @@ mod tests {
 
     #[test]
     fn loopback_listener_rejects_mismatch_with_fixed_failure_response() {
-        let port = ephemeral_port();
-        let uri = callback_uri(port);
-        let mut listener = LoopbackCallbackListener::bind(&uri).expect("listener");
+        let mut listener = ephemeral_listener();
         let clock = MonotonicClock;
         let (result, response) = run_callback(
             &mut listener,
@@ -2152,9 +2154,7 @@ mod tests {
 
     #[test]
     fn loopback_listener_rejects_callback_completed_at_deadline() {
-        let port = ephemeral_port();
-        let uri = callback_uri(port);
-        let mut listener = LoopbackCallbackListener::bind(&uri).expect("listener");
+        let mut listener = ephemeral_listener();
         let start = Instant::now();
         let deadline = start + AUTHORIZATION_TIMEOUT;
         let clock = SequenceClock::new([start, start, deadline], deadline);
@@ -2173,9 +2173,7 @@ mod tests {
 
     #[test]
     fn loopback_listener_timeout_consumes_callback_without_waiting() {
-        let port = ephemeral_port();
-        let uri = callback_uri(port);
-        let mut listener = LoopbackCallbackListener::bind(&uri).expect("listener");
+        let mut listener = ephemeral_listener();
         let now = Instant::now();
         let clock = FixedClock(now);
         assert!(matches!(
