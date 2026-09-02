@@ -127,7 +127,7 @@ pub(crate) fn run(operation: CodexOperation) -> Result<CodexStatus, CodexError> 
             &mut source,
             runtime_parent,
             CODEX_BINARY_SHA256,
-            expected_codex_header()?,
+            CODEX_BINARY_HEADER,
         )?;
         let spec = CommandSpec::new(
             executable.path().to_owned(),
@@ -164,8 +164,7 @@ fn finish_operation(
 const CODEX_INSTALL_RELATIVE_PATH: &str =
     ".local/share/mise/installs/aqua-openai-codex/0.151.0/bin/codex";
 #[cfg(target_os = "macos")]
-const CODEX_HOME_RELATIVE_PATH: [&str; 4] =
-    ["Library", "Application Support", "nagi", "codex-home"];
+const CODEX_HOME_RELATIVE_PATH: &str = "Library/Application Support/nagi/codex-home";
 #[cfg(target_os = "macos")]
 const MANAGED_MARKER_NAME: &str = ".nagi-managed-v1";
 #[cfg(target_os = "macos")]
@@ -198,9 +197,15 @@ const PRIVATE_RUNTIME_DIRECTORY_ATTEMPTS: u32 = 32;
 const CODEX_BINARY_SHA256: &str =
     "98491713ffb196061003ee148636e743997cc31d76144ba7c53462269896891d";
 #[cfg(target_os = "macos")]
+#[cfg(target_arch = "aarch64")]
+const CODEX_BINARY_HEADER: [u8; 8] = [0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0x00, 0x00, 0x01];
+#[cfg(target_os = "macos")]
 #[cfg(target_arch = "x86_64")]
 const CODEX_BINARY_SHA256: &str =
     "52e7b9519170c83ac9363d23e5d8b8ff116d211149614d098cb3ce10bef82d95";
+#[cfg(target_os = "macos")]
+#[cfg(target_arch = "x86_64")]
+const CODEX_BINARY_HEADER: [u8; 8] = [0xcf, 0xfa, 0xed, 0xfe, 0x07, 0x00, 0x00, 0x01];
 
 #[cfg(target_os = "macos")]
 use sha2::{Digest, Sha256};
@@ -252,24 +257,9 @@ fn open_verified_codex_executable(home: &Path) -> Result<VerifiedCodexSource, Co
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&path)
         .map_err(|_| CodexError::ExecutableUnavailable)?;
-    let identity = verify_codex_binary_file(
-        &mut file,
-        CODEX_BINARY_SHA256,
-        &expected_codex_header()?,
-        None,
-    )?;
+    let identity =
+        verify_codex_binary_file(&mut file, CODEX_BINARY_SHA256, &CODEX_BINARY_HEADER, None)?;
     Ok(VerifiedCodexSource { file, identity })
-}
-
-#[cfg(target_os = "macos")]
-fn expected_codex_header() -> Result<[u8; 8], CodexError> {
-    if cfg!(target_arch = "aarch64") {
-        Ok([0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0x00, 0x00, 0x01])
-    } else if cfg!(target_arch = "x86_64") {
-        Ok([0xcf, 0xfa, 0xed, 0xfe, 0x07, 0x00, 0x00, 0x01])
-    } else {
-        Err(CodexError::ExecutableUntrusted)
-    }
 }
 
 #[cfg(target_os = "macos")]
@@ -646,14 +636,14 @@ fn create_private_runtime_directory(parent: &Path) -> Result<PathBuf, CodexError
 
 #[cfg(target_os = "macos")]
 fn prepare_managed_home(home: &Path) -> Result<PathBuf, CodexError> {
-    let library = home.join(CODEX_HOME_RELATIVE_PATH[0]);
-    let app_support = library.join(CODEX_HOME_RELATIVE_PATH[1]);
-    let nagi = app_support.join(CODEX_HOME_RELATIVE_PATH[2]);
-    let path = nagi.join(CODEX_HOME_RELATIVE_PATH[3]);
+    let path = home.join(CODEX_HOME_RELATIVE_PATH);
+    let nagi = path.parent().ok_or(CodexError::Configuration)?;
+    let app_support = nagi.parent().ok_or(CodexError::Configuration)?;
+    let library = app_support.parent().ok_or(CodexError::Configuration)?;
 
-    ensure_directory(&library)?;
-    ensure_directory(&app_support)?;
-    ensure_directory(&nagi)?;
+    ensure_directory(library)?;
+    ensure_directory(app_support)?;
+    ensure_directory(nagi)?;
     create_or_verify_managed_home(&path)?;
     Ok(path)
 }
