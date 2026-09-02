@@ -633,6 +633,9 @@ impl LoopbackTransport {
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .map_err(|_| PollError::RequestFailed)?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .map_err(|_| PollError::RequestFailed)?;
         let header = format!(
             "POST /graphql HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             request.body.len()
@@ -799,8 +802,18 @@ fn handle_connection(
     if stream.set_nonblocking(false).is_err() {
         return;
     }
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    if stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .is_err()
+    {
+        return;
+    }
+    if stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .is_err()
+    {
+        return;
+    }
     let body = match read_http_request(&mut stream) {
         Ok(body) => body,
         Err(_) => {
