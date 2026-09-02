@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if (($# != 1)); then
-  echo "Temporal SDK contract wrapper requires exactly one internal mode (message or activity)." >&2
+  echo "Temporal SDK contract wrapper requires exactly one internal mode (message, activity, or replay)." >&2
   exit 2
 fi
 
@@ -36,8 +36,22 @@ case "${contract_mode}" in
     contract_redaction_pattern='(authorization:|bearer[[:space:]]+|access[_-]?token|client[_-]?secret|password[=:]|/Users/|/private/|/home/)'
     contract_extended_term_grace=1
     ;;
+  replay)
+    contract_label="Temporal replay contract"
+    contract_opt_in="replay"
+    contract_feature="temporal-replay-contract"
+    contract_test="temporal_replay_contract"
+    contract_binary_prefix="temporal_replay_contract"
+    contract_target_suffix="replay"
+    contract_tmp_prefix="replay"
+    contract_binary_digest_env="NAGI_CONTRACT_TEMPORAL_REPLAY_BINARY_SHA256"
+    contract_temporal_mode="--replay-contract"
+    contract_fixture="synthetic.temporal-replay.v1"
+    contract_redaction_pattern='(authorization:|bearer[[:space:]]+|access[_-]?token|client[_-]?secret|password[=:]|/Users/|/private/|/home/)'
+    contract_extended_term_grace=0
+    ;;
   *)
-    echo "Temporal SDK contract wrapper accepts only the internal message or activity mode." >&2
+    echo "Temporal SDK contract wrapper accepts only the internal message, activity, or replay mode." >&2
     exit 2
     ;;
 esac
@@ -47,9 +61,14 @@ if [[ "${contract_opt_in}" == "messages" ]]; then
     echo "SKIP: Temporal message contract is opt-in; set NAGI_CONTRACT_TEMPORAL_MESSAGES=1 to request it."
     exit 0
   fi
-else
+elif [[ "${contract_opt_in}" == "activities" ]]; then
   if [[ "${NAGI_CONTRACT_TEMPORAL_ACTIVITIES:-0}" != "1" ]]; then
     echo "SKIP: Temporal Activity contract is opt-in; set NAGI_CONTRACT_TEMPORAL_ACTIVITIES=1 to request it."
+    exit 0
+  fi
+else
+  if [[ "${NAGI_CONTRACT_TEMPORAL_REPLAY:-0}" != "1" ]]; then
+    echo "SKIP: Temporal replay contract is opt-in; set NAGI_CONTRACT_TEMPORAL_REPLAY=1 to request it."
     exit 0
   fi
 fi
@@ -114,6 +133,40 @@ fi
 if ! revision="$(live_read_checked_revision "${git_path}" "${repo_root}")"; then
   echo "${contract_label} could not bind the checked revision." >&2
   exit 1
+fi
+# Cargo resolves the workspace from the current directory. Anchor the build
+# and the inherited Temporal-sidecar invocation to the exact checkout found
+# from this script, so a direct absolute invocation cannot accidentally build
+# a different workspace selected by the caller's cwd.
+if ! cd "${repo_root}" 2>/dev/null; then
+  echo "${contract_label} could not enter its resolved repository." >&2
+  exit 1
+fi
+# This replay-only guard checks the commit object's structural gpgsig header
+# and nothing about signer identity or trust. GitHub Verified delivery and
+# the repository's required merge checks remain the trusted delivery gate.
+if [[ "${contract_mode}" == "replay" ]] \
+  && ! "${git_path}" -C "${repo_root}" cat-file commit "${revision}" 2>/dev/null \
+    | /usr/bin/awk '
+      BEGIN { in_headers = 1; signed = 0 }
+      in_headers && /^$/ { in_headers = 0; next }
+      in_headers && /^gpgsig / { signed = 1 }
+      END { exit !signed }
+    '; then
+  echo "${contract_label} requires a checked revision with a commit signature object." >&2
+  exit 1
+fi
+
+replay_bootstrap_directory=""
+if [[ "${contract_mode}" == "replay" ]]; then
+  replay_bootstrap_directory="${NAGI_TEMPORAL_REPLAY_BOOTSTRAP_DIR:-}"
+  if [[ -n "${replay_bootstrap_directory}" ]] \
+    && { [[ ! "${replay_bootstrap_directory}" =~ ^/private/tmp/[A-Za-z0-9._-]+$ ]] \
+      || ! live_validate_path_components "${replay_bootstrap_directory}" \
+      || [[ -e "${replay_bootstrap_directory}" || -L "${replay_bootstrap_directory}" ]]; }; then
+    echo "${contract_label} requires an absent exact bootstrap directory directly under /private/tmp." >&2
+    exit 1
+  fi
 fi
 
 validated_home="${HOME:-}"
@@ -555,6 +608,13 @@ if [[ ! "${contract_binary_sha256}" =~ ^[0-9a-f]{64}$ ]]; then
   exit 1
 fi
 
+replay_bootstrap_environment=()
+if [[ -n "${replay_bootstrap_directory}" ]]; then
+  replay_bootstrap_environment+=(
+    "NAGI_TEMPORAL_REPLAY_BOOTSTRAP_DIR=${replay_bootstrap_directory}"
+  )
+fi
+
 /usr/bin/printf '%s\n' \
   "{\"schemaVersion\":1,\"layer\":\"macos\",\"gate\":\"temporal\",\"result\":\"pass\",\"revision\":\"${revision}\",\"fixture\":\"${contract_fixture}\",\"versions\":{\"rust\":\"1.98.0\",\"temporalCli\":\"1.8.2\",\"temporalRustSdk\":\"0.7.0\",\"codex\":\"0.151.0\"},\"checks\":[{\"name\":\"fixture-provenance\",\"result\":\"pass\"},{\"name\":\"version-pins\",\"result\":\"pass\"},{\"name\":\"boundary\",\"result\":\"pass\"},{\"name\":\"redaction\",\"result\":\"pass\"},{\"name\":\"preflight\",\"result\":\"pass\"}]}" \
   2>/dev/null >"${expected_evidence}" || {
@@ -581,6 +641,8 @@ if live_supervise_child_without_file_limit \
   TMPDIR="${contract_tmp}" \
   NAGI_CONTRACT_TEMPORAL=1 \
   "${contract_binary_digest_env}=${contract_binary_sha256}" \
+  NAGI_TEMPORAL_REPLAY_PRODUCER_REVISION="${revision}" \
+  "${replay_bootstrap_environment[@]}" \
   /bin/bash "${temporal_script}" "${contract_temporal_mode}"; then
   sidecar_status=0
 else
@@ -605,6 +667,16 @@ if /usr/bin/grep -Eiq "${contract_redaction_pattern}" \
   "${sidecar_stdout}" "${sidecar_stderr}" 2>/dev/null; then
   echo "${contract_label} evidence failed redaction checks." >&2
   exit 1
+fi
+
+if [[ "${contract_mode}" == "replay" && -n "${replay_bootstrap_directory}" ]]; then
+  if ! live_validate_path_components "${replay_bootstrap_directory}" \
+    || [[ ! -d "${replay_bootstrap_directory}" || -L "${replay_bootstrap_directory}" ]] \
+    || [[ "$(/usr/bin/stat -f '%u %Lp' "${replay_bootstrap_directory}" 2>/dev/null || true)" \
+      != "${current_uid} 700" ]]; then
+    echo "${contract_label} did not preserve its validated bootstrap corpus." >&2
+    exit 1
+  fi
 fi
 
 if ! evidence_line="$(/bin/cat "${sidecar_stdout}" 2>/dev/null)"; then

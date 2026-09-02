@@ -6,7 +6,7 @@ The Phase 0 harness has three deliberate layers:
 - `mise run contract:macos` is an opt-in preflight for host-only contracts. It skips when unset; an explicit request on a non-Darwin host or before the corresponding contract implementation has landed fails closed. The script enables only the default-off `macos-keychain-contract` feature and runs a separate integration test against the raw Cargo-built `nagi` executable. Fresh processes use only a synthetic service and fixed nonproduction account to verify absent, write-record-A, read-A, update-record-B, read-B, delete, and absent phases through the file-based `SecItem` path. The test uses a unique empty working directory, requires it to remain empty after every child, caps and scans child stdout/stderr for both synthetic records, and attempts exact cleanup on failures. Every child also has a short deadline followed by kill and reap to bound an unexpected Keychain interaction. The raw executable path is outside any `.app`, and the roundtrip succeeds without a provisioning profile supplied by the harness; these are the standalone runtime packaging checks, not ACL or signing-identity proof. It does not launch OAuth or contact a provider.
 - `mise run contract:live` is an opt-in provider contract command. It rejects API-key, token, and client-secret environment credentials, requires local setup metadata and explicit administrator consent, validates a loopback callback and clean checked revision, and runs only the exact bounded Linear read contract through the P0-04 Keychain access lease. It never enumerates provider collections or performs domain-data writes. The runner builds and validates the ordinary raw executable in the exact checkout before starting the child.
 
-The two opt-in layers are intentionally not part of the default test or CI path. An unset layer skips. An explicitly requested but unsupported or not-yet-implemented layer fails, so a future gate cannot be reported as passing by accident.
+The opt-in layers are intentionally not part of the default test or CI path. An unset layer skips. An explicitly requested but not-yet-implemented layer fails, so a future gate cannot be reported as passing by accident.
 
 The Linear polling boundary is covered by a credential-free loopback GraphQL
 server in the Rust unit-test target. Each request is matched to a scripted
@@ -152,8 +152,67 @@ cleanup, and records its terminal result. Every child has bounded waits,
 private capped output, redaction checks, and orphan/listener checks. The task
 is credential-free, loopback-only, and emits only the fixed sanitized evidence
 record; same-UID replacement races against private inputs remain a documented
-runtime-integrity limitation. Replay behavior belongs to P0-10 and is not
-covered here.
+runtime-integrity limitation.
+
+Temporal replay compatibility is a separate opt-in macOS contract, enabled with
+`NAGI_CONTRACT_TEMPORAL_REPLAY=1 mise run contract:temporal-replay`. Its thin
+entrypoint selects only the shared wrapper's literal `replay` mode. The wrapper
+builds the feature-gated `temporalio-sdk = "=0.7.0"` test with the locked Rust
+and protoc toolchain, then runs it against a Temporal CLI sidecar whose
+architecture-specific release archive URL, archive SHA-256, executable
+SHA-256, file type, and version are checked against the reviewed provenance
+manifest and `mise.lock`. The sidecar is therefore the pinned history producer
+for this contract; a caller-selected or unverified producer is not accepted.
+
+The live export creates two genuine two-run chains in that sidecar: a legacy
+source definition and a current source definition each execute run A,
+Continue-As-New into run B, and complete run B. The witness fetches each exact
+run, requires the Continue-As-New event's new run ID to equal run B, and binds
+run B's `first_execution_run_id`, `original_execution_run_id`, and
+`continued_execution_run_id` to the expected chain. It does not follow a
+latest-run alias. Raw sidecar captures and producer details stay in a run-
+private `0700` directory containing `0600` files. Checked-corpus reads reject
+a symlink at the final leaf with Unix `O_NOFOLLOW` and re-stat the opened file
+descriptor. Parent-component checks are preflight only, so a same-UID actor
+could replace a parent after that check; this residual path-component race is
+documented and is not claimed closed by this contract. The public Temporal `History` corpus
+canonicalizes worker identity, Build ID, and worker/deployment
+metadata to fixed synthetic values; no source-derived Build ID is retained in
+public histories. The separate provenance manifest records the reviewed
+producer and artifact digests needed for binding, together with a signed clean producer revision.
+The sanitized corpus and
+manifest are intentionally committed and public, while raw captures never
+become public evidence.
+
+The default `mise run test` reads that checked corpus and replays it with the
+SDK `WorkflowReplayer` without connecting to the sidecar. Its structural
+guard rejects test-builder-generated/canned histories, latest-run lookup, and
+raw history printing, while allowing the checked fixture files to be loaded.
+Replay compatibility is explicit: the legacy no-marker histories
+replay under the legacy definition, the current marker histories replay under
+the current definition (including the pre-marker histories), a legacy
+definition rejects a marker-bearing current history as nondeterministic, and
+an unknown marker (represented by a mismatched patch ID) is also rejected as
+nondeterministic. The committed corpus manifest records the fixture and
+`"deploymentVersioning": "not_exercised"`; Worker Deployment Versioning
+routing is not exercised and the contract makes no routing claim.
+
+Each worker receives a deterministic Build ID through
+`WorkerDeploymentOptions::from_build_id`, while
+`use_worker_versioning == false` leaves the poller in the SDK's UNVERSIONED
+mode. This is a Build ID poller witness only. Worker Deployment Versioning
+routing, deployment registration, pinning, ramping, and version-selection
+behavior are not exercised, and the contract makes no routing claim. The
+local replay wrapper's signature gate checks only for a `gpgsig` header in the
+checked commit object; it does not establish signer identity or trust. GitHub
+Verified delivery and the repository's required merge checks provide that
+trusted delivery gate. The producer binding is the reviewed manifest and
+lockfile digests. At runtime, the wrapper requires that checked revision
+to be clean, binds the test binary digest before and after execution, and
+accepts the sidecar producer only when its reviewed manifest and lockfile digests
+match. Public output remains the fixed redacted evidence record; raw
+captures and replay diagnostics remain private and bounded, while the
+sanitized corpus and provenance manifest stay intentionally committed/public.
 
 The live runner resolves the repository from its own script path, requires a
 clean checked revision, and builds the ordinary raw

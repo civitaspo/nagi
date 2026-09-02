@@ -1174,6 +1174,7 @@ dependencies = [
  "security-framework-sys",
  "serde",
  "serde_json",
+ "sha2",
  "temporalio-client",
  "temporalio-common",
  "temporalio-sdk",

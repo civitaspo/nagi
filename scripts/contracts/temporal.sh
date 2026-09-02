@@ -3,6 +3,7 @@ set -euo pipefail
 
 message_contract_enabled=0
 activity_contract_enabled=0
+replay_contract_enabled=0
 case "$#" in
   0) ;;
   1)
@@ -13,14 +14,17 @@ case "$#" in
       --activity-contract)
         activity_contract_enabled=1
         ;;
+      --replay-contract)
+        replay_contract_enabled=1
+        ;;
       *)
-        echo "Temporal contract layer accepts only the internal --message-contract or --activity-contract mode." >&2
+        echo "Temporal contract layer accepts only the internal --message-contract, --activity-contract, or --replay-contract mode." >&2
         exit 2
         ;;
     esac
     ;;
   *)
-    echo "Temporal contract layer accepts no positional arguments except --message-contract or --activity-contract." >&2
+    echo "Temporal contract layer accepts no positional arguments except --message-contract, --activity-contract, or --replay-contract." >&2
     exit 2
     ;;
 esac
@@ -223,6 +227,8 @@ message_stdout="${contract_tmp}/message.stdout"
 message_stderr="${contract_tmp}/message.stderr"
 activity_stdout="${contract_tmp}/activity.stdout"
 activity_stderr="${contract_tmp}/activity.stderr"
+replay_stdout="${contract_tmp}/replay.stdout"
+replay_stderr="${contract_tmp}/replay.stderr"
 activity_worker_stdout="${contract_tmp}/activity-worker.stdout"
 activity_worker_stderr="${contract_tmp}/activity-worker.stderr"
 activity_history_before_server="${contract_tmp}/activity-history-before-server.json"
@@ -237,6 +243,8 @@ activity_cluster_after="${contract_tmp}/activity-cluster-after.json"
 : >"${message_stderr}"
 : >"${activity_stdout}"
 : >"${activity_stderr}"
+: >"${replay_stdout}"
+: >"${replay_stderr}"
 : >"${activity_worker_stdout}"
 : >"${activity_worker_stderr}"
 MAX_CHILD_OUTPUT_BYTES=65536
@@ -400,6 +408,11 @@ elif [[ "${activity_contract_enabled}" == "1" ]]; then
   workflow_id="nagi-contract-activity-workflow-v1"
   workflow_type="ActivityRecoveryWorkflow"
   task_queue="nagi-contract-activity-v1"
+elif [[ "${replay_contract_enabled}" == "1" ]]; then
+  namespace="synthetic-replay-v1"
+  workflow_id="nagi-contract-replay-workflow-v1"
+  workflow_type="ReplayCompatibilityWorkflow"
+  task_queue="nagi-contract-replay-v1"
 else
   namespace="synthetic-persistence-v1"
 fi
@@ -446,6 +459,16 @@ assert_loopback_listeners() {
 assert_no_listeners() {
   local pid="$1"
   [[ -z "$(listener_output "${pid}")" ]]
+}
+
+assert_no_port_listener() {
+  local port="$1"
+  local listeners
+  [[ "${port}" =~ ^[0-9]+$ ]] || return 1
+  listeners="$(
+    "${lsof_path}" -nP -a -iTCP:"${port}" -sTCP:LISTEN 2>/dev/null || true
+  )"
+  [[ -z "${listeners}" ]]
 }
 
 assert_sqlite_store_paths() {
@@ -503,10 +526,10 @@ start_server() {
   : >"${stderr_file}"
   # Temporal writes SQLite files, so the shared helper's output file-size
   # ulimit cannot be applied to this child. Output files are still checked on
-  # every readiness iteration and before evidence is emitted. The message
-  # wrapper already owns the complete process group, so keep that sidecar in
-  # the current group; P0-07 retains the helper-created group.
-  if [[ "${message_contract_enabled}" == "1" ]]; then
+  # every readiness iteration and before evidence is emitted. The message and
+  # replay wrappers own the complete process group, so keep those sidecars in
+  # the current group; P0-07 and Activity retain helper-created groups.
+  if [[ "${message_contract_enabled}" == "1" || "${replay_contract_enabled}" == "1" ]]; then
     live_start_child_in_current_group_without_file_limit "${stdout_file}" "${stderr_file}" \
       /usr/bin/env -i \
       PATH=/usr/bin:/bin \
@@ -672,6 +695,148 @@ run_message_contract() {
     || [[ "${message_binary_sha256_after}" != "${message_binary_sha256_before}" ]] \
     || ! assert_message_output_safe; then
     echo "Temporal message contract found changed or unsafe test output." >&2
+    return 1
+  fi
+}
+
+assert_replay_output_safe() {
+  local path size
+  for path in "${replay_stdout}" "${replay_stderr}" \
+    "${stdout_file}" "${stderr_file}"; do
+    size="$(live_file_size "${path}")"
+    [[ "${size}" =~ ^[0-9]+$ ]] && ((size <= MAX_CHILD_OUTPUT_BYTES)) || return 1
+  done
+  if /usr/bin/grep -Eiq \
+    '(authorization:|bearer[[:space:]]+|access[_-]?token|client[_-]?secret|password[=:]|/Users/|/private/|/home/)' \
+    "${replay_stdout}" "${replay_stderr}" "${stdout_file}" "${stderr_file}"; then
+    return 1
+  fi
+}
+
+run_replay_contract() {
+  local replay_target replay_binary_candidates replay_binary
+  local replay_binary_sha256_before replay_binary_sha256_after
+  local expected_replay_binary_sha256="${NAGI_CONTRACT_TEMPORAL_REPLAY_BINARY_SHA256:-}"
+  local replay_producer_revision="${NAGI_TEMPORAL_REPLAY_PRODUCER_REVISION:-}"
+  local replay_bootstrap_directory="${NAGI_TEMPORAL_REPLAY_BOOTSTRAP_DIR:-}"
+  local replay_phase="${1:-}"
+  local replay_status
+  if [[ "${replay_phase}" != "export" && "${replay_phase}" != "replay" ]]; then
+    echo "Temporal replay contract requires an explicit export or replay phase." >&2
+    return 2
+  fi
+  replay_target="${repo_root}/target/nagi-temporal-replay-contract"
+  if ! live_validate_path_components "${replay_target}" \
+    || [[ ! -d "${replay_target}" || -L "${replay_target}" ]]; then
+    echo "Temporal replay contract could not access its dedicated Cargo target." >&2
+    return 1
+  fi
+  replay_binary_candidates="$(/usr/bin/find "${replay_target}/debug/deps" \
+    -type f -name 'temporal_replay_contract-*' -perm -100 -links 1 -print 2>/dev/null || true)"
+  if [[ -z "${replay_binary_candidates}" || "${replay_binary_candidates}" == *$'\n'* \
+    || "${replay_binary_candidates}" == *$'\r'* || "${replay_binary_candidates}" == *$'\t'* ]]; then
+    echo "Temporal replay contract did not produce exactly one test binary." >&2
+    return 1
+  fi
+  replay_binary="${replay_binary_candidates}"
+  if ! live_validate_path_components "${replay_binary}" \
+    || [[ "${replay_binary}" != "${replay_target}/debug/deps/temporal_replay_contract-"* ]] \
+    || [[ ! -f "${replay_binary}" || -L "${replay_binary}" || ! -x "${replay_binary}" ]] \
+    || [[ "$(/usr/bin/stat -f '%u %Lp %l' "${replay_binary}" 2>/dev/null || true)" \
+      != "$(/usr/bin/id -u) 700 1" ]] \
+    || [[ "$(/usr/bin/file -b "${replay_binary}" 2>/dev/null || true)" != "${expected_file_description}" ]]; then
+    echo "Temporal replay contract rejected the built test binary." >&2
+    return 1
+  fi
+  replay_binary_sha256_before="$(binary_sha256 "${replay_binary}")" || return 1
+  if [[ ! "${expected_replay_binary_sha256}" =~ ^[0-9a-f]{64}$ ]] \
+    || [[ "${replay_binary_sha256_before}" != "${expected_replay_binary_sha256}" ]]; then
+    echo "Temporal replay contract could not bind the test binary digest." >&2
+    return 1
+  fi
+  if [[ ! "${replay_producer_revision}" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "Temporal replay contract could not bind the clean producer revision." >&2
+    return 1
+  fi
+  if [[ -n "${replay_bootstrap_directory}" ]]; then
+    if [[ ! "${replay_bootstrap_directory}" =~ ^/private/tmp/[A-Za-z0-9._-]+$ ]] \
+      || ! live_validate_path_components "${replay_bootstrap_directory}"; then
+      echo "Temporal replay contract rejected its bootstrap directory." >&2
+      return 1
+    fi
+    if [[ "${replay_phase}" == "export" ]] \
+      && [[ -e "${replay_bootstrap_directory}" || -L "${replay_bootstrap_directory}" ]]; then
+      echo "Temporal replay contract requires an absent bootstrap directory before export." >&2
+      return 1
+    fi
+    if [[ "${replay_phase}" == "replay" ]] \
+      && { [[ ! -d "${replay_bootstrap_directory}" || -L "${replay_bootstrap_directory}" ]] \
+        || [[ "$(/usr/bin/stat -f '%u %Lp' "${replay_bootstrap_directory}" 2>/dev/null || true)" \
+          != "$(/usr/bin/id -u) 700" ]]; }; then
+      echo "Temporal replay contract requires the preserved bootstrap corpus." >&2
+      return 1
+    fi
+  fi
+  if [[ "${replay_phase}" == "replay" ]] \
+    && { [[ ! -d "${contract_tmp}/replay-corpus" || -L "${contract_tmp}/replay-corpus" ]] \
+      || [[ "$(/usr/bin/stat -f '%u %Lp' "${contract_tmp}/replay-corpus" 2>/dev/null || true)" \
+        != "$(/usr/bin/id -u) 700" ]]; }; then
+    echo "Temporal replay contract could not access its exported corpus." >&2
+    return 1
+  fi
+
+  : >"${replay_stdout}"
+  : >"${replay_stderr}"
+  local -a replay_environment=(
+    NAGI_TEMPORAL_REPLAY_NAMESPACE="${namespace}"
+    NAGI_TEMPORAL_REPLAY_CORPUS_DIR="${contract_tmp}/replay-corpus"
+    NAGI_TEMPORAL_REPLAY_PHASE="${replay_phase}"
+    NAGI_TEMPORAL_REPLAY_PRODUCER_REVISION="${replay_producer_revision}"
+    NAGI_TEMPORAL_REPLAY_TEST_BINARY_SHA256="${replay_binary_sha256_before}"
+    NAGI_TEMPORAL_REPLAY_TEMPORAL_CLI_PLATFORM="${artifact_key}"
+    NAGI_TEMPORAL_REPLAY_TEMPORAL_CLI_SHA256="${binary_sha256_before}"
+    NAGI_TEMPORAL_REPLAY_TEMPORAL_CLI_VERSION=1.8.2
+  )
+  # A replay must not be able to fall back to the sidecar that was stopped
+  # between phases. The live export requires its exact loopback address; the
+  # server-free replay deliberately omits it so an accidental provider call
+  # fails at the test boundary instead of reaching a reused port.
+  if [[ "${replay_phase}" == "export" ]]; then
+    replay_environment+=(
+      "NAGI_TEMPORAL_REPLAY_ADDRESS=http://127.0.0.1:${grpc_port}"
+    )
+  fi
+  if [[ -n "${replay_bootstrap_directory}" ]]; then
+    replay_environment+=(
+      "NAGI_TEMPORAL_REPLAY_BOOTSTRAP_DIR=${replay_bootstrap_directory}"
+    )
+  fi
+  # The live witness owns corpus export and validation. Export receives the
+  # synthetic loopback binding; replay receives only its private corpus
+  # directory. No caller environment, provider data, or credential is
+  # inherited.
+  if /bin/sh -c 'ulimit -f 128 || exit 125; exec "$@"' temporal-replay-test \
+    /usr/bin/env -i \
+    PATH=/usr/bin:/bin \
+    HOME="${home_directory}" \
+    TMPDIR="${temp_directory}" \
+    LANG=C \
+    "${replay_environment[@]}" \
+    "${replay_binary}" --exact temporal_replay_contract_exercises_live \
+    >"${replay_stdout}" 2>"${replay_stderr}"; then
+    replay_status=0
+  else
+    replay_status=$?
+  fi
+  if [[ "${replay_status}" -ne 0 ]]; then
+    echo "Temporal replay contract test did not complete successfully." >&2
+    return 1
+  fi
+  replay_binary_sha256_after="$(binary_sha256 "${replay_binary}")" || return 1
+  if [[ "${replay_binary_sha256_after}" != "${expected_replay_binary_sha256}" ]] \
+    || [[ "${replay_binary_sha256_after}" != "${replay_binary_sha256_before}" ]] \
+    || ! assert_replay_output_safe; then
+    echo "Temporal replay contract found changed or unsafe test output." >&2
     return 1
   fi
 }
@@ -1129,7 +1294,8 @@ force_kill_server() {
   [[ "${wait_status}" == "137" ]] || return 1
   assert_child_output_bound || return 1
   if kill -0 "${server_pid}" 2>/dev/null \
-    || live_process_group_exists || ! assert_no_listeners "${server_pid}"; then
+    || live_process_group_exists || ! assert_no_listeners "${server_pid}" \
+    || ! assert_no_port_listener "${grpc_port}"; then
     preserve_temp=1
     return 1
   fi
@@ -1154,6 +1320,7 @@ stop_server() {
     return 1
   fi
   if live_process_group_exists || ! assert_no_listeners "${server_pid}" \
+    || ! assert_no_port_listener "${grpc_port}" \
     || ! assert_child_output_bound; then
     preserve_temp=1
     return 1
@@ -1239,6 +1406,23 @@ if [[ "${message_contract_enabled}" == "1" ]]; then
 elif [[ "${activity_contract_enabled}" == "1" ]]; then
   if ! run_activity_contract; then
     echo "Temporal Activity contract did not pass its bounded SDK witness." >&2
+    exit 1
+  fi
+elif [[ "${replay_contract_enabled}" == "1" ]]; then
+  if ! run_replay_contract export; then
+    echo "Temporal replay contract export did not pass its bounded SDK witness." >&2
+    exit 1
+  fi
+  if ! stop_server; then
+    echo "Temporal replay contract could not stop and reap the sidecar before replay." >&2
+    exit 1
+  fi
+  if ! assert_sqlite_store_paths "${database}"; then
+    echo "Temporal replay contract found an unsafe SQLite companion path." >&2
+    exit 1
+  fi
+  if ! run_replay_contract replay; then
+    echo "Temporal replay contract replay did not pass its server-free witness." >&2
     exit 1
   fi
 else
@@ -1370,6 +1554,8 @@ if [[ "${message_contract_enabled}" == "1" ]]; then
   evidence_fixture="synthetic.temporal-message.v1"
 elif [[ "${activity_contract_enabled}" == "1" ]]; then
   evidence_fixture="synthetic.temporal-activity.v1"
+elif [[ "${replay_contract_enabled}" == "1" ]]; then
+  evidence_fixture="synthetic.temporal-replay.v1"
 else
   evidence_fixture="synthetic.temporal-sidecar.v1"
 fi

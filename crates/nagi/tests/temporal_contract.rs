@@ -1,9 +1,9 @@
 //! Hermetic checks for the opt-in Temporal sidecar contract.
 //!
-//! The actual CLI/server round trips are deliberately outside the default test
-//! suite. The separate `mise run contract:temporal` and
-//! `mise run contract:temporal-messages` tasks enable them explicitly; this
-//! target checks that both opt-in boundaries remain explicit and closed.
+//! The live CLI/server producer round trips are deliberately outside the
+//! default test suite. The checked replay corpus is replayed server-free by
+//! default; the separate opt-in contract tasks produce and validate it. This
+//! target checks that those boundaries remain explicit and closed.
 
 const TEMPORAL_SCRIPT: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -33,6 +33,30 @@ const TEMPORAL_ACTIVITY_TEST: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/temporal_activity_contract.rs"
 ));
+const TEMPORAL_REPLAY_ENTRYPOINT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../scripts/contracts/temporal-replay.sh"
+));
+const TEMPORAL_REPLAY_TEST: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/temporal_replay_contract.rs"
+));
+const TEMPORAL_REPLAY_WORKFLOWS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/support/temporal_replay/workflows.rs"
+));
+const TEMPORAL_REPLAY_CORPUS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/support/temporal_replay/corpus.rs"
+));
+const TEMPORAL_REPLAY_SANITIZER: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/support/temporal_replay/sanitizer.rs"
+));
+const TEMPORAL_REPLAY_VERIFIER: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/support/temporal_replay/replay.rs"
+));
 const LIVE_HELPERS: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../scripts/contracts/live_helpers.sh"
@@ -45,6 +69,36 @@ const REPOSITORY_GUIDELINES: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../AGENTS.md"));
 const MISE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../mise.toml"));
 const NAGI_MANIFEST: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
+
+fn assert_markers(source: &str, label: &str, markers: &str) {
+    for marker in markers
+        .split('|')
+        .map(str::trim)
+        .filter(|marker| !marker.is_empty())
+    {
+        assert!(source.contains(marker), "{label} is missing {marker:?}");
+    }
+}
+
+fn assert_absent_markers(source: &str, label: &str, markers: &str) {
+    for marker in markers
+        .split('|')
+        .map(str::trim)
+        .filter(|marker| !marker.is_empty())
+    {
+        assert!(
+            !source.contains(marker),
+            "{label} contains forbidden {marker:?}"
+        );
+    }
+}
+
+fn manifest_test_block<'a>(manifest: &'a str, test_name: &str) -> Option<&'a str> {
+    let name_line = format!("name = \"{test_name}\"");
+    manifest
+        .split("[[test]]")
+        .find(|block| block.lines().any(|line| line.trim() == name_line))
+}
 
 #[test]
 fn temporal_contract_is_explicitly_opt_in() {
@@ -173,6 +227,140 @@ fn temporal_activity_contract_separates_worker_and_sidecar_recovery_gates() {
     }
     assert!(TEMPORAL_SCRIPT.contains("history_event_records"));
     assert!(TEMPORAL_SCRIPT.contains("plutil -extract events json"));
+}
+
+#[test]
+fn temporal_replay_contract_is_opt_in_and_default_replay_is_wired() {
+    assert_markers(
+        MISE,
+        "mise replay task",
+        r#"[tasks."contract:temporal-replay"]|run = "scripts/contracts/temporal-replay.sh"|cargo test --locked --features temporal-replay-contract --test temporal_replay_contract temporal_replay_checked_corpus -- --exact"#,
+    );
+    assert_markers(
+        TEMPORAL_REPLAY_ENTRYPOINT,
+        "replay entrypoint",
+        r#"SKIP: Temporal replay contract is opt-in; set NAGI_CONTRACT_TEMPORAL_REPLAY=1|/bin/bash "${shared_script}" replay"#,
+    );
+    assert_markers(
+        TEMPORAL_SDK_SCRIPT,
+        "replay wrapper",
+        r#"replay)|contract_feature="temporal-replay-contract"|contract_test="temporal_replay_contract"|contract_fixture="synthetic.temporal-replay.v1"|MAX_OUTPUT_BYTES"#,
+    );
+    let replay_test_block = manifest_test_block(NAGI_MANIFEST, "temporal_replay_contract")
+        .expect("Cargo must register the Temporal replay test");
+    assert_markers(
+        replay_test_block,
+        "Cargo replay test",
+        r#"path = "tests/temporal_replay_contract.rs"|required-features = ["temporal-replay-contract"]"#,
+    );
+    assert_markers(
+        TEMPORAL_REPLAY_TEST,
+        "checked corpus entrypoint",
+        r#"#[tokio::test|temporal_replay_checked_corpus|replay_private_corpus(|checked_corpus_directory()"#,
+    );
+    assert_markers(
+        TEMPORAL_REPLAY_CORPUS,
+        "checked corpus loader",
+        "checked_corpus_directory()|MANIFEST_FILE|LEGACY_A_FILE",
+    );
+    assert_markers(
+        TEMPORAL_REPLAY_VERIFIER,
+        "replay verifier",
+        "WorkflowReplayer|replay_private_corpus(directory: &Path)",
+    );
+}
+
+#[test]
+fn temporal_replay_contract_requires_genuine_two_run_chains_and_server_free_replay() {
+    assert_markers(
+        TEMPORAL_REPLAY_WORKFLOWS,
+        "two-run chain and marker matrix",
+        "async fn run_legacy_chain(|async fn run_current_chain(|WorkflowExecutionContinuedAsNewEventAttributes|first_execution_run_id|continued_execution_run_id|new_execution_run_id|run_id: Some(run_b.clone())|first_execution_run_id: Some(run_a.clone())|assert_eq!(continue_as_new_run_id(&chain.history_a), chain.run_b)|ctx.patched(PATCH_ID)|ctx.patched(MISMATCHED_PATCH_ID)",
+    );
+    assert_markers(
+        TEMPORAL_REPLAY_VERIFIER,
+        "replay matrix",
+        "replay_with_current(legacy_a.clone())|replay_with_current(current_a.clone())|replay_with_legacy(legacy_a)|replay_with_legacy(current_a)|replay_with_mismatched_patch(current_b)|WorkflowReplayFailure::Nondeterminism",
+    );
+
+    // The replay phase consumes the checked corpus only. It must not acquire
+    // a client, start a workflow, or fetch a history from a running sidecar.
+    let replay_phase = TEMPORAL_REPLAY_VERIFIER
+        .split_once("async fn replay_private_corpus(")
+        .map(|(_, remainder)| {
+            let end = remainder.find("\n#[").unwrap_or(remainder.len());
+            &remainder[..end]
+        })
+        .expect("Temporal replay contract must define a bounded replay phase");
+    assert_absent_markers(
+        replay_phase,
+        "server-free replay phase",
+        "Connection::connect|start_workflow(|fetch_history(|Worker::new",
+    );
+    // Checked fixture files are valid inputs. Only in-source history builders,
+    // latest-run aliases, and direct output are prohibited.
+    for (source, label) in [
+        (TEMPORAL_REPLAY_WORKFLOWS, "workflow source"),
+        (TEMPORAL_REPLAY_CORPUS, "corpus source"),
+        (TEMPORAL_REPLAY_SANITIZER, "sanitizer source"),
+        (TEMPORAL_REPLAY_VERIFIER, "replay source"),
+    ] {
+        assert_absent_markers(
+            source,
+            label,
+            "History {|HistoryEvent {|fn build_history(|fn canned_history(|WorkflowHistory::new(|WorkflowHistory::from_events(|latest_run|latest-run|latest run|println!|eprintln!|dbg!",
+        );
+    }
+}
+
+#[test]
+fn temporal_replay_contract_binds_private_corpus_build_id_and_provenance() {
+    assert_markers(
+        TEMPORAL_REPLAY_WORKFLOWS,
+        "producer witness",
+        "fn workflow_build_id()|include_bytes!(\"workflows.rs\")|WorkerDeploymentOptions::from_build_id(build_id.clone())|use_worker_versioning|WorkerVersioningMode::Unversioned|describe_task_queue",
+    );
+    assert_markers(
+        TEMPORAL_REPLAY_CORPUS,
+        "corpus provenance witness",
+        "write_private_file|0o700|0o600|O_NOFOLLOW|file.metadata()|not_exercised|producer_revision_clean|producer_revision_attestation|temporal_cli_sha256",
+    );
+    assert_markers(
+        TEMPORAL_REPLAY_SANITIZER,
+        "sanitizer provenance witness",
+        "assert_history_json_sanitized_with_build_id|all_nonempty_values|SANITIZED_BUILD_ID|SANITIZED_DEPLOYMENT_NAME|SANITIZED_DEPLOYMENT_VERSION|SANITIZED_SERIES_NAME|SANITIZED_PINNED_VERSION|binary_checksum|workerDeploymentVersion|deploymentName|seriesName|pinnedVersion|WorkflowHistory::from_json",
+    );
+    assert_markers(
+        TEMPORAL_REPLAY_VERIFIER,
+        "checked corpus safety witness",
+        "assert_history_json_sanitized_with_build_id|WorkflowHistory::from_json",
+    );
+    assert_absent_markers(
+        TEMPORAL_REPLAY_WORKFLOWS,
+        "routing witness",
+        "set_worker_deployment_current_version|set_current_deployment_version|routing_config|WorkerDeploymentVersioning",
+    );
+    assert_markers(
+        TEMPORAL_SCRIPT,
+        "sidecar provenance harness",
+        "live_validate_clean_revision|provenance_manifest|lock_manifest|expected_archive_sha256|expected_binary_sha256|NAGI_CONTRACT_TEMPORAL_REPLAY_BINARY_SHA256|NAGI_TEMPORAL_REPLAY_PRODUCER_REVISION=|run_replay_contract|assert_replay_output_safe",
+    );
+    assert_markers(
+        TEMPORAL_SDK_SCRIPT,
+        "fixed contract evidence",
+        r#"if ! /usr/bin/cmp -s "${sidecar_stdout}" "${expected_evidence}"|contract_fixture|MAX_OUTPUT_BYTES"#,
+    );
+    assert_markers(
+        CONTRACT_DOC,
+        "replay documentation",
+        r#"pinned history producer|default `mise run test`|Temporal `History` corpus|intentionally committed and public|"deploymentVersioning": "not_exercised"|no routing claim|signed clean producer revision|manifest and lockfile digests"#,
+    );
+    assert_absent_markers(
+        CONTRACT_DOC,
+        "replay capability naming",
+        "workerDeploymentVersioning",
+    );
+    assert!(REPOSITORY_GUIDELINES.contains("signed clean producer revision"));
 }
 
 #[test]
@@ -351,7 +539,7 @@ fn temporal_contract_has_stable_boundary_invariants() {
     assert!(start_server < message_launcher);
     assert!(message_launcher < standard_launcher);
     assert!(TEMPORAL_SCRIPT.contains(
-        r#"if [[ "${message_contract_enabled}" == "1" ]]; then
+        r#"if [[ "${message_contract_enabled}" == "1" || "${replay_contract_enabled}" == "1" ]]; then
     live_start_child_in_current_group_without_file_limit"#
     ));
     assert!(TEMPORAL_SCRIPT.contains(

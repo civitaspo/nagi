@@ -24,6 +24,14 @@ temporal-activity-contract = [
     "dep:temporalio-workflow",
     "dep:tokio",
 ]
+temporal-replay-contract = [
+    "dep:temporalio-client",
+    "dep:temporalio-common",
+    "dep:temporalio-sdk",
+    "dep:temporalio-workflow",
+    "dep:sha2",
+    "dep:tokio",
+]
 
 [dependencies]
 base64 = "=0.22.1"
@@ -47,6 +55,7 @@ temporalio-client = { version = "=0.7.0", default-features = false, optional = t
 temporalio-common = { version = "=0.7.0", default-features = false, optional = true }
 temporalio-sdk = { version = "=0.7.0", default-features = false, optional = true }
 temporalio-workflow = { version = "=0.7.0", default-features = false, optional = true }
+sha2 = { version = "=0.10.9", optional = true }
 tokio = { version = "=1.47.0", default-features = false, features = [
     "macros",
     "parking_lot",
@@ -76,3 +85,8 @@ required-features = ["temporal-message-contract"]
 name = "temporal_activity_contract"
 path = "tests/temporal_activity_contract.rs"
 required-features = ["temporal-activity-contract"]
+
+[[test]]
+name = "temporal_replay_contract"
+path = "tests/temporal_replay_contract.rs"
+required-features = ["temporal-replay-contract"]
