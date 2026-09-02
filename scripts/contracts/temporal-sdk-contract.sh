@@ -369,7 +369,15 @@ cleanup() {
   fi
   return 0
 }
-trap cleanup EXIT
+exit_cleanup() {
+  local original_status=$?
+  trap - EXIT
+  if ! cleanup; then
+    original_status=1
+  fi
+  exit "${original_status}"
+}
+trap exit_cleanup EXIT
 trap 'exit 143' HUP INT TERM
 
 developer_registry_cache="${validated_home}/.cargo/registry/cache"
@@ -608,9 +616,16 @@ if [[ ! "${contract_binary_sha256}" =~ ^[0-9a-f]{64}$ ]]; then
   exit 1
 fi
 
-replay_bootstrap_environment=()
-if [[ -n "${replay_bootstrap_directory}" ]]; then
-  replay_bootstrap_environment+=(
+sidecar_environment=(
+  "PATH=${temporal_source_directory}:/usr/bin:/bin"
+  "HOME=/"
+  "TMPDIR=${contract_tmp}"
+  "NAGI_CONTRACT_TEMPORAL=1"
+  "${contract_binary_digest_env}=${contract_binary_sha256}"
+  "NAGI_TEMPORAL_REPLAY_PRODUCER_REVISION=${revision}"
+)
+if [[ "${contract_mode}" == "replay" && -n "${replay_bootstrap_directory}" ]]; then
+  sidecar_environment+=(
     "NAGI_TEMPORAL_REPLAY_BOOTSTRAP_DIR=${replay_bootstrap_directory}"
   )
 fi
@@ -636,13 +651,7 @@ fi
 if live_supervise_child_without_file_limit \
   "${sidecar_stdout}" "${sidecar_stderr}" "${MAX_OUTPUT_BYTES}" 3600 \
   /usr/bin/env -i \
-  PATH="${temporal_source_directory}:/usr/bin:/bin" \
-  HOME=/ \
-  TMPDIR="${contract_tmp}" \
-  NAGI_CONTRACT_TEMPORAL=1 \
-  "${contract_binary_digest_env}=${contract_binary_sha256}" \
-  NAGI_TEMPORAL_REPLAY_PRODUCER_REVISION="${revision}" \
-  "${replay_bootstrap_environment[@]}" \
+  "${sidecar_environment[@]}" \
   /bin/bash "${temporal_script}" "${contract_temporal_mode}"; then
   sidecar_status=0
 else

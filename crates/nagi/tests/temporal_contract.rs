@@ -1052,6 +1052,99 @@ fn temporal_sdk_dispatcher_rejects_missing_extra_and_malicious_modes() {
 
 #[cfg(unix)]
 #[test]
+fn temporal_sdk_wrapper_handles_empty_optional_environment_and_exit_status() {
+    use std::process::{Command, Output};
+
+    assert!(TEMPORAL_SDK_SCRIPT.contains("sidecar_environment=("));
+    assert!(TEMPORAL_SDK_SCRIPT.contains(
+        "if [[ \"${contract_mode}\" == \"replay\" && -n \"${replay_bootstrap_directory}\" ]]; then"
+    ));
+    assert!(TEMPORAL_SDK_SCRIPT.contains("\"${sidecar_environment[@]}\""));
+    assert!(!TEMPORAL_SDK_SCRIPT.contains("replay_bootstrap_environment=()"));
+    assert!(!TEMPORAL_SDK_SCRIPT.contains("\"${replay_bootstrap_environment[@]}\""));
+    assert!(TEMPORAL_SDK_SCRIPT.contains("exit_cleanup()"));
+    assert!(TEMPORAL_SDK_SCRIPT.contains("local original_status=$?"));
+    assert!(TEMPORAL_SDK_SCRIPT.contains("exit \"${original_status}\""));
+
+    let run_bash = |script: &str| -> Output {
+        Command::new("/bin/bash")
+            .arg("-c")
+            .arg(script)
+            .env_clear()
+            .output()
+            .expect("Bash fixture should start")
+    };
+
+    // These fixtures use only Bash builtins. They exercise the Bash 3.2
+    // `nounset` behavior without starting a provider, sidecar, or helper.
+    let environment = run_bash(
+        r#"
+set -euo pipefail
+sidecar_environment=("BASE=1")
+contract_mode="message"
+replay_bootstrap_directory=""
+if [[ "${contract_mode}" == "replay" && -n "${replay_bootstrap_directory}" ]]; then
+  sidecar_environment+=("BOOT=${replay_bootstrap_directory}")
+fi
+[[ "${#sidecar_environment[@]}" -eq 1 ]]
+[[ "${sidecar_environment[0]}" == "BASE=1" ]]
+contract_mode="replay"
+replay_bootstrap_directory="/private/tmp/synthetic-bootstrap"
+if [[ "${contract_mode}" == "replay" && -n "${replay_bootstrap_directory}" ]]; then
+  sidecar_environment+=("BOOT=${replay_bootstrap_directory}")
+fi
+[[ "${#sidecar_environment[@]}" -eq 2 ]]
+[[ "${sidecar_environment[1]}" == "BOOT=/private/tmp/synthetic-bootstrap" ]]
+"#,
+    );
+    assert!(environment.status.success());
+    assert!(environment.stdout.is_empty());
+    assert!(environment.stderr.is_empty());
+
+    const EXIT_CLEANUP_FIXTURE_PREFIX: &str = r#"
+set -euo pipefail
+cleanup_status=0
+cleanup() { return "${cleanup_status}"; }
+exit_cleanup() {
+  local original_status=$?
+  trap - EXIT
+  if ! cleanup; then
+    original_status=1
+  fi
+  exit "${original_status}"
+}
+trap exit_cleanup EXIT
+"#;
+    let exit_cases = [
+        (
+            "preserve ordinary failure",
+            [EXIT_CLEANUP_FIXTURE_PREFIX, "false\n"].concat(),
+            1,
+        ),
+        (
+            "preserve nounset failure",
+            [
+                EXIT_CLEANUP_FIXTURE_PREFIX,
+                "set +e\nprintf '%s\\n' \"${missing_scalar}\"\noriginal_status=$?\nset -e\nexit \"${original_status}\"\n",
+            ]
+            .concat(),
+            127,
+        ),
+        (
+            "promote cleanup failure",
+            [EXIT_CLEANUP_FIXTURE_PREFIX, "cleanup_status=1\n:\n"].concat(),
+            1,
+        ),
+    ];
+    for (label, script, expected_status) in exit_cases {
+        let output = run_bash(&script);
+        assert_eq!(output.status.code(), Some(expected_status), "{label}");
+        assert!(output.stdout.is_empty(), "{label}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn temporal_sdk_dispatcher_ignores_cross_mode_opt_in() {
     use std::process::Command;
 
