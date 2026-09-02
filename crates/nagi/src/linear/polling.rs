@@ -796,7 +796,11 @@ fn handle_connection(
     steps: &Arc<Mutex<VecDeque<ScriptStep>>>,
     requests: &Arc<Mutex<Vec<RequestRecord>>>,
 ) {
+    if stream.set_nonblocking(false).is_err() {
+        return;
+    }
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
     let body = match read_http_request(&mut stream) {
         Ok(body) => body,
         Err(_) => {
@@ -816,52 +820,23 @@ fn handle_connection(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    let variables = parsed
-        .get("variables")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
     let query = parsed
         .get("query")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let team_id = variables
-        .get("teamId")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let issue_id = variables
-        .get("issueId")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let first = variables
-        .get("first")
-        .and_then(Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok());
-    let after = variables
-        .get("after")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let since = variables
-        .get("since")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let until = variables
-        .get("until")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let record = RequestRecord {
-        operation: operation.clone(),
-        team_id,
-        issue_id: issue_id.clone(),
-        first,
-        after: after.clone(),
-        since,
-        until,
+    let Some(record) = request_record(&operation, parsed.get("variables")) else {
+        let _ = write_http_response(
+            &mut stream,
+            400,
+            &json!({"error": "synthetic request scope"}),
+        );
+        return;
     };
     requests
         .lock()
         .expect("synthetic requests lock")
         .push(record.clone());
-    if !request_scope_is_valid(&record, query) {
+    if !query_contract_matches(&record.operation, query) {
         let _ = write_http_response(
             &mut stream,
             400,
@@ -874,8 +849,8 @@ fn handle_connection(
         match steps.pop_front() {
             Some(step)
                 if step.operation == operation
-                    && step.issue_id == issue_id
-                    && step.after == after =>
+                    && step.issue_id == record.issue_id
+                    && step.after == record.after =>
             {
                 Some(step)
             }
@@ -892,34 +867,109 @@ fn handle_connection(
     }
 }
 
-fn request_scope_is_valid(record: &RequestRecord, query: &str) -> bool {
-    if !query_contract_matches(&record.operation, query) {
-        return false;
-    }
-    match record.operation.as_str() {
+fn request_record(operation: &str, variables: Option<&Value>) -> Option<RequestRecord> {
+    let variables = variables?.as_object()?;
+    match operation {
         "NagiIssueUpperBound" => {
-            record.team_id.as_deref() == Some(SYNTHETIC_TEAM_ID)
-                && record.first == Some(1)
-                && record.issue_id.is_none()
-                && record.after.is_none()
-                && record.since.is_none()
-                && record.until.is_none()
+            if variables.len() != 2 {
+                return None;
+            }
+            let team_id = required_string(variables, "teamId")?;
+            let first = fixed_first(variables, 1)?;
+            (team_id == SYNTHETIC_TEAM_ID).then_some(RequestRecord {
+                operation: operation.to_owned(),
+                team_id: Some(team_id),
+                issue_id: None,
+                first: Some(first),
+                after: None,
+                since: None,
+                until: None,
+            })
         }
         "NagiIssueScan" => {
-            record.team_id.as_deref() == Some(SYNTHETIC_TEAM_ID)
-                && record.first == Some(FIXED_PAGE_SIZE)
-                && record.issue_id.is_none()
-                && record.since.is_some()
-                && record.until.is_some()
+            if variables.len() != 5 {
+                return None;
+            }
+            let team_id = required_string(variables, "teamId")?;
+            let since = required_timestamp(variables, "since")?;
+            let until = required_timestamp(variables, "until")?;
+            let first = fixed_first(variables, FIXED_PAGE_SIZE)?;
+            let after = optional_cursor(variables, "after")?;
+            (team_id == SYNTHETIC_TEAM_ID).then_some(RequestRecord {
+                operation: operation.to_owned(),
+                team_id: Some(team_id),
+                issue_id: None,
+                first: Some(first),
+                after,
+                since: Some(since),
+                until: Some(until),
+            })
         }
-        "NagiIssueLabels" | "NagiCurrentIssue" => {
-            record.team_id.is_none()
-                && record.first == Some(FIXED_PAGE_SIZE)
-                && record.issue_id.is_some()
-                && record.since.is_none()
-                && record.until.is_none()
+        "NagiIssueLabels" => {
+            if variables.len() != 3 {
+                return None;
+            }
+            let issue_id = required_id(variables, "issueId")?;
+            let first = fixed_first(variables, FIXED_PAGE_SIZE)?;
+            let after = optional_cursor(variables, "after")?;
+            Some(RequestRecord {
+                operation: operation.to_owned(),
+                team_id: None,
+                issue_id: Some(issue_id),
+                first: Some(first),
+                after,
+                since: None,
+                until: None,
+            })
         }
-        _ => false,
+        "NagiCurrentIssue" => {
+            if variables.len() != 2 {
+                return None;
+            }
+            let issue_id = required_id(variables, "issueId")?;
+            let first = fixed_first(variables, FIXED_PAGE_SIZE)?;
+            Some(RequestRecord {
+                operation: operation.to_owned(),
+                team_id: None,
+                issue_id: Some(issue_id),
+                first: Some(first),
+                after: None,
+                since: None,
+                until: None,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn required_string(variables: &serde_json::Map<String, Value>, name: &str) -> Option<String> {
+    variables.get(name)?.as_str().map(str::to_owned)
+}
+
+fn required_id(variables: &serde_json::Map<String, Value>, name: &str) -> Option<String> {
+    let value = required_string(variables, name)?;
+    validate_id(&value).ok().map(|_| value)
+}
+
+fn required_timestamp(variables: &serde_json::Map<String, Value>, name: &str) -> Option<String> {
+    let value = required_string(variables, name)?;
+    parse_timestamp(&value).ok().map(|_| value)
+}
+
+fn fixed_first(variables: &serde_json::Map<String, Value>, expected: usize) -> Option<usize> {
+    let value = variables.get("first")?.as_u64()?;
+    let value = usize::try_from(value).ok()?;
+    (value == expected).then_some(value)
+}
+
+fn optional_cursor(
+    variables: &serde_json::Map<String, Value>,
+    name: &str,
+) -> Option<Option<String>> {
+    match variables.get(name)? {
+        Value::Null => Some(None),
+        Value::String(value) => validate_cursor(value).ok().map(|_| Some(value.clone())),
+        _ => None,
     }
 }
 
@@ -986,6 +1036,9 @@ fn read_http_request(stream: &mut TcpStream) -> Result<Vec<u8>, PollError> {
 
 fn write_http_response(stream: &mut TcpStream, status: u16, body: &Value) -> Result<(), PollError> {
     let body = serde_json::to_vec(body).map_err(|_| PollError::RequestFailed)?;
+    if body.len() > MAX_RESPONSE_BYTES {
+        return Err(PollError::ResponseTooLarge);
+    }
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -1211,6 +1264,48 @@ mod tests {
             "UnknownOperation",
             UPPER_BOUND_QUERY
         ));
+
+        const SENTINEL_VARIABLE: &str = "credential-variable-sentinel-7e9a";
+        let (server, _poller) = server_and_poller([head_step(Some(T1))], 0);
+        let mut request_json: Value =
+            serde_json::from_slice(&GraphqlRequest::upper_bound(SYNTHETIC_TEAM_ID).body)
+                .expect("synthetic request JSON");
+        request_json["variables"]["credential"] = json!(SENTINEL_VARIABLE);
+        let request = GraphqlRequest {
+            body: serde_json::to_vec(&request_json).expect("synthetic request JSON"),
+        };
+        let request_debug = format!("{request:?}");
+        let mut transport = LoopbackTransport {
+            address: server.address(),
+        };
+        let response = transport
+            .execute(&request)
+            .expect("rejected request response");
+        assert_eq!(response.status, 400);
+        assert!(!String::from_utf8_lossy(&response.body).contains(SENTINEL_VARIABLE));
+        assert!(!request_debug.contains(SENTINEL_VARIABLE));
+        assert_eq!(server.remaining_steps(), 1);
+    }
+
+    #[test]
+    fn oversized_scripted_response_fails_bounded_and_tears_down_cleanly() {
+        let (server, _poller) = server_and_poller(
+            [step(
+                "NagiIssueUpperBound",
+                None,
+                None,
+                200,
+                json!({"data": null, "padding": "x".repeat(MAX_RESPONSE_BYTES)}),
+            )],
+            0,
+        );
+        let mut transport = LoopbackTransport {
+            address: server.address(),
+        };
+        let result = transport.execute(&GraphqlRequest::upper_bound(SYNTHETIC_TEAM_ID));
+        assert!(matches!(result, Err(PollError::RequestFailed)));
+        assert_eq!(server.remaining_steps(), 0);
+        drop(server);
     }
 
     #[test]
