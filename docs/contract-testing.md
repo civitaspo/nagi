@@ -100,13 +100,14 @@ its resulting private files but does not claim an OS-level hard limit for
 arbitrary raw sidecar output. The wrapper runs exactly one validated test binary
 through the sidecar harness and removes the generated target only after bounded
 cleanup. The synthetic Workflow covers
-Signal-With-Start bootstrap, payload-level signal idempotency and conflicting
-digest rejection, Update validation and stable update IDs, Query reads, and a
+Signal-With-Start bootstrap, full-payload signal idempotency and conflicting
+payload rejection, Update validation and stable update IDs, Query reads, and a
 post-commit response-loss recovery that queries state before retrying the same
 ID. Because temporalio-client 0.7.0 generates the Signal-With-Start transport
 request ID internally and does not expose it through `WorkflowStartOptions`, the
-resend witness uses a stable application logical message ID and payload digest,
-and queries a delivery counter to prove the resend reached the Workflow before
+resend witness uses a stable application logical message ID and full canonical
+signal payload, rejects any changed payload field for an existing logical ID,
+and queries the workflow state to prove the resend reached the Workflow before
 deduplication. The SDK and protoc are build-only contract dependencies; the
 standalone `nagi` binary and production runtime do not include this harness.
 No app bundle, provisioning profile, or signing identity is required.

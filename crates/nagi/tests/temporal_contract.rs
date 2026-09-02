@@ -77,6 +77,30 @@ fn temporal_message_contract_is_explicitly_opt_in_and_build_only() {
 }
 
 #[test]
+fn temporal_message_contract_uses_full_signal_payload_and_one_state_query() {
+    for required in [
+        "derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)",
+        "if applied != &signal",
+        "signal_deliveries,",
+        "CONFLICTING_SIGNAL_DELTA",
+        "digest: START_SIGNAL_DIGEST.to_owned(),",
+        "delta: CONFLICTING_SIGNAL_DELTA,",
+        "wait_for_state(&handle, (1, 1, 0, 2, 0, false)).await",
+    ] {
+        assert!(
+            TEMPORAL_MESSAGE_TEST.contains(required),
+            "Temporal message contract is missing {required:?}"
+        );
+    }
+    for obsolete in ["signal_delivery_count", "wait_for_signal_deliveries"] {
+        assert!(
+            !TEMPORAL_MESSAGE_TEST.contains(obsolete),
+            "Temporal message contract still has a separate delivery query: {obsolete:?}"
+        );
+    }
+}
+
+#[test]
 fn temporal_contract_has_stable_boundary_invariants() {
     for required in [
         "provenance_manifest",
@@ -213,7 +237,7 @@ fn temporal_message_wrapper_binds_the_private_locked_toolchain() {
         "current_uid",
         "validated_home",
         "rust_toolchain_host",
-        "validate_tool_tree",
+        "validate_current_user_owned_tree",
         "validate_tool_executable",
         "rust_toolchain_source",
         "protoc_source",
@@ -266,6 +290,8 @@ fn temporal_message_wrapper_binds_the_private_locked_toolchain() {
             "Temporal message wrapper is missing {required:?}"
         );
     }
+    assert!(!TEMPORAL_MESSAGE_SCRIPT.contains("validate_tool_tree"));
+    assert!(!TEMPORAL_MESSAGE_SCRIPT.contains("validate_registry_tree"));
     assert!(!TEMPORAL_MESSAGE_SCRIPT.contains("-perm -111"));
     assert!(!TEMPORAL_MESSAGE_SCRIPT.contains("$(/usr/bin/id -u) 755 1"));
     for obsolete in [

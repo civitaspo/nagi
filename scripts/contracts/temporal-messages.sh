@@ -113,7 +113,7 @@ fi
 # directly. Both the source and clone trees are current-user-owned, canonical
 # trees of directories and single-link regular files; no symlink can redirect
 # a tool or an include file.
-validate_tool_tree() {
+validate_current_user_owned_tree() {
   if (($# != 1)); then
     return 1
   fi
@@ -160,8 +160,8 @@ validate_tool_executable() {
 
 rust_toolchain_source="${validated_home}/.rustup/toolchains/1.98.0-${rust_toolchain_host}"
 protoc_source="${validated_home}/.local/share/mise/installs/aqua-protocolbuffers-protobuf-protoc/36.1"
-if ! validate_tool_tree "${rust_toolchain_source}" \
-  || ! validate_tool_tree "${protoc_source}"; then
+if ! validate_current_user_owned_tree "${rust_toolchain_source}" \
+  || ! validate_current_user_owned_tree "${protoc_source}"; then
   echo "Temporal message contract requires validated installed tool distributions." >&2
   exit 1
 fi
@@ -270,40 +270,10 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 143' HUP INT TERM
 
-validate_registry_tree() {
-  if (($# != 1)); then
-    return 1
-  fi
-  local registry_path="$1"
-  local registry_real_path
-  local invalid_registry_entries
-
-  if [[ "${registry_path}" != /* ]] \
-    || ! live_validate_path_components "${registry_path}" \
-    || [[ ! -d "${registry_path}" || -L "${registry_path}" ]]; then
-    return 1
-  fi
-  registry_real_path="$(cd "${registry_path}" 2>/dev/null && pwd -P 2>/dev/null)" \
-    || return 1
-  [[ "${registry_real_path}" == "${registry_path}" ]] || return 1
-  if [[ "$(/usr/bin/stat -f '%u' "${registry_path}" 2>/dev/null || true)" != "${current_uid}" ]]; then
-    return 1
-  fi
-
-  if ! invalid_registry_entries="$(/usr/bin/find -P "${registry_path}" \
-    \( -type l -o \( ! -type d ! -type f \) \
-      -o \( -type f ! -links 1 \) -o ! -uid "${current_uid}" \
-      -o \( -perm -020 -o -perm -002 \) \) \
-    -print -quit 2>/dev/null)"; then
-    return 1
-  fi
-  [[ -z "${invalid_registry_entries}" ]]
-}
-
 developer_registry_cache="${validated_home}/.cargo/registry/cache"
 developer_registry_index="${validated_home}/.cargo/registry/index"
-if ! validate_registry_tree "${developer_registry_cache}" \
-  || ! validate_registry_tree "${developer_registry_index}"; then
+if ! validate_current_user_owned_tree "${developer_registry_cache}" \
+  || ! validate_current_user_owned_tree "${developer_registry_index}"; then
   echo "Temporal message contract requires validated developer Cargo registry directories." >&2
   exit 1
 fi
@@ -334,8 +304,8 @@ if [[ -e "${private_registry_cache}" || -L "${private_registry_cache}" \
 fi
 if ! /bin/cp -cR "${developer_registry_cache}" "${private_registry_cache}" >/dev/null 2>&1 \
   || ! /bin/cp -cR "${developer_registry_index}" "${private_registry_index}" >/dev/null 2>&1 \
-  || ! validate_registry_tree "${private_registry_cache}" \
-  || ! validate_registry_tree "${private_registry_index}"; then
+  || ! validate_current_user_owned_tree "${private_registry_cache}" \
+  || ! validate_current_user_owned_tree "${private_registry_index}"; then
   echo "Temporal message contract could not establish its private Cargo registry." >&2
   exit 1
 fi
@@ -346,7 +316,7 @@ clone_tool_tree() {
   fi
   local source="$1"
   local destination="$2"
-  if ! validate_tool_tree "${source}" \
+  if ! validate_current_user_owned_tree "${source}" \
     || [[ "${destination}" != /* ]] \
     || ! live_validate_path_components "${destination}" \
     || [[ -e "${destination}" || -L "${destination}" ]]; then
@@ -354,7 +324,7 @@ clone_tool_tree() {
   fi
   /bin/cp -cR "${source}" "${destination}" >/dev/null 2>&1 \
     && /bin/chmod 700 "${destination}" >/dev/null 2>&1 \
-    && validate_tool_tree "${destination}"
+    && validate_current_user_owned_tree "${destination}"
 }
 
 private_rust_toolchain="${contract_tmp}/rust-toolchain"
@@ -462,10 +432,10 @@ if ((message_contract_status == 0)); then
     message_contract_status=1
   fi
 fi
-if ! validate_tool_tree "${rust_toolchain_source}" \
-  || ! validate_tool_tree "${protoc_source}" \
-  || ! validate_tool_tree "${private_rust_toolchain}" \
-  || ! validate_tool_tree "${private_protoc}" \
+if ! validate_current_user_owned_tree "${rust_toolchain_source}" \
+  || ! validate_current_user_owned_tree "${protoc_source}" \
+  || ! validate_current_user_owned_tree "${private_rust_toolchain}" \
+  || ! validate_current_user_owned_tree "${private_protoc}" \
   || ! validate_tool_executable "${rustc_source}" \
   || ! validate_tool_executable "${cargo_source}" \
   || ! validate_tool_executable "${protoc_source_binary}" \

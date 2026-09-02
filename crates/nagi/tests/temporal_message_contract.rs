@@ -41,15 +41,17 @@ const WORKFLOW_ID: &str = "nagi-contract-message-workflow-v1";
 const TASK_QUEUE: &str = "nagi-contract-message-v1";
 const START_SIGNAL_ID: &str = "logical-signal-v1";
 const START_SIGNAL_DIGEST: &str = "digest-a";
-const MISMATCHED_SIGNAL_DIGEST: &str = "digest-b";
+const CONFLICTING_SIGNAL_DELTA: i32 = 99;
 const UPDATE_ID: &str = "logical-update-v1";
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct LogicalSignal {
     logical_id: String,
     digest: String,
     delta: i32,
 }
+
+type MessageState = (i32, usize, usize, u32, u32, bool);
 
 #[workflow]
 #[derive(Default)]
@@ -70,9 +72,10 @@ impl MessageWorkflow {
         Ok(ctx.state(|state| state.total))
     }
 
-    /// Signals are application-idempotent: a logical signal ID and payload
-    /// digest are applied once even when separate transport requests carry the
-    /// same logical message. A conflicting digest is ignored (fail closed).
+    /// Signals are application-idempotent: a logical signal ID and its full
+    /// canonical payload are applied once even when separate transport
+    /// requests carry the same logical message. A conflicting payload is
+    /// ignored (fail closed).
     #[signal]
     fn apply_signal(&mut self, _ctx: &mut SyncWorkflowContext<Self>, signal: LogicalSignal) {
         self.signal_deliveries += 1;
@@ -85,8 +88,8 @@ impl MessageWorkflow {
             self.applied_signals.push(signal);
             return;
         };
-        if applied.digest != signal.digest {
-            // A conflicting payload is an observable application-level
+        if applied != &signal {
+            // A conflicting full payload is an observable application-level
             // rejection, but it never changes the business total or replaces
             // the first accepted payload.
             self.rejected_signal_conflicts += 1;
@@ -94,19 +97,15 @@ impl MessageWorkflow {
     }
 
     #[query]
-    fn state(&self, _ctx: &WorkflowContextView) -> (i32, usize, usize, u32, bool) {
+    fn state(&self, _ctx: &WorkflowContextView) -> MessageState {
         (
             self.total,
             self.applied_signals.len(),
             self.rejected_signal_conflicts,
+            self.signal_deliveries,
             self.update_invocations,
             self.finished,
         )
-    }
-
-    #[query]
-    fn signal_delivery_count(&self, _ctx: &WorkflowContextView) -> u32 {
-        self.signal_deliveries
     }
 
     #[update_validator(complete)]
@@ -235,7 +234,7 @@ async fn make_start_signal(data_converter: &DataConverter) -> WorkflowStartSigna
 
 async fn query_state(
     handle: &temporalio_client::WorkflowHandle<Client, message_workflow::Run>,
-) -> Result<(i32, usize, usize, u32, bool), temporalio_client::errors::WorkflowQueryError> {
+) -> Result<MessageState, temporalio_client::errors::WorkflowQueryError> {
     handle
         .query(
             MessageWorkflow::state,
@@ -249,7 +248,7 @@ async fn query_state(
 
 async fn wait_for_state(
     handle: &temporalio_client::WorkflowHandle<Client, message_workflow::Run>,
-    expected: (i32, usize, usize, u32, bool),
+    expected: MessageState,
 ) {
     for _ in 0..80 {
         if let Ok(actual) = query_state(handle).await
@@ -260,29 +259,6 @@ async fn wait_for_state(
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("synthetic workflow did not reach the expected queried state")
-}
-
-async fn wait_for_signal_deliveries(
-    handle: &temporalio_client::WorkflowHandle<Client, message_workflow::Run>,
-    expected: u32,
-) {
-    for _ in 0..80 {
-        if let Ok(actual) = handle
-            .query(
-                MessageWorkflow::signal_delivery_count,
-                (),
-                WorkflowQueryOptions::builder()
-                    .rpc_options(bounded_rpc_options())
-                    .build(),
-            )
-            .await
-            && actual == expected
-        {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    panic!("synthetic workflow did not observe the expected signal deliveries")
 }
 
 fn update_options(update_id: &str) -> WorkflowExecuteUpdateOptions {
@@ -338,13 +314,14 @@ async fn temporal_message_contract_exercises_messages() {
 
             // The start signal is delivered before the first workflow task. A query
             // proves both delivery and the workflow-level logical-ID idempotency key.
-            wait_for_state(&handle, (1, 1, 0, 0, false)).await;
+            wait_for_state(&handle, (1, 1, 0, 1, 0, false)).await;
 
             // temporalio-client 0.7.0 generates the Signal-With-Start transport
             // request ID internally, so this resend deliberately uses the same
-            // application logical ID and digest instead. UseExisting makes the
-            // running execution explicit, and the delivery counter proves the
-            // second Signal-With-Start was observed before application deduplication.
+            // application logical ID and full payload instead. UseExisting makes
+            // the running execution explicit, and the delivery counter proves
+            // the second Signal-With-Start was observed before application
+            // deduplication.
             let resend_handle = client
                 .start_workflow(
                     MessageWorkflow::run,
@@ -358,10 +335,10 @@ async fn temporal_message_contract_exercises_messages() {
                 .await
                 .expect("Signal-With-Start resend should use the running workflow");
             assert_eq!(resend_handle.run_id(), handle.run_id());
-            wait_for_signal_deliveries(&handle, 2).await;
+            wait_for_state(&handle, (1, 1, 0, 2, 0, false)).await;
             assert_eq!(
                 query_state(&handle).await.expect("SWS resend query"),
-                (1, 1, 0, 0, false)
+                (1, 1, 0, 2, 0, false)
             );
 
             // Use distinct transport request IDs while retaining one logical ID. The
@@ -384,8 +361,7 @@ async fn temporal_message_contract_exercises_messages() {
                     .await
                     .expect("duplicate logical signal should be accepted");
             }
-            wait_for_signal_deliveries(&handle, 4).await;
-            wait_for_state(&handle, (1, 1, 0, 0, false)).await;
+            wait_for_state(&handle, (1, 1, 0, 4, 0, false)).await;
 
             let mismatched_signal_options = WorkflowSignalOptions::builder()
                 .request_id("synthetic-signal-request-mismatch".to_owned())
@@ -396,19 +372,19 @@ async fn temporal_message_contract_exercises_messages() {
                     MessageWorkflow::apply_signal,
                     LogicalSignal {
                         logical_id: START_SIGNAL_ID.to_owned(),
-                        digest: MISMATCHED_SIGNAL_DIGEST.to_owned(),
-                        delta: 99,
+                        digest: START_SIGNAL_DIGEST.to_owned(),
+                        delta: CONFLICTING_SIGNAL_DELTA,
                     },
                     mismatched_signal_options,
                 )
                 .await
                 .expect("conflicting logical signal should be accepted then ignored");
-            // A conflicting digest cannot mutate the already-applied logical signal.
-            wait_for_signal_deliveries(&handle, 5).await;
-            wait_for_state(&handle, (1, 1, 1, 0, false)).await;
+            // A changed delta with the same declared digest cannot mutate the
+            // already-applied logical signal.
+            wait_for_state(&handle, (1, 1, 1, 5, 0, false)).await;
             assert_eq!(
                 query_state(&handle).await.expect("stable query"),
-                (1, 1, 1, 0, false)
+                (1, 1, 1, 5, 0, false)
             );
 
             // The validator rejects before the handler mutates state.
@@ -423,7 +399,7 @@ async fn temporal_message_contract_exercises_messages() {
                 matches!(invalid_update, Err(WorkflowUpdateError::Failed(_))),
                 "negative Update must be rejected by its validator"
             );
-            wait_for_state(&handle, (1, 1, 1, 0, false)).await;
+            wait_for_state(&handle, (1, 1, 1, 5, 0, false)).await;
 
             let response_loss = Arc::new(ResponseLossOnce::new());
             let response_options = ClientOptions::new(namespace)
@@ -444,7 +420,7 @@ async fn temporal_message_contract_exercises_messages() {
                 matches!(lost_response, Err(WorkflowUpdateError::Other(_))),
                 "the first Update result must model a lost client response"
             );
-            wait_for_state(&handle, (7, 1, 1, 1, false)).await;
+            wait_for_state(&handle, (7, 1, 1, 5, 1, false)).await;
 
             // A retry is allowed only after state inspection and carries the exact same
             // stable Update ID. Temporal returns the original handler result. The
@@ -456,7 +432,7 @@ async fn temporal_message_contract_exercises_messages() {
             assert_eq!(recovered_result, 1);
             assert_eq!(
                 query_state(&handle).await.expect("stable post-retry query"),
-                (7, 1, 1, 1, false)
+                (7, 1, 1, 5, 1, false)
             );
             assert_eq!(
                 response_loss.update_ids(),
@@ -474,7 +450,7 @@ async fn temporal_message_contract_exercises_messages() {
                 )
                 .await
                 .expect("finish signal should close the synthetic workflow");
-            wait_for_state(&handle, (7, 1, 1, 1, true)).await;
+            wait_for_state(&handle, (7, 1, 1, 5, 1, true)).await;
 
             let result = handle
                 .get_result(
