@@ -108,7 +108,11 @@ request ID internally and does not expose it through `WorkflowStartOptions`, the
 resend witness uses a stable application logical message ID and full canonical
 signal payload, rejects any changed payload field for an existing logical ID,
 and queries the workflow state to prove the resend reached the Workflow before
-deduplication. The SDK and protoc are build-only contract dependencies; the
+deduplication. Every Signal-With-Start request explicitly combines `UseExisting`
+for a running execution with `RejectDuplicate` for a closed execution. After
+the synthetic Workflow completes, a same-ID retry must return the SDK's
+`AlreadyStarted` error and leave the queried state unchanged. The SDK and protoc
+are build-only contract dependencies; the
 standalone `nagi` binary and production runtime do not include this harness.
 No app bundle, provisioning profile, or signing identity is required.
 

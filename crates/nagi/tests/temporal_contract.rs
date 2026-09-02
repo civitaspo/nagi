@@ -86,6 +86,11 @@ fn temporal_message_contract_uses_full_signal_payload_and_one_state_query() {
         "digest: START_SIGNAL_DIGEST.to_owned(),",
         "delta: CONFLICTING_SIGNAL_DELTA,",
         "wait_for_state(&handle, (1, 1, 0, 2, 0, false)).await",
+        "WorkflowIdConflictPolicy::UseExisting",
+        "WorkflowIdReusePolicy::RejectDuplicate",
+        "WorkflowStartError::AlreadyStarted",
+        "closed_retry",
+        "no new run or start-signal mutation",
     ] {
         assert!(
             TEMPORAL_MESSAGE_TEST.contains(required),
@@ -98,6 +103,20 @@ fn temporal_message_contract_uses_full_signal_payload_and_one_state_query() {
             "Temporal message contract still has a separate delivery query: {obsolete:?}"
         );
     }
+    assert!(!TEMPORAL_MESSAGE_TEST.contains("SWS resend query"));
+    assert!(!TEMPORAL_MESSAGE_TEST.contains("stable query"));
+    assert_eq!(
+        TEMPORAL_MESSAGE_TEST
+            .matches(".id_conflict_policy(WorkflowIdConflictPolicy::UseExisting)")
+            .count(),
+        3
+    );
+    assert_eq!(
+        TEMPORAL_MESSAGE_TEST
+            .matches(".id_reuse_policy(WorkflowIdReusePolicy::RejectDuplicate)")
+            .count(),
+        3
+    );
 }
 
 #[test]

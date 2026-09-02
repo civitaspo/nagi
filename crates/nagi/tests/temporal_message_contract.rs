@@ -21,11 +21,15 @@ use temporalio_client::{
     Client, ClientInterceptor, ClientOptions, Connection, ConnectionOptions, Next,
     PollWorkflowUpdateInput, PollWorkflowUpdateOutput, RetryOptions, RpcOptions, Url,
     WorkflowExecuteUpdateOptions, WorkflowGetResultOptions, WorkflowQueryOptions,
-    WorkflowSignalOptions, WorkflowStartOptions, WorkflowStartSignal, errors::WorkflowUpdateError,
+    WorkflowSignalOptions, WorkflowStartOptions, WorkflowStartSignal,
+    errors::{WorkflowStartError, WorkflowUpdateError},
 };
 use temporalio_common::{
     data_converters::{DataConverter, SerializationContextData},
-    protos::temporal::api::{common::v1::Payloads, enums::v1::WorkflowIdConflictPolicy},
+    protos::temporal::api::{
+        common::v1::Payloads,
+        enums::v1::{WorkflowIdConflictPolicy, WorkflowIdReusePolicy},
+    },
 };
 use temporalio_sdk::{
     Runtime, SyncWorkflowContext, Worker, WorkerOptions, WorkflowContext, WorkflowContextView,
@@ -304,6 +308,7 @@ async fn temporal_message_contract_exercises_messages() {
 
             let start_options = WorkflowStartOptions::new(TASK_QUEUE, WORKFLOW_ID)
                 .id_conflict_policy(WorkflowIdConflictPolicy::UseExisting)
+                .id_reuse_policy(WorkflowIdReusePolicy::RejectDuplicate)
                 .start_signal(start_signal.clone())
                 .rpc_options(bounded_rpc_options())
                 .build();
@@ -328,7 +333,8 @@ async fn temporal_message_contract_exercises_messages() {
                     (),
                     WorkflowStartOptions::new(TASK_QUEUE, WORKFLOW_ID)
                         .id_conflict_policy(WorkflowIdConflictPolicy::UseExisting)
-                        .start_signal(start_signal)
+                        .id_reuse_policy(WorkflowIdReusePolicy::RejectDuplicate)
+                        .start_signal(start_signal.clone())
                         .rpc_options(bounded_rpc_options())
                         .build(),
                 )
@@ -336,10 +342,6 @@ async fn temporal_message_contract_exercises_messages() {
                 .expect("Signal-With-Start resend should use the running workflow");
             assert_eq!(resend_handle.run_id(), handle.run_id());
             wait_for_state(&handle, (1, 1, 0, 2, 0, false)).await;
-            assert_eq!(
-                query_state(&handle).await.expect("SWS resend query"),
-                (1, 1, 0, 2, 0, false)
-            );
 
             // Use distinct transport request IDs while retaining one logical ID. The
             // application, rather than transport retry behavior, owns deduplication.
@@ -382,10 +384,6 @@ async fn temporal_message_contract_exercises_messages() {
             // A changed delta with the same declared digest cannot mutate the
             // already-applied logical signal.
             wait_for_state(&handle, (1, 1, 1, 5, 0, false)).await;
-            assert_eq!(
-                query_state(&handle).await.expect("stable query"),
-                (1, 1, 1, 5, 0, false)
-            );
 
             // The validator rejects before the handler mutates state.
             let invalid_update = handle
@@ -462,6 +460,33 @@ async fn temporal_message_contract_exercises_messages() {
                 .await
                 .expect("completed workflow result");
             assert_eq!(result, 7);
+
+            // A closed workflow ID cannot be reused, even when a Signal-With-Start
+            // request asks to use an existing running execution. The explicit
+            // AlreadyStarted error proves that no new run or start-signal mutation
+            // was created after completion.
+            let closed_retry = client
+                .start_workflow(
+                    MessageWorkflow::run,
+                    (),
+                    WorkflowStartOptions::new(TASK_QUEUE, WORKFLOW_ID)
+                        .id_conflict_policy(WorkflowIdConflictPolicy::UseExisting)
+                        .id_reuse_policy(WorkflowIdReusePolicy::RejectDuplicate)
+                        .start_signal(start_signal)
+                        .rpc_options(bounded_rpc_options())
+                        .build(),
+                )
+                .await;
+            assert!(
+                matches!(closed_retry, Err(WorkflowStartError::AlreadyStarted { .. })),
+                "closed Signal-With-Start retry must return AlreadyStarted"
+            );
+            assert_eq!(
+                query_state(&handle)
+                    .await
+                    .expect("closed retry must leave state queryable"),
+                (7, 1, 1, 5, 1, true)
+            );
 
             shutdown_worker();
             let worker_result = tokio::time::timeout(Duration::from_secs(10), worker_task)
