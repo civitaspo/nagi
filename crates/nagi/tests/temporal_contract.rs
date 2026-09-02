@@ -123,9 +123,14 @@ fn temporal_cli_provenance_is_architecture_specific_and_public() {
     let digest_guard = TEMPORAL_SCRIPT
         .find(r#"[[ "${binary_sha256_before}" != "${expected_binary_sha256}" ]]"#)
         .expect("Temporal contract must reject an unexpected executable digest");
+    let version_query = TEMPORAL_SCRIPT
+        .find(r#""${temporal_binary}" --disable-config-env --disable-config-file --version"#)
+        .expect("Temporal contract must query the executable version");
     let server_start = TEMPORAL_SCRIPT
         .find("start_server_with_retry yes")
         .expect("Temporal contract must start the sidecar after provenance checks");
+    assert!(digest_guard < version_query);
+    assert!(version_query < server_start);
     assert!(digest_guard < server_start);
 }
 

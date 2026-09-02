@@ -50,19 +50,10 @@ case "${temporal_binary}" in
     ;;
 esac
 
-if ! version_output="$(/usr/bin/env -i PATH=/usr/bin:/bin HOME=/ TMPDIR=/tmp LANG=C \
-  "${temporal_binary}" --disable-config-env --disable-config-file --version 2>/dev/null)"; then
-  echo "Temporal contract layer could not query the Temporal CLI version." >&2
-  exit 1
-fi
 expected_file_prefix="Mach-O"
 file_description="$(/usr/bin/file -b "${temporal_binary}" 2>/dev/null || true)"
 if [[ "${file_description}" != "${expected_file_prefix}"* ]]; then
   echo "Temporal contract layer found a non-native Temporal CLI executable." >&2
-  exit 1
-fi
-if [[ "${version_output}" != "temporal version 1.8.2 (Server 1.31.2, UI 2.50.1)" ]]; then
-  echo "Temporal contract layer found an unexpected Temporal CLI version." >&2
   exit 1
 fi
 
@@ -192,9 +183,17 @@ if [[ "${lock_archive_sha256}" != "${expected_archive_sha256}" ]] \
   exit 1
 fi
 if [[ "${file_description}" != "${expected_file_description}" ]] \
-  || [[ "${version_output}" != "${expected_version_output}" ]] \
   || [[ "${binary_sha256_before}" != "${expected_binary_sha256}" ]]; then
   echo "Temporal contract layer rejected the Temporal CLI provenance." >&2
+  exit 1
+fi
+if ! version_output="$(/usr/bin/env -i PATH=/usr/bin:/bin HOME=/ TMPDIR=/tmp LANG=C \
+  "${temporal_binary}" --disable-config-env --disable-config-file --version 2>/dev/null)"; then
+  echo "Temporal contract layer could not query the Temporal CLI version." >&2
+  exit 1
+fi
+if [[ "${version_output}" != "${expected_version_output}" ]]; then
+  echo "Temporal contract layer found an unexpected Temporal CLI version." >&2
   exit 1
 fi
 
