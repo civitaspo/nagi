@@ -29,7 +29,13 @@ fi
 
 [tasks.test]
 description = "Run the Rust test suite"
-run = "cargo test --workspace --locked"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+cargo test --workspace --locked
+cargo test --locked --features temporal-replay-contract --test temporal_replay_contract temporal_replay_checked_corpus -- --exact
+"""
 
 [tasks.build]
 description = "Build the Rust workspace"
@@ -63,6 +69,10 @@ run = "scripts/contracts/temporal-messages.sh"
 [tasks."contract:temporal-activities"]
 description = "Run the explicitly enabled local Temporal Activity recovery contract"
 run = "scripts/contracts/temporal-activities.sh"
+
+[tasks."contract:temporal-replay"]
+description = "Run the explicitly enabled local Temporal replay compatibility contract"
+run = "scripts/contracts/temporal-replay.sh"
 
 [tasks."contract:live"]
 description = "Preflight explicitly enabled live-provider contract tests"
