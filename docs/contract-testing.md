@@ -75,16 +75,21 @@ Temporal message handling is a separate opt-in macOS contract, enabled with
 wrapper requires a clean checked revision and builds the feature-gated
 `temporalio-sdk = "=0.7.0"` test with the locked `rust@1.98.0` and
 `aqua:protocolbuffers/protobuf/protoc@36.1` tools into the dedicated
-`target/nagi-temporal-message-contract` directory. The build uses private
-mode-0700 `HOME`, `CARGO_HOME`, and mise config/cache/state directories. It
-clone-copies only validated Cargo registry cache and index trees, then invokes
-Cargo offline with the lockfile, so developer Cargo configuration, credentials,
-and unpacked registry sources are not read. Exact `rustc`, `cargo`, and `protoc` probes
-must match before and after the build; the current-user native mise executable
-is validated and its SHA-256 must remain unchanged. Build, probe, and sidecar
-output stays in private bounded files. The wrapper runs exactly one validated
-test binary through the sidecar harness and removes the generated target only
-after bounded cleanup. The synthetic Workflow covers
+`target/nagi-temporal-message-contract` directory. The wrapper validates the
+installed architecture-specific Rust `1.98.0` and protoc `36.1` trees as
+canonical current-user-owned trees containing only directories and single-link
+regular files, then APFS-clone-copies both complete distributions (including
+protoc includes) into a private store. The build uses only the private Rust and
+protoc `PATH`, mode-0700 `HOME` and `CARGO_HOME`, and clone-copied Cargo
+registry cache and index trees, then invokes Cargo offline with the lockfile.
+Developer Cargo configuration, credentials, unpacked sources, and mise
+read/write state are not used. Exact `rustc`, `cargo`, and `protoc` probes must
+match before and after the build; each source executable SHA-256 is bound before
+cloning, the private copies must match it, and the private hashes must remain
+unchanged across the build.
+Build, probe, and sidecar output stays in private bounded files. The wrapper
+runs exactly one validated test binary through the sidecar harness and removes
+the generated target only after bounded cleanup. The synthetic Workflow covers
 Signal-With-Start bootstrap, payload-level signal idempotency and conflicting
 digest rejection, Update validation and stable update IDs, Query reads, and a
 post-commit response-loss recovery that queries state before retrying the same

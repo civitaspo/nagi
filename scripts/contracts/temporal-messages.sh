@@ -17,8 +17,14 @@ if [[ ! "${current_uid}" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 case "$(/usr/bin/uname -m)" in
-  arm64) mise_expected_file_description="Mach-O 64-bit executable arm64" ;;
-  x86_64) mise_expected_file_description="Mach-O 64-bit executable x86_64" ;;
+  arm64)
+    rust_toolchain_host="aarch64-apple-darwin"
+    expected_file_description="Mach-O 64-bit executable arm64"
+    ;;
+  x86_64)
+    rust_toolchain_host="x86_64-apple-darwin"
+    expected_file_description="Mach-O 64-bit executable x86_64"
+    ;;
   *)
     echo "Temporal message contract requires a supported macOS architecture." >&2
     exit 1
@@ -58,57 +64,16 @@ if ! revision="$(live_read_checked_revision "${git_path}" "${repo_root}")"; then
   exit 1
 fi
 
-home_directory="${HOME:-}"
-if ! live_validate_home_directory "${home_directory}" \
-  || ! live_validate_path_components "${home_directory}"; then
+validated_home="${HOME:-}"
+if ! live_validate_home_directory "${validated_home}" \
+  || ! live_validate_path_components "${validated_home}"; then
   echo "Temporal message contract requires a validated developer home directory for the locked build." >&2
   exit 1
 fi
 
-developer_mise_data="${home_directory}/.local/share/mise"
-if [[ "${developer_mise_data}" != /* ]] \
-  || ! live_validate_path_components "${developer_mise_data}" \
-  || [[ ! -d "${developer_mise_data}" || -L "${developer_mise_data}" ]]; then
-  echo "Temporal message contract requires a validated developer mise data directory." >&2
-  exit 1
-fi
-if ! developer_mise_data_real="$(cd "${developer_mise_data}" 2>/dev/null && pwd -P 2>/dev/null)" \
-  || [[ "${developer_mise_data_real}" != "${developer_mise_data}" ]]; then
-  echo "Temporal message contract requires a real developer mise data directory." >&2
-  exit 1
-fi
-
-mise_path=""
-validate_mise_executable() {
-  if (($# != 1)); then
-    return 1
-  fi
-  local candidate="$1"
-  local ownership
-  local file_description
-  if ! live_trusted_executable "${candidate}"; then
-    return 1
-  fi
-  ownership="$(/usr/bin/stat -f '%u %l' "${candidate}" 2>/dev/null || true)"
-  if [[ "${ownership}" != "${current_uid} 1" ]]; then
-    return 1
-  fi
-  file_description="$(/usr/bin/file -b "${candidate}" 2>/dev/null || true)"
-  [[ "${file_description}" == "${mise_expected_file_description}" ]]
-}
-for candidate in \
-  "${home_directory}/.local/bin/mise" \
-  /opt/homebrew/bin/mise \
-  /usr/local/bin/mise \
-  /usr/bin/mise \
-  /bin/mise; do
-  if validate_mise_executable "${candidate}"; then
-    mise_path="${candidate}"
-    break
-  fi
-done
-if [[ -z "${mise_path}" ]]; then
-  echo "Temporal message contract requires the pinned mise executable." >&2
+validated_home_real="$(cd "${validated_home}" 2>/dev/null && pwd -P 2>/dev/null || true)"
+if [[ "${validated_home_real}" != "${validated_home}" ]]; then
+  echo "Temporal message contract requires a canonical developer home directory." >&2
   exit 1
 fi
 
@@ -136,6 +101,82 @@ esac
 temporal_source_directory="${temporal_binary_source%/*}"
 if ! live_validate_path_components "${temporal_source_directory}"; then
   echo "Temporal message contract rejected the Temporal CLI directory." >&2
+  exit 1
+fi
+
+# The message contract must not let mise resolve or install anything during the
+# build. It clone-copies the already-installed, exact Rust and protoc
+# distributions into the run-private store and invokes their leaf binaries
+# directly. Both the source and clone trees are current-user-owned, canonical
+# trees of directories and single-link regular files; no symlink can redirect
+# a tool or an include file.
+validate_tool_tree() {
+  if (($# != 1)); then
+    return 1
+  fi
+  local tree="$1"
+  local tree_real
+  local invalid_entries
+  if [[ "${tree}" != /* ]] \
+    || ! live_validate_path_components "${tree}" \
+    || [[ ! -d "${tree}" || -L "${tree}" ]]; then
+    return 1
+  fi
+  tree_real="$(cd "${tree}" 2>/dev/null && pwd -P 2>/dev/null || true)"
+  [[ "${tree_real}" == "${tree}" ]] || return 1
+  if [[ "$(/usr/bin/stat -f '%u' "${tree}" 2>/dev/null || true)" != "${current_uid}" ]]; then
+    return 1
+  fi
+  if ! invalid_entries="$(/usr/bin/find -P "${tree}" \
+    \( -type l -o \( ! -type d ! -type f \) \
+      -o \( -type f ! -links 1 \) -o \( ! -uid "${current_uid}" \) \) \
+    -print -quit 2>/dev/null)"; then
+    return 1
+  fi
+  [[ -z "${invalid_entries}" ]]
+}
+
+validate_tool_executable() {
+  if (($# != 1)); then
+    return 1
+  fi
+  local executable="$1"
+  local ownership
+  local file_description
+  if ! live_trusted_executable "${executable}"; then
+    return 1
+  fi
+  ownership="$(/usr/bin/stat -f '%u %l' "${executable}" 2>/dev/null || true)"
+  if [[ "${ownership}" != "${current_uid} 1" ]]; then
+    return 1
+  fi
+  file_description="$(/usr/bin/file -b "${executable}" 2>/dev/null || true)"
+  [[ "${file_description}" == "${expected_file_description}" ]]
+}
+
+rust_toolchain_source="${validated_home}/.rustup/toolchains/1.98.0-${rust_toolchain_host}"
+protoc_source="${validated_home}/.local/share/mise/installs/aqua-protocolbuffers-protobuf-protoc/36.1"
+if ! validate_tool_tree "${rust_toolchain_source}" \
+  || ! validate_tool_tree "${protoc_source}"; then
+  echo "Temporal message contract requires validated installed tool distributions." >&2
+  exit 1
+fi
+rustc_source="${rust_toolchain_source}/bin/rustc"
+cargo_source="${rust_toolchain_source}/bin/cargo"
+protoc_source_binary="${protoc_source}/bin/protoc"
+if ! validate_tool_executable "${rustc_source}" \
+  || ! validate_tool_executable "${cargo_source}" \
+  || ! validate_tool_executable "${protoc_source_binary}"; then
+  echo "Temporal message contract rejected an installed tool executable." >&2
+  exit 1
+fi
+rustc_source_sha256="$(live_binary_sha256 "${rustc_source}" 2>/dev/null || true)"
+cargo_source_sha256="$(live_binary_sha256 "${cargo_source}" 2>/dev/null || true)"
+protoc_source_sha256="$(live_binary_sha256 "${protoc_source_binary}" 2>/dev/null || true)"
+if [[ ! "${rustc_source_sha256}" =~ ^[0-9a-f]{64}$ \
+  || ! "${cargo_source_sha256}" =~ ^[0-9a-f]{64}$ \
+  || ! "${protoc_source_sha256}" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "Temporal message contract could not bind the installed tool executable digests." >&2
   exit 1
 fi
 
@@ -237,8 +278,8 @@ validate_registry_tree() {
   [[ -z "${invalid_registry_entries}" ]]
 }
 
-developer_registry_cache="${home_directory}/.cargo/registry/cache"
-developer_registry_index="${home_directory}/.cargo/registry/index"
+developer_registry_cache="${validated_home}/.cargo/registry/cache"
+developer_registry_index="${validated_home}/.cargo/registry/index"
 if ! validate_registry_tree "${developer_registry_cache}" \
   || ! validate_registry_tree "${developer_registry_index}"; then
   echo "Temporal message contract requires validated developer Cargo registry directories." >&2
@@ -277,24 +318,51 @@ if ! /bin/cp -cR "${developer_registry_cache}" "${private_registry_cache}" \
   exit 1
 fi
 
-mise_config_directory="${contract_tmp}/mise-config"
-mise_cache_directory="${contract_tmp}/mise-cache"
-mise_state_directory="${contract_tmp}/mise-state"
-if ! /bin/mkdir -m 700 \
-  "${mise_config_directory}" "${mise_cache_directory}" "${mise_state_directory}"; then
-  echo "Temporal message contract could not establish its private mise directories." >&2
+clone_tool_tree() {
+  if (($# != 2)); then
+    return 1
+  fi
+  local source="$1"
+  local destination="$2"
+  if ! validate_tool_tree "${source}" \
+    || [[ "${destination}" != /* ]] \
+    || ! live_validate_path_components "${destination}" \
+    || [[ -e "${destination}" || -L "${destination}" ]]; then
+    return 1
+  fi
+  /bin/cp -cR "${source}" "${destination}" \
+    && /bin/chmod 700 "${destination}" \
+    && validate_tool_tree "${destination}"
+}
+
+private_rust_toolchain="${contract_tmp}/rust-toolchain"
+private_protoc="${contract_tmp}/protoc"
+if ! clone_tool_tree "${rust_toolchain_source}" "${private_rust_toolchain}" \
+  || ! clone_tool_tree "${protoc_source}" "${private_protoc}"; then
+  echo "Temporal message contract could not establish its private tool distributions." >&2
   exit 1
 fi
-for private_mise_directory in \
-  "${mise_config_directory}" "${mise_cache_directory}" "${mise_state_directory}"; do
-  if ! live_validate_path_components "${private_mise_directory}" \
-    || [[ ! -d "${private_mise_directory}" || -L "${private_mise_directory}" ]] \
-    || [[ "$(/usr/bin/stat -f '%u %Lp' "${private_mise_directory}" 2>/dev/null || true)" \
-      != "$(/usr/bin/id -u) 700" ]]; then
-    echo "Temporal message contract rejected its private mise directory." >&2
-    exit 1
-  fi
-done
+private_rustc="${private_rust_toolchain}/bin/rustc"
+private_cargo="${private_rust_toolchain}/bin/cargo"
+private_protoc_binary="${private_protoc}/bin/protoc"
+if ! validate_tool_executable "${private_rustc}" \
+  || ! validate_tool_executable "${private_cargo}" \
+  || ! validate_tool_executable "${private_protoc_binary}"; then
+  echo "Temporal message contract rejected a private tool executable." >&2
+  exit 1
+fi
+rustc_sha256_before="$(live_binary_sha256 "${private_rustc}" 2>/dev/null || true)"
+cargo_sha256_before="$(live_binary_sha256 "${private_cargo}" 2>/dev/null || true)"
+protoc_sha256_before="$(live_binary_sha256 "${private_protoc_binary}" 2>/dev/null || true)"
+if [[ ! "${rustc_sha256_before}" =~ ^[0-9a-f]{64}$ \
+  || ! "${cargo_sha256_before}" =~ ^[0-9a-f]{64}$ \
+  || ! "${protoc_sha256_before}" =~ ^[0-9a-f]{64}$ \
+  || "${rustc_sha256_before}" != "${rustc_source_sha256}" \
+  || "${cargo_sha256_before}" != "${cargo_source_sha256}" \
+  || "${protoc_sha256_before}" != "${protoc_source_sha256}" ]]; then
+  echo "Temporal message contract detected a changed or corrupt private tool clone." >&2
+  exit 1
+fi
 
 message_tool_step() {
   if (($# < 5)); then
@@ -318,19 +386,12 @@ message_tool_step() {
   "${supervise_command}" \
     "${stdout_file}" "${stderr_file}" "${MAX_OUTPUT_BYTES}" "${max_child_polls}" \
     /usr/bin/env -i \
-    PATH=/usr/bin:/bin \
+    PATH="${private_rust_toolchain}/bin:${private_protoc}/bin:/usr/bin:/bin" \
     HOME="${build_home}" \
     CARGO_HOME="${cargo_home}" \
     TMPDIR="${contract_tmp}" \
     CARGO_TARGET_DIR="${contract_target}" \
-    MISE_DATA_DIR="${developer_mise_data}" \
-    MISE_CONFIG_DIR="${mise_config_directory}" \
-    MISE_CACHE_DIR="${mise_cache_directory}" \
-    MISE_STATE_DIR="${mise_state_directory}" \
-    MISE_TRUSTED_CONFIG_PATHS="${repo_root}/mise.toml" \
     LANG=C \
-    "${mise_path}" exec --locked -C "${repo_root}" --quiet --no-deps \
-    rust@1.98.0 aqua:protocolbuffers/protobuf/protoc@36.1 -- \
     "$@"
 }
 
@@ -354,11 +415,6 @@ message_probe_output_is_exact() {
     && /usr/bin/cmp -s "${probe_stdout}" "${expected_tool_probe}"
 }
 
-mise_sha256_before="$(live_binary_sha256 "${mise_path}" 2>/dev/null || true)"
-if [[ ! "${mise_sha256_before}" =~ ^[0-9a-f]{64}$ ]]; then
-  echo "Temporal message contract could not bind the mise executable digest." >&2
-  exit 1
-fi
 message_contract_status=0
 if message_probe_step && message_probe_output_is_exact; then
   :
@@ -378,10 +434,29 @@ if ((message_contract_status == 0)); then
     message_contract_status=1
   fi
 fi
-mise_sha256_after="$(live_binary_sha256 "${mise_path}" 2>/dev/null || true)"
-if [[ ! "${mise_sha256_after}" =~ ^[0-9a-f]{64}$ ]] \
-  || [[ "${mise_sha256_after}" != "${mise_sha256_before}" ]]; then
-  echo "Temporal message contract detected a changed mise executable." >&2
+if ! validate_tool_tree "${rust_toolchain_source}" \
+  || ! validate_tool_tree "${protoc_source}" \
+  || ! validate_tool_tree "${private_rust_toolchain}" \
+  || ! validate_tool_tree "${private_protoc}" \
+  || ! validate_tool_executable "${rustc_source}" \
+  || ! validate_tool_executable "${cargo_source}" \
+  || ! validate_tool_executable "${protoc_source_binary}" \
+  || ! validate_tool_executable "${private_rustc}" \
+  || ! validate_tool_executable "${private_cargo}" \
+  || ! validate_tool_executable "${private_protoc_binary}"; then
+  echo "Temporal message contract detected a changed tool distribution." >&2
+  exit 1
+fi
+rustc_sha256_after="$(live_binary_sha256 "${private_rustc}" 2>/dev/null || true)"
+cargo_sha256_after="$(live_binary_sha256 "${private_cargo}" 2>/dev/null || true)"
+protoc_sha256_after="$(live_binary_sha256 "${private_protoc_binary}" 2>/dev/null || true)"
+if [[ ! "${rustc_sha256_after}" =~ ^[0-9a-f]{64}$ \
+  || ! "${cargo_sha256_after}" =~ ^[0-9a-f]{64}$ \
+  || ! "${protoc_sha256_after}" =~ ^[0-9a-f]{64}$ \
+  || "${rustc_sha256_after}" != "${rustc_sha256_before}" \
+  || "${cargo_sha256_after}" != "${cargo_sha256_before}" \
+  || "${protoc_sha256_after}" != "${protoc_sha256_before}" ]]; then
+  echo "Temporal message contract detected a changed private tool executable." >&2
   exit 1
 fi
 if ((message_contract_status != 0)); then
@@ -418,14 +493,6 @@ if ! live_validate_path_components "${message_binary}" \
   echo "Temporal message contract rejected the built test binary." >&2
   exit 1
 fi
-case "$(/usr/bin/uname -m)" in
-  arm64) expected_file_description="Mach-O 64-bit executable arm64" ;;
-  x86_64) expected_file_description="Mach-O 64-bit executable x86_64" ;;
-  *)
-    echo "Temporal message contract requires a supported macOS architecture." >&2
-    exit 1
-    ;;
-esac
 if [[ "$(/usr/bin/file -b "${message_binary}" 2>/dev/null || true)" \
   != "${expected_file_description}" ]]; then
   echo "Temporal message contract rejected the test binary file type." >&2

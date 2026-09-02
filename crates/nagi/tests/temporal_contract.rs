@@ -43,7 +43,10 @@ fn temporal_message_contract_is_explicitly_opt_in_and_build_only() {
         "SKIP: Temporal message contract is opt-in; set NAGI_CONTRACT_TEMPORAL_MESSAGES=1"
     ));
     assert!(TEMPORAL_MESSAGE_SCRIPT.contains("temporal-message-contract"));
-    assert!(TEMPORAL_MESSAGE_SCRIPT.contains("aqua:protocolbuffers/protobuf/protoc@36.1"));
+    assert!(
+        TEMPORAL_MESSAGE_SCRIPT
+            .contains(".local/share/mise/installs/aqua-protocolbuffers-protobuf-protoc/36.1")
+    );
     assert!(TEMPORAL_MESSAGE_SCRIPT.contains("target/nagi-temporal-message-contract"));
     assert!(TEMPORAL_MESSAGE_SCRIPT.contains("synthetic.temporal-message.v1"));
     for required in [
@@ -184,28 +187,67 @@ fn temporal_message_wrapper_passes_the_internal_mode_and_binary_digest() {
 fn temporal_message_wrapper_binds_the_private_locked_toolchain() {
     for required in [
         "current_uid",
-        "validate_mise_executable",
+        "validated_home",
+        "rust_toolchain_host",
+        "validate_tool_tree",
+        "validate_tool_executable",
+        "rust_toolchain_source",
+        "protoc_source",
+        "1.98.0-${rust_toolchain_host}",
+        ".rustup/toolchains",
+        ".local/share/mise/installs/aqua-protocolbuffers-protobuf-protoc/36.1",
+        "validated_home_real",
+        "/usr/bin/find -P",
+        "-type l",
+        "-type f ! -links 1",
+        "! -uid \"${current_uid}\"",
+        "private_rust_toolchain",
+        "private_protoc",
         "stat -f '%u %l'",
-        "mise_expected_file_description",
         "Mach-O 64-bit executable arm64",
         "Mach-O 64-bit executable x86_64",
-        "mise_sha256_before",
-        "mise_sha256_after",
+        "/bin/cp -cR",
+        "/bin/chmod 700",
+        "PATH=\"${private_rust_toolchain}/bin:${private_protoc}/bin:/usr/bin:/bin\"",
         "message_tool_step",
         "HOME=\"${build_home}\"",
         "CARGO_HOME=\"${cargo_home}\"",
-        "MISE_CONFIG_DIR=\"${mise_config_directory}\"",
-        "MISE_CACHE_DIR=\"${mise_cache_directory}\"",
-        "MISE_STATE_DIR=\"${mise_state_directory}\"",
         "rustc --version; cargo --version; protoc --version",
         "rustc 1.98.0 (88d9e12ae 2026-08-18)",
         "cargo 1.98.0 (797e8a9bc 2026-08-05)",
         "libprotoc 36.1",
+        "rustc_source_sha256",
+        "cargo_source_sha256",
+        "protoc_source_sha256",
+        "rustc_sha256_before",
+        "cargo_sha256_before",
+        "protoc_sha256_before",
+        "rustc_sha256_after",
+        "cargo_sha256_after",
+        "protoc_sha256_after",
         "/usr/bin/cmp -s \"${probe_stdout}\" \"${expected_tool_probe}\"",
     ] {
         assert!(
             TEMPORAL_MESSAGE_SCRIPT.contains(required),
             "Temporal message wrapper is missing {required:?}"
+        );
+    }
+    for obsolete in [
+        "mise_path",
+        "validate_mise_executable",
+        "mise_expected_file_description",
+        "mise_sha256_before",
+        "mise_sha256_after",
+        "MISE_DATA_DIR=",
+        "MISE_CONFIG_DIR=",
+        "MISE_CACHE_DIR=",
+        "MISE_STATE_DIR=",
+        "MISE_TRUSTED_CONFIG_PATHS=",
+        "mise exec",
+    ] {
+        assert!(
+            !TEMPORAL_MESSAGE_SCRIPT.contains(obsolete),
+            "Temporal message wrapper still contains obsolete mise state {obsolete:?}"
         );
     }
     assert!(TEMPORAL_MESSAGE_SCRIPT.contains(
