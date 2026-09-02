@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "tool": "aqua:temporalio/cli",
+  "version": "1.8.2",
+  "artifacts": {
+    "macos-arm64": {
+      "archiveUrl": "https://github.com/temporalio/cli/releases/download/v1.8.2/temporal_cli_1.8.2_darwin_arm64.tar.gz",
+      "archiveSha256": "dacdc3587682c04cf27e67c8878ca2d755230b6ad63c0c6ebddd7348ae90ed94",
+      "binarySha256": "e16fc1396c19f87e29e453a78b6be62249397fea06ed0207d1c5f205eb5042bb",
+      "fileDescription": "Mach-O 64-bit executable arm64",
+      "versionOutput": "temporal version 1.8.2 (Server 1.31.2, UI 2.50.1)"
+    },
+    "macos-x64": {
+      "archiveUrl": "https://github.com/temporalio/cli/releases/download/v1.8.2/temporal_cli_1.8.2_darwin_amd64.tar.gz",
+      "archiveSha256": "489d7f5420cae02b559774ac23df035141954c33a51dba96f5759a0ddccdf1b6",
+      "binarySha256": "36e14609a3bc8eb96eecc50d89e73f8ea9f12855ad4148a88a6f91930fb16239",
+      "fileDescription": "Mach-O 64-bit executable x86_64",
+      "versionOutput": "temporal version 1.8.2 (Server 1.31.2, UI 2.50.1)"
+    }
+  }
+}
