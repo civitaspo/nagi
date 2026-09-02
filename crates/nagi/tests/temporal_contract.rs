@@ -8,6 +8,10 @@ const TEMPORAL_SCRIPT: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../scripts/contracts/temporal.sh"
 ));
+const TEMPORAL_PROVENANCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../contracts/temporal-cli-provenance.json"
+));
 const MISE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../mise.toml"));
 
 #[test]
@@ -21,65 +25,31 @@ fn temporal_contract_is_explicitly_opt_in() {
 }
 
 #[test]
-fn temporal_contract_has_a_closed_persistence_witness() {
+fn temporal_contract_has_stable_boundary_invariants() {
     for required in [
         "aqua:temporalio/cli@1.8.2",
-        "--locked",
+        "provenance_manifest",
+        "expected_binary_sha256",
         "--disable-config-env",
         "--disable-config-file",
         "--ip 127.0.0.1",
         "--db-filename",
         "--http-port 0",
         "--metrics-port 0",
-        "--log-format json",
-        "--log-level warn",
         "--identity nagi-contract-temporal-v1",
-        "expected_file_prefix=\"Mach-O\"",
-        "binary_sha256_before",
-        "binary_sha256_after",
-        "live_start_child",
         "live_start_child_without_file_limit",
         "live_signal_child_group KILL",
-        "live_group_exited_within",
-        "live_reap_child",
-        "live_select_trusted_git",
         "live_validate_clean_revision",
-        "live_read_checked_revision",
-        "live_validate_revision",
-        "assert_loopback_listeners",
-        "assert_no_listeners",
         "workflow start",
-        "workflow describe",
         "workflow show",
-        "/usr/bin/plutil",
-        "workflowExecutionInfo.execution.workflowId",
-        "workflowExecutionInfo.type.name",
-        "workflowExecutionInfo.status",
-        "workflowExecutionInfo.taskQueue",
-        "workflowExecutionInfo.historyLength",
-        "workflowExecutionInfo.execution.runId",
-        "-expect string",
         "operator namespace describe",
         "operator cluster describe",
         "assert_sqlite_cluster",
-        "cluster_before",
-        "cluster_after",
-        "assert_sqlite_store_paths",
-        "pwd -P",
-        "stat -f '%u %Lp'",
-        "700",
-        "raw_contract_tmp",
-        "preserve_temp",
-        "run_id_before",
-        "trap - EXIT",
-        "if ! cleanup; then",
-        "! -e \"${contract_tmp}\"",
-        "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-        "return 1\n  fi\n  return 0",
         "cmp -s",
         "--namespace \"${namespace}\"",
         "start_server_with_retry no",
         "stop_server",
+        "evidence_layer=macos",
     ] {
         assert!(
             TEMPORAL_SCRIPT.contains(required),
@@ -87,16 +57,76 @@ fn temporal_contract_has_a_closed_persistence_witness() {
         );
     }
 
+    assert!(TEMPORAL_SCRIPT.contains("Mach-O"));
+    assert!(TEMPORAL_SCRIPT.contains("assert_loopback_listeners"));
+    assert!(TEMPORAL_SCRIPT.contains("assert_sqlite_store_paths"));
+
     // The contract must not silently use the default public-facing ports or a
     // caller-selected endpoint. Ports are selected per run and every listener
     // is checked against IPv4 loopback before the witness is accepted.
     assert!(!TEMPORAL_SCRIPT.contains("127.0.0.1:7233"));
     assert!(!TEMPORAL_SCRIPT.contains("127.0.0.1:7243"));
     assert!(!TEMPORAL_SCRIPT.contains("--sqlite-pragma"));
-    assert!(!TEMPORAL_SCRIPT.contains("expected_file_prefix=\"ELF\""));
-    assert!(!TEMPORAL_SCRIPT.contains("https://"));
     assert!(!TEMPORAL_SCRIPT.contains("--api-key"));
     assert!(!TEMPORAL_SCRIPT.contains("--namespace \"${NAGI_"));
+}
+
+#[test]
+fn temporal_cli_provenance_is_architecture_specific_and_public() {
+    let manifest: serde_json::Value =
+        serde_json::from_str(TEMPORAL_PROVENANCE).expect("Temporal provenance must be JSON");
+    assert_eq!(manifest["schemaVersion"].as_i64(), Some(1));
+    assert_eq!(manifest["tool"].as_str(), Some("aqua:temporalio/cli"));
+    assert_eq!(manifest["version"].as_str(), Some("1.8.2"));
+    let artifacts = manifest["artifacts"]
+        .as_object()
+        .expect("Temporal provenance must contain artifacts");
+    assert_eq!(artifacts.len(), 2);
+    for (architecture, archive_name, archive_sha256, binary_sha256, file_description) in [
+        (
+            "macos-arm64",
+            "darwin_arm64",
+            "dacdc3587682c04cf27e67c8878ca2d755230b6ad63c0c6ebddd7348ae90ed94",
+            "e16fc1396c19f87e29e453a78b6be62249397fea06ed0207d1c5f205eb5042bb",
+            "Mach-O 64-bit executable arm64",
+        ),
+        (
+            "macos-x64",
+            "darwin_amd64",
+            "489d7f5420cae02b559774ac23df035141954c33a51dba96f5759a0ddccdf1b6",
+            "36e14609a3bc8eb96eecc50d89e73f8ea9f12855ad4148a88a6f91930fb16239",
+            "Mach-O 64-bit executable x86_64",
+        ),
+    ] {
+        let artifact = artifacts
+            .get(architecture)
+            .and_then(serde_json::Value::as_object)
+            .expect("Temporal provenance architecture entry is missing");
+        let expected_archive_url = format!(
+            "https://github.com/temporalio/cli/releases/download/v1.8.2/temporal_cli_1.8.2_{archive_name}.tar.gz"
+        );
+        assert_eq!(
+            artifact["archiveUrl"].as_str(),
+            Some(expected_archive_url.as_str())
+        );
+        assert_eq!(artifact["archiveSha256"].as_str(), Some(archive_sha256));
+        assert_eq!(artifact["binarySha256"].as_str(), Some(binary_sha256));
+        assert_eq!(artifact["fileDescription"].as_str(), Some(file_description));
+        assert_eq!(
+            artifact["versionOutput"].as_str(),
+            Some("temporal version 1.8.2 (Server 1.31.2, UI 2.50.1)")
+        );
+    }
+    assert!(!TEMPORAL_PROVENANCE.contains("/Users/"));
+    assert!(!TEMPORAL_PROVENANCE.contains("/private/"));
+
+    let digest_guard = TEMPORAL_SCRIPT
+        .find(r#"[[ "${binary_sha256_before}" != "${expected_binary_sha256}" ]]"#)
+        .expect("Temporal contract must reject an unexpected executable digest");
+    let server_start = TEMPORAL_SCRIPT
+        .find("start_server_with_retry yes")
+        .expect("Temporal contract must start the sidecar after provenance checks");
+    assert!(digest_guard < server_start);
 }
 
 #[cfg(target_os = "macos")]

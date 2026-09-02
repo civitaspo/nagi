@@ -39,6 +39,11 @@ locked `aqua:temporalio/cli@1.8.2` binary, checks the exact CLI version and bind
 its SHA-256 for the complete run, then starts `server start-dev` with fixed
 loopback settings and a file-backed SQLite database. SQLite PRAGMA policy and
 crash-recovery details are owned by the later dual-database contract. The
+reviewed `contracts/temporal-cli-provenance.json` records the official
+architecture-specific release archive and executable digests. The runner
+cross-checks each archive URL and checksum against the matching `mise.lock`
+entry before accepting the executable, so a PATH-selected `mise` cannot replace
+the locked artifact with another stable binary.
 contract uses a unique owner-only temporary directory, randomized nonzero
 loopback ports, and an
 environment with config-file and config-environment loading disabled. It asks

@@ -110,6 +110,94 @@ if ! revision="$(live_read_checked_revision "${git_path}" "${repo_root}")"; then
   exit 1
 fi
 
+provenance_manifest="${repo_root}/contracts/temporal-cli-provenance.json"
+lock_manifest="${repo_root}/mise.lock"
+if ! live_validate_path_components "${provenance_manifest}" \
+  || [[ ! -f "${provenance_manifest}" || -L "${provenance_manifest}" ]] \
+  || ! live_validate_path_components "${lock_manifest}" \
+  || [[ ! -f "${lock_manifest}" || -L "${lock_manifest}" ]] \
+  || [[ ! -x /usr/bin/plutil ]]; then
+  echo "Temporal contract layer could not load its reviewed provenance manifests." >&2
+  exit 1
+fi
+
+provenance_extract() {
+  (($# == 1)) || return 1
+  /usr/bin/plutil -extract "$1" raw -expect string -o - "${provenance_manifest}" 2>/dev/null
+}
+
+if [[ "$(/usr/bin/uname -m)" == "arm64" ]]; then
+  artifact_key="macos-arm64"
+  archive_suffix="darwin_arm64"
+  expected_file_description="Mach-O 64-bit executable arm64"
+elif [[ "$(/usr/bin/uname -m)" == "x86_64" ]]; then
+  artifact_key="macos-x64"
+  archive_suffix="darwin_amd64"
+  expected_file_description="Mach-O 64-bit executable x86_64"
+else
+  echo "Temporal contract layer requires a supported macOS architecture." >&2
+  exit 1
+fi
+artifact_prefix="artifacts.${artifact_key}"
+if [[ "$(/usr/bin/plutil -extract schemaVersion raw -expect integer -o - \
+  "${provenance_manifest}" 2>/dev/null)" != "1" ]] \
+  || [[ "$(provenance_extract tool)" != "aqua:temporalio/cli" ]] \
+  || [[ "$(provenance_extract version)" != "1.8.2" ]]; then
+  echo "Temporal contract layer rejected its reviewed provenance manifest." >&2
+  exit 1
+fi
+if ! expected_archive_url="$(provenance_extract "${artifact_prefix}.archiveUrl")" \
+  || ! expected_archive_sha256="$(provenance_extract "${artifact_prefix}.archiveSha256")" \
+  || ! expected_binary_sha256="$(provenance_extract "${artifact_prefix}.binarySha256")" \
+  || ! manifest_file_description="$(provenance_extract "${artifact_prefix}.fileDescription")" \
+  || ! expected_version_output="$(provenance_extract "${artifact_prefix}.versionOutput")"; then
+  echo "Temporal contract layer could not read its architecture provenance." >&2
+  exit 1
+fi
+if [[ "${manifest_file_description}" != "${expected_file_description}" ]] \
+  || [[ "${expected_version_output}" != "temporal version 1.8.2 (Server 1.31.2, UI 2.50.1)" ]] \
+  || [[ ! "${expected_archive_sha256}" =~ ^[0-9a-f]{64}$ ]] \
+  || [[ ! "${expected_binary_sha256}" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "Temporal contract layer rejected its architecture provenance." >&2
+  exit 1
+fi
+
+lock_section="[tools.\"aqua:temporalio/cli\".\"platforms.${artifact_key}\"]"
+lock_archive_sha256="$(/usr/bin/awk -v section="${lock_section}" '
+  $0 == section { in_section = 1; next }
+  in_section && /^\[/ { exit }
+  in_section && /^checksum = "sha256:[0-9a-f]+"$/ {
+    sub(/^checksum = "sha256:/, "")
+    sub(/"$/, "")
+    print
+    exit
+  }
+' "${lock_manifest}")"
+lock_archive_url="$(/usr/bin/awk -v section="${lock_section}" '
+  $0 == section { in_section = 1; next }
+  in_section && /^\[/ { exit }
+  in_section && index($0, "url = \"https://github.com/temporalio/cli/releases/") == 1 {
+    sub(/^url = "/, "")
+    sub(/"$/, "")
+    print
+    exit
+  }
+' "${lock_manifest}")"
+official_archive_url="https://github.com/temporalio/cli/releases/download/v1.8.2/temporal_cli_1.8.2_${archive_suffix}.tar.gz"
+if [[ "${lock_archive_sha256}" != "${expected_archive_sha256}" ]] \
+  || [[ ! "${lock_archive_sha256}" =~ ^[0-9a-f]{64}$ ]] \
+  || [[ "${expected_archive_url}" != "${lock_archive_url}" ]] \
+  || [[ "${expected_archive_url}" != "${official_archive_url}" ]]; then
+  echo "Temporal contract layer rejected its locked Temporal archive provenance." >&2
+  exit 1
+fi
+if [[ "${file_description}" != "${expected_file_description}" ]] \
+  || [[ "${version_output}" != "${expected_version_output}" ]] \
+  || [[ "${binary_sha256_before}" != "${expected_binary_sha256}" ]]; then
+  echo "Temporal contract layer rejected the Temporal CLI provenance." >&2
+  exit 1
+fi
+
 umask 077
 raw_contract_tmp="$(/usr/bin/mktemp -d /tmp/nagi-temporal-contract.XXXXXX)"
 contract_tmp="$(cd "${raw_contract_tmp}" && pwd -P 2>/dev/null || true)"
