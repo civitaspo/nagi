@@ -22,12 +22,15 @@ by overlap deduplication. Root and nested Relay cursors are bounded and
 must progress; incomplete nested label pages, malformed timestamps (including
 `archivedAt`) and an exact `issue: null` response fail closed with the
 watermark unchanged; archive observations are retained as explicit transitions.
-Exact-issue enrichment uses the same configured bounded label page size and
+Exact-issue enrichment uses the same fixed bounded label page size and
 canonicalizes label IDs before comparison.
 HTTP 429 and GraphQL `RATELIMITED` are
 typed rate-limit failures with no automatic retry or partial watermark commit.
 The server is test-only and binds to loopback; it does not change the
-standalone executable or expose a configurable production endpoint.
+standalone executable or expose a configurable production endpoint. This
+scripted server proves client boundary and state handling only; it does not
+execute a live Linear schema or filter, and this spike does not prove the
+later durable SQLite/Temporal production poller.
 
 The live runner resolves the repository from its own script path, requires a
 clean checked revision, and builds the ordinary raw

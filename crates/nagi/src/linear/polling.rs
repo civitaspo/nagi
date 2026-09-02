@@ -20,11 +20,15 @@ use std::time::Duration;
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_CURSOR_BYTES: usize = 4 * 1024;
 const MAX_ID_BYTES: usize = 4 * 1024;
-const DEFAULT_PAGE_SIZE: usize = 2;
-const DEFAULT_OVERLAP_MS: i64 = 1_000;
-const DEFAULT_MAX_PAGES: usize = 16;
-const DEFAULT_MAX_NESTED_PAGES: usize = 16;
+const FIXED_PAGE_SIZE: usize = 2;
+const FIXED_OVERLAP_MS: i64 = 1_000;
+const FIXED_MAX_PAGES: usize = 16;
+const FIXED_MAX_NESTED_PAGES: usize = 16;
 const SYNTHETIC_TEAM_ID: &str = "synthetic-team";
+const UPPER_BOUND_QUERY: &str = "query NagiIssueUpperBound($teamId: ID!, $first: Int!) { issues(first: $first, orderBy: updatedAt, includeArchived: true, filter: { team: { id: { eq: $teamId } } }) { nodes { updatedAt } } }";
+const ISSUE_SCAN_QUERY: &str = "query NagiIssueScan($teamId: ID!, $since: DateTimeOrDuration!, $until: DateTimeOrDuration!, $first: Int!, $after: String) { issues(first: $first, after: $after, orderBy: updatedAt, includeArchived: true, filter: { team: { id: { eq: $teamId } }, updatedAt: { gte: $since, lte: $until } }) { nodes { id updatedAt archivedAt labels(first: $first) { nodes { id } pageInfo { hasNextPage endCursor } } } pageInfo { hasNextPage endCursor } } }";
+const LABELS_QUERY: &str = "query NagiIssueLabels($issueId: String!, $first: Int!, $after: String) { issue(id: $issueId) { id updatedAt labels(first: $first, after: $after) { nodes { id } pageInfo { hasNextPage endCursor } } } }";
+const CURRENT_ISSUE_QUERY: &str = "query NagiCurrentIssue($issueId: String!, $first: Int!) { issue(id: $issueId) { id updatedAt archivedAt labels(first: $first) { nodes { id } pageInfo { hasNextPage endCursor } } } }";
 
 /// Errors intentionally carry no provider values.  This keeps a failed
 /// contract run safe to print and makes the failure classes auditable.
@@ -74,25 +78,6 @@ impl std::fmt::Display for PollError {
 
 impl std::error::Error for PollError {}
 
-#[derive(Clone, Debug)]
-struct PollConfig {
-    page_size: usize,
-    overlap_ms: i64,
-    max_pages: usize,
-    max_nested_pages: usize,
-}
-
-impl Default for PollConfig {
-    fn default() -> Self {
-        Self {
-            page_size: DEFAULT_PAGE_SIZE,
-            overlap_ms: DEFAULT_OVERLAP_MS,
-            max_pages: DEFAULT_MAX_PAGES,
-            max_nested_pages: DEFAULT_MAX_NESTED_PAGES,
-        }
-    }
-}
-
 #[derive(Clone, Eq, PartialEq)]
 struct IssueSnapshot {
     id: String,
@@ -137,19 +122,24 @@ impl fmt::Debug for PollBatch {
     }
 }
 
-trait PollTransport {
-    fn execute(&mut self, request: &GraphqlRequest) -> Result<PollResponse, PollError>;
-}
-
 struct GraphqlRequest {
     body: Vec<u8>,
+}
+
+impl fmt::Debug for GraphqlRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GraphqlRequest")
+            .field("body", &"[redacted]")
+            .finish()
+    }
 }
 
 impl GraphqlRequest {
     fn upper_bound(team_id: &str) -> Self {
         Self::new(
             "NagiIssueUpperBound",
-            "query NagiIssueUpperBound($teamId: ID!, $first: Int!) { issues(first: $first, orderBy: updatedAt, includeArchived: true, filter: { team: { id: { eq: $teamId } } }) { nodes { updatedAt } } }",
+            UPPER_BOUND_QUERY,
             json!({"teamId": team_id, "first": 1}),
         )
     }
@@ -163,7 +153,7 @@ impl GraphqlRequest {
     ) -> Self {
         Self::new(
             "NagiIssueScan",
-            "query NagiIssueScan($teamId: ID!, $since: DateTimeOrDuration!, $until: DateTimeOrDuration!, $first: Int!, $after: String) { issues(first: $first, after: $after, orderBy: updatedAt, includeArchived: true, filter: { team: { id: { eq: $teamId } }, updatedAt: { gte: $since, lte: $until } }) { nodes { id updatedAt archivedAt labels(first: $first) { nodes { id } pageInfo { hasNextPage endCursor } } } pageInfo { hasNextPage endCursor } } }",
+            ISSUE_SCAN_QUERY,
             json!({
                 "teamId": team_id,
                 "since": timestamp(since_ms),
@@ -177,7 +167,7 @@ impl GraphqlRequest {
     fn labels(issue_id: &str, first: usize, after: Option<&str>) -> Self {
         Self::new(
             "NagiIssueLabels",
-            "query NagiIssueLabels($issueId: String!, $first: Int!, $after: String) { issue(id: $issueId) { id updatedAt labels(first: $first, after: $after) { nodes { id } pageInfo { hasNextPage endCursor } } } }",
+            LABELS_QUERY,
             json!({
                 "issueId": issue_id,
                 "first": first,
@@ -189,7 +179,7 @@ impl GraphqlRequest {
     fn current_issue(issue_id: &str, first: usize) -> Self {
         Self::new(
             "NagiCurrentIssue",
-            "query NagiCurrentIssue($issueId: String!, $first: Int!) { issue(id: $issueId) { id updatedAt archivedAt labels(first: $first) { nodes { id } pageInfo { hasNextPage endCursor } } } }",
+            CURRENT_ISSUE_QUERY,
             json!({"issueId": issue_id, "first": first}),
         )
     }
@@ -211,25 +201,30 @@ struct PollResponse {
     body: Vec<u8>,
 }
 
-struct Poller<T> {
-    transport: T,
-    config: PollConfig,
+impl fmt::Debug for PollResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PollResponse")
+            .field("status", &self.status)
+            .field("content_type_valid", &self.content_type_valid)
+            .field("body", &"[redacted]")
+            .finish()
+    }
+}
+
+struct Poller {
+    transport: LoopbackTransport,
     state: PollState,
 }
 
-impl<T: PollTransport> Poller<T> {
-    fn new(transport: T, watermark_ms: i64, config: PollConfig) -> Self {
+impl Poller {
+    fn new(transport: LoopbackTransport, watermark_ms: i64) -> Self {
         assert!(
             watermark_ms >= 0,
             "synthetic watermark must be non-negative"
         );
-        assert!(config.page_size > 0);
-        assert!(config.overlap_ms >= 0);
-        assert!(config.max_pages > 0);
-        assert!(config.max_nested_pages > 0);
         Self {
             transport,
-            config,
             state: PollState {
                 watermark_ms,
                 records: BTreeMap::new(),
@@ -267,7 +262,7 @@ impl<T: PollTransport> Poller<T> {
         let since_ms = self
             .state
             .watermark_ms
-            .saturating_sub(self.config.overlap_ms)
+            .saturating_sub(FIXED_OVERLAP_MS)
             .max(0);
         let mut after = None;
         let mut seen_cursors = BTreeSet::new();
@@ -275,16 +270,16 @@ impl<T: PollTransport> Poller<T> {
         let mut fresh = Vec::new();
         let mut saw_node = false;
 
-        for page_ordinal in 0..self.config.max_pages {
+        for page_ordinal in 0..FIXED_MAX_PAGES {
             let page_response = self.transport.execute(&GraphqlRequest::issue_scan(
                 SYNTHETIC_TEAM_ID,
                 since_ms,
                 upper_ms,
-                self.config.page_size,
+                FIXED_PAGE_SIZE,
                 after.as_deref(),
             ))?;
             let page: IssuePageData = decode(page_response)?;
-            if page.issues.nodes.len() > self.config.page_size {
+            if page.issues.nodes.len() > FIXED_PAGE_SIZE {
                 return Err(PollError::PageBound);
             }
 
@@ -317,7 +312,7 @@ impl<T: PollTransport> Poller<T> {
                     watermark_ms: next_watermark,
                 });
             };
-            if page_ordinal + 1 == self.config.max_pages {
+            if page_ordinal + 1 == FIXED_MAX_PAGES {
                 return Err(PollError::PageLimit);
             }
             if !seen_cursors.insert(next_cursor.clone()) {
@@ -366,8 +361,8 @@ impl<T: PollTransport> Poller<T> {
         let mut labels = BTreeSet::new();
         let mut seen_cursors = BTreeSet::new();
         let mut after = None;
-        for page_ordinal in 0..self.config.max_nested_pages {
-            if page.nodes.len() > self.config.page_size {
+        for page_ordinal in 0..FIXED_MAX_NESTED_PAGES {
+            if page.nodes.len() > FIXED_PAGE_SIZE {
                 return Err(PollError::PageBound);
             }
             for label in page.nodes {
@@ -377,7 +372,7 @@ impl<T: PollTransport> Poller<T> {
             let Some(next_cursor) = page.page_info.next_cursor(after.as_deref())? else {
                 return Ok(labels.into_iter().collect());
             };
-            if page_ordinal + 1 == self.config.max_nested_pages {
+            if page_ordinal + 1 == FIXED_MAX_NESTED_PAGES {
                 return Err(PollError::PageLimit);
             }
             if !seen_cursors.insert(next_cursor.clone()) {
@@ -385,7 +380,7 @@ impl<T: PollTransport> Poller<T> {
             }
             let response = self.transport.execute(&GraphqlRequest::labels(
                 issue_id,
-                self.config.page_size,
+                FIXED_PAGE_SIZE,
                 Some(next_cursor.as_str()),
             ))?;
             let next: LabelsData = decode(response)?;
@@ -404,10 +399,9 @@ impl<T: PollTransport> Poller<T> {
 
     fn current_issue(&mut self, issue_id: &str) -> Result<IssueSnapshot, PollError> {
         validate_id(issue_id)?;
-        let response = self.transport.execute(&GraphqlRequest::current_issue(
-            issue_id,
-            self.config.page_size,
-        ))?;
+        let response = self
+            .transport
+            .execute(&GraphqlRequest::current_issue(issue_id, FIXED_PAGE_SIZE))?;
         let current: CurrentIssueData = decode(response)?;
         let issue = current.issue.ok_or(PollError::NotFound)?;
         if issue.id != issue_id {
@@ -455,8 +449,7 @@ fn decode<T: for<'de> Deserialize<'de>>(response: PollResponse) -> Result<T, Pol
     if !response.content_type_valid {
         return Err(PollError::ContentType);
     }
-    let envelope: GraphqlEnvelope<T> = serde_json::from_slice(&response.body).map_err(|error| {
-        let _ = error;
+    let envelope: GraphqlEnvelope<T> = serde_json::from_slice(&response.body).map_err(|_| {
         if response.status == 200 {
             PollError::Graphql
         } else {
@@ -616,10 +609,7 @@ fn parse_timestamp(value: &str) -> Result<i64, PollError> {
     {
         return Err(PollError::InvalidTimestamp);
     }
-    let parsed = DateTime::parse_from_rfc3339(value).map_err(|error| {
-        let _ = error;
-        PollError::InvalidTimestamp
-    })?;
+    let parsed = DateTime::parse_from_rfc3339(value).map_err(|_| PollError::InvalidTimestamp)?;
     Ok(parsed.timestamp_millis())
 }
 
@@ -636,19 +626,13 @@ struct LoopbackTransport {
     address: SocketAddr,
 }
 
-impl PollTransport for LoopbackTransport {
+impl LoopbackTransport {
     fn execute(&mut self, request: &GraphqlRequest) -> Result<PollResponse, PollError> {
         let mut stream = TcpStream::connect_timeout(&self.address, Duration::from_secs(2))
-            .map_err(|error| {
-                let _ = error;
-                PollError::RequestFailed
-            })?;
+            .map_err(|_| PollError::RequestFailed)?;
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
-            .map_err(|error| {
-                let _ = error;
-                PollError::RequestFailed
-            })?;
+            .map_err(|_| PollError::RequestFailed)?;
         let header = format!(
             "POST /graphql HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             request.body.len()
@@ -656,17 +640,13 @@ impl PollTransport for LoopbackTransport {
         stream
             .write_all(header.as_bytes())
             .and_then(|_| stream.write_all(&request.body))
-            .map_err(|error| {
-                let _ = error;
-                PollError::RequestFailed
-            })?;
+            .map_err(|_| PollError::RequestFailed)?;
         let _ = stream.shutdown(Shutdown::Write);
         let mut bytes = Vec::new();
         let mut limited = stream.take((MAX_RESPONSE_BYTES + 1) as u64);
-        limited.read_to_end(&mut bytes).map_err(|error| {
-            let _ = error;
-            PollError::RequestFailed
-        })?;
+        limited
+            .read_to_end(&mut bytes)
+            .map_err(|_| PollError::RequestFailed)?;
         if bytes.len() > MAX_RESPONSE_BYTES {
             return Err(PollError::ResponseTooLarge);
         }
@@ -677,10 +657,10 @@ impl PollTransport for LoopbackTransport {
 fn parse_http_response(bytes: &[u8]) -> Result<PollResponse, PollError> {
     let mut headers = [httparse::EMPTY_HEADER; 16];
     let mut response = httparse::Response::new(&mut headers);
-    let header_end = match response.parse(bytes).map_err(|error| {
-        let _ = error;
-        PollError::RequestFailed
-    })? {
+    let header_end = match response
+        .parse(bytes)
+        .map_err(|_| PollError::RequestFailed)?
+    {
         httparse::Status::Complete(end) => end,
         httparse::Status::Partial => return Err(PollError::RequestFailed),
     };
@@ -724,8 +704,6 @@ struct RequestRecord {
     after: Option<String>,
     since: Option<String>,
     until: Option<String>,
-    team_scoped: bool,
-    include_archived: bool,
 }
 
 impl fmt::Debug for RequestRecord {
@@ -737,10 +715,8 @@ impl fmt::Debug for RequestRecord {
             .field("issue_id", &"[redacted]")
             .field("first", &self.first)
             .field("after", &"[redacted]")
-            .field("since", &self.since)
-            .field("until", &self.until)
-            .field("team_scoped", &self.team_scoped)
-            .field("include_archived", &self.include_archived)
+            .field("since", &"[redacted]")
+            .field("until", &"[redacted]")
             .finish()
     }
 }
@@ -795,28 +771,13 @@ impl SyntheticGraphqlServer {
     }
 
     fn requests(&self) -> Vec<RequestRecord> {
-        let requests = self
-            .requests
+        self.requests
             .lock()
             .expect("synthetic requests lock")
-            .clone();
-        assert!(
-            requests.iter().all(request_scope_is_valid),
-            "synthetic request scope contract failed"
-        );
-        requests
+            .clone()
     }
 
     fn remaining_steps(&self) -> usize {
-        let requests = self
-            .requests
-            .lock()
-            .expect("synthetic requests lock")
-            .clone();
-        assert!(
-            requests.iter().all(request_scope_is_valid),
-            "synthetic request scope contract failed"
-        );
         self.steps.lock().expect("synthetic steps lock").len()
     }
 }
@@ -895,14 +856,12 @@ fn handle_connection(
         after: after.clone(),
         since,
         until,
-        team_scoped: query.contains("team: { id: { eq: $teamId } }") && query.contains("$teamId"),
-        include_archived: query.contains("includeArchived: true"),
     };
     requests
         .lock()
         .expect("synthetic requests lock")
         .push(record.clone());
-    if !request_scope_is_valid(&record) {
+    if !request_scope_is_valid(&record, query) {
         let _ = write_http_response(
             &mut stream,
             400,
@@ -933,26 +892,43 @@ fn handle_connection(
     }
 }
 
-fn request_scope_is_valid(record: &RequestRecord) -> bool {
+fn request_scope_is_valid(record: &RequestRecord, query: &str) -> bool {
+    if !query_contract_matches(&record.operation, query) {
+        return false;
+    }
     match record.operation.as_str() {
         "NagiIssueUpperBound" => {
             record.team_id.as_deref() == Some(SYNTHETIC_TEAM_ID)
                 && record.first == Some(1)
-                && record.team_scoped
-                && record.include_archived
+                && record.issue_id.is_none()
+                && record.after.is_none()
+                && record.since.is_none()
+                && record.until.is_none()
         }
         "NagiIssueScan" => {
             record.team_id.as_deref() == Some(SYNTHETIC_TEAM_ID)
-                && record.first == Some(DEFAULT_PAGE_SIZE)
-                && record.team_scoped
-                && record.include_archived
+                && record.first == Some(FIXED_PAGE_SIZE)
+                && record.issue_id.is_none()
+                && record.since.is_some()
+                && record.until.is_some()
         }
         "NagiIssueLabels" | "NagiCurrentIssue" => {
             record.team_id.is_none()
-                && record.first == Some(DEFAULT_PAGE_SIZE)
-                && !record.team_scoped
-                && !record.include_archived
+                && record.first == Some(FIXED_PAGE_SIZE)
+                && record.issue_id.is_some()
+                && record.since.is_none()
+                && record.until.is_none()
         }
+        _ => false,
+    }
+}
+
+fn query_contract_matches(operation: &str, query: &str) -> bool {
+    match operation {
+        "NagiIssueUpperBound" => query == UPPER_BOUND_QUERY,
+        "NagiIssueScan" => query == ISSUE_SCAN_QUERY,
+        "NagiIssueLabels" => query == LABELS_QUERY,
+        "NagiCurrentIssue" => query == CURRENT_ISSUE_QUERY,
         _ => false,
     }
 }
@@ -962,10 +938,9 @@ fn read_http_request(stream: &mut TcpStream) -> Result<Vec<u8>, PollError> {
     let header_end;
     loop {
         let mut chunk = [0_u8; 2048];
-        let count = stream.read(&mut chunk).map_err(|error| {
-            let _ = error;
-            PollError::RequestFailed
-        })?;
+        let count = stream
+            .read(&mut chunk)
+            .map_err(|_| PollError::RequestFailed)?;
         if count == 0 {
             return Err(PollError::RequestFailed);
         }
@@ -980,10 +955,9 @@ fn read_http_request(stream: &mut TcpStream) -> Result<Vec<u8>, PollError> {
     }
     let mut headers = [httparse::EMPTY_HEADER; 16];
     let mut request = httparse::Request::new(&mut headers);
-    request.parse(&bytes[..header_end]).map_err(|error| {
-        let _ = error;
-        PollError::RequestFailed
-    })?;
+    request
+        .parse(&bytes[..header_end])
+        .map_err(|_| PollError::RequestFailed)?;
     let content_length = request
         .headers
         .iter()
@@ -999,10 +973,9 @@ fn read_http_request(stream: &mut TcpStream) -> Result<Vec<u8>, PollError> {
     }
     while bytes.len() < total {
         let mut chunk = [0_u8; 2048];
-        let count = stream.read(&mut chunk).map_err(|error| {
-            let _ = error;
-            PollError::RequestFailed
-        })?;
+        let count = stream
+            .read(&mut chunk)
+            .map_err(|_| PollError::RequestFailed)?;
         if count == 0 {
             return Err(PollError::RequestFailed);
         }
@@ -1012,10 +985,7 @@ fn read_http_request(stream: &mut TcpStream) -> Result<Vec<u8>, PollError> {
 }
 
 fn write_http_response(stream: &mut TcpStream, status: u16, body: &Value) -> Result<(), PollError> {
-    let body = serde_json::to_vec(body).map_err(|error| {
-        let _ = error;
-        PollError::RequestFailed
-    })?;
+    let body = serde_json::to_vec(body).map_err(|_| PollError::RequestFailed)?;
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -1029,10 +999,7 @@ fn write_http_response(stream: &mut TcpStream, status: u16, body: &Value) -> Res
     stream
         .write_all(header.as_bytes())
         .and_then(|_| stream.write_all(&body))
-        .map_err(|error| {
-            let _ = error;
-            PollError::RequestFailed
-        })
+        .map_err(|_| PollError::RequestFailed)
 }
 
 fn step(
@@ -1142,50 +1109,126 @@ mod tests {
     fn server_and_poller(
         steps: impl IntoIterator<Item = ScriptStep>,
         watermark_ms: i64,
-    ) -> (SyntheticGraphqlServer, Poller<LoopbackTransport>) {
+    ) -> (SyntheticGraphqlServer, Poller) {
         let server = SyntheticGraphqlServer::new(steps);
         let poller = Poller::new(
             LoopbackTransport {
                 address: server.address(),
             },
             watermark_ms,
-            PollConfig::default(),
         );
         (server, poller)
+    }
+
+    fn head_step(updated_at_ms: Option<i64>) -> ScriptStep {
+        step(
+            "NagiIssueUpperBound",
+            None,
+            None,
+            200,
+            upper_bound(updated_at_ms),
+        )
+    }
+
+    fn root_step(
+        after: Option<&str>,
+        nodes: Vec<Value>,
+        has_next: bool,
+        end_cursor: Option<&str>,
+    ) -> ScriptStep {
+        step(
+            "NagiIssueScan",
+            None,
+            after,
+            200,
+            issue_page(nodes, has_next, end_cursor),
+        )
+    }
+
+    fn root_response(after: Option<&str>, status: u16, body: Value) -> ScriptStep {
+        step("NagiIssueScan", None, after, status, body)
+    }
+
+    fn labels_step(
+        issue_id: &str,
+        after: Option<&str>,
+        updated_at_ms: i64,
+        labels: &[&str],
+        has_next: bool,
+        end_cursor: Option<&str>,
+    ) -> ScriptStep {
+        step(
+            "NagiIssueLabels",
+            Some(issue_id),
+            after,
+            200,
+            labels_page(issue_id, updated_at_ms, labels, has_next, end_cursor),
+        )
+    }
+
+    fn labels_response(
+        issue_id: &str,
+        after: Option<&str>,
+        status: u16,
+        body: Value,
+    ) -> ScriptStep {
+        step("NagiIssueLabels", Some(issue_id), after, status, body)
+    }
+
+    fn current_step(issue_id: &str, issue: Option<Value>) -> ScriptStep {
+        step(
+            "NagiCurrentIssue",
+            Some(issue_id),
+            None,
+            200,
+            current_issue(issue),
+        )
+    }
+
+    #[test]
+    fn server_accepts_only_the_fixed_read_query_documents() {
+        for (operation, query) in [
+            ("NagiIssueUpperBound", UPPER_BOUND_QUERY),
+            ("NagiIssueScan", ISSUE_SCAN_QUERY),
+            ("NagiIssueLabels", LABELS_QUERY),
+            ("NagiCurrentIssue", CURRENT_ISSUE_QUERY),
+        ] {
+            assert!(query_contract_matches(operation, query));
+        }
+        for query in [UPPER_BOUND_QUERY, ISSUE_SCAN_QUERY] {
+            assert!(query.starts_with("query "));
+            assert!(query.contains("includeArchived: true"));
+            assert!(query.contains("team: { id: { eq: $teamId } }"));
+            assert!(!query.starts_with("mutation "));
+        }
+
+        let mutation = UPPER_BOUND_QUERY.replacen("query ", "mutation ", 1);
+        let broader = format!("{UPPER_BOUND_QUERY} fragment Unexpected on Issue {{ id }}");
+        assert!(!query_contract_matches("NagiIssueUpperBound", &mutation));
+        assert!(!query_contract_matches("NagiIssueUpperBound", &broader));
+        assert!(!query_contract_matches("NagiIssueScan", UPPER_BOUND_QUERY));
+        assert!(!query_contract_matches(
+            "UnknownOperation",
+            UPPER_BOUND_QUERY
+        ));
     }
 
     #[test]
     fn identical_timestamps_are_preserved_across_root_pages() {
         let (server, mut poller) = server_and_poller(
             [
-                step(
-                    "NagiIssueUpperBound",
+                head_step(Some(T1)),
+                root_step(
                     None,
-                    None,
-                    200,
-                    upper_bound(Some(T1)),
-                ),
-                step(
-                    "NagiIssueScan",
-                    None,
-                    None,
-                    200,
-                    issue_page(
-                        vec![issue_node(ISSUE_A, T1, None, &[], false, None)],
-                        true,
-                        Some("root-a"),
-                    ),
-                ),
-                step(
-                    "NagiIssueScan",
-                    None,
+                    vec![issue_node(ISSUE_A, T1, None, &[], false, None)],
+                    true,
                     Some("root-a"),
-                    200,
-                    issue_page(
-                        vec![issue_node(ISSUE_B, T1, None, &[], false, None)],
-                        false,
-                        None,
-                    ),
+                ),
+                root_step(
+                    Some("root-a"),
+                    vec![issue_node(ISSUE_B, T1, None, &[], false, None)],
+                    false,
+                    None,
                 ),
             ],
             0,
@@ -1199,12 +1242,8 @@ mod tests {
         let requests = server.requests();
         assert_eq!(requests[0].team_id.as_deref(), Some(SYNTHETIC_TEAM_ID));
         assert_eq!(requests[0].first, Some(1));
-        assert!(requests[0].team_scoped);
-        assert!(requests[0].include_archived);
         assert_eq!(requests[1].team_id.as_deref(), Some(SYNTHETIC_TEAM_ID));
-        assert_eq!(requests[1].first, Some(DEFAULT_PAGE_SIZE));
-        assert!(requests[1].team_scoped);
-        assert!(requests[1].include_archived);
+        assert_eq!(requests[1].first, Some(FIXED_PAGE_SIZE));
         assert_eq!(requests[1].since.as_deref(), Some(timestamp(0).as_str()));
         assert_eq!(requests[1].until.as_deref(), Some(timestamp(T1).as_str()));
     }
@@ -1213,44 +1252,22 @@ mod tests {
     fn inclusive_overlap_deduplicates_old_versions_but_keeps_later_edits() {
         let (server, mut poller) = server_and_poller(
             [
-                step(
-                    "NagiIssueUpperBound",
+                head_step(Some(T1)),
+                root_step(
                     None,
+                    vec![issue_node(ISSUE_A, T1, None, &[LABEL_A], false, None)],
+                    false,
                     None,
-                    200,
-                    upper_bound(Some(T1)),
                 ),
-                step(
-                    "NagiIssueScan",
+                head_step(Some(T2)),
+                root_step(
                     None,
+                    vec![
+                        issue_node(ISSUE_A, T1, None, &[LABEL_A], false, None),
+                        issue_node(ISSUE_A, T2, None, &[LABEL_B], false, None),
+                    ],
+                    false,
                     None,
-                    200,
-                    issue_page(
-                        vec![issue_node(ISSUE_A, T1, None, &[LABEL_A], false, None)],
-                        false,
-                        None,
-                    ),
-                ),
-                step(
-                    "NagiIssueUpperBound",
-                    None,
-                    None,
-                    200,
-                    upper_bound(Some(T2)),
-                ),
-                step(
-                    "NagiIssueScan",
-                    None,
-                    None,
-                    200,
-                    issue_page(
-                        vec![
-                            issue_node(ISSUE_A, T1, None, &[LABEL_A], false, None),
-                            issue_node(ISSUE_A, T2, None, &[LABEL_B], false, None),
-                        ],
-                        false,
-                        None,
-                    ),
                 ),
             ],
             0,
@@ -1265,7 +1282,7 @@ mod tests {
         let requests = server.requests();
         assert_eq!(
             requests[3].since.as_deref(),
-            Some(timestamp(T1 - DEFAULT_OVERLAP_MS).as_str())
+            Some(timestamp(T1 - FIXED_OVERLAP_MS).as_str())
         );
     }
 
@@ -1273,37 +1290,27 @@ mod tests {
     fn nested_label_pagination_is_complete_before_root_cursor_commit() {
         let (server, mut poller) = server_and_poller(
             [
-                step(
-                    "NagiIssueUpperBound",
+                head_step(Some(T1)),
+                root_step(
                     None,
-                    None,
-                    200,
-                    upper_bound(Some(T1)),
-                ),
-                step(
-                    "NagiIssueScan",
-                    None,
-                    None,
-                    200,
-                    issue_page(
-                        vec![issue_node(
-                            ISSUE_A,
-                            T1,
-                            None,
-                            &[LABEL_A],
-                            true,
-                            Some("label-a"),
-                        )],
-                        false,
+                    vec![issue_node(
+                        ISSUE_A,
+                        T1,
                         None,
-                    ),
+                        &[LABEL_A],
+                        true,
+                        Some("label-a"),
+                    )],
+                    false,
+                    None,
                 ),
-                step(
-                    "NagiIssueLabels",
-                    Some(ISSUE_A),
+                labels_step(
+                    ISSUE_A,
                     Some("label-a"),
-                    200,
-                    labels_page(ISSUE_A, T1, &[LABEL_B, LABEL_C], false, None),
+                    T1,
+                    &[LABEL_B, LABEL_C],
+                    false,
+                    None,
                 ),
             ],
             0,
@@ -1322,26 +1329,15 @@ mod tests {
     fn label_order_is_canonical_before_same_revision_deduplication() {
         let (server, mut poller) = server_and_poller(
             [
-                step(
-                    "NagiIssueUpperBound",
+                head_step(Some(T1)),
+                root_step(
                     None,
+                    vec![
+                        issue_node(ISSUE_A, T1, None, &[LABEL_B, LABEL_A], false, None),
+                        issue_node(ISSUE_A, T1, None, &[LABEL_A, LABEL_B], false, None),
+                    ],
+                    false,
                     None,
-                    200,
-                    upper_bound(Some(T1)),
-                ),
-                step(
-                    "NagiIssueScan",
-                    None,
-                    None,
-                    200,
-                    issue_page(
-                        vec![
-                            issue_node(ISSUE_A, T1, None, &[LABEL_B, LABEL_A], false, None),
-                            issue_node(ISSUE_A, T1, None, &[LABEL_A, LABEL_B], false, None),
-                        ],
-                        false,
-                        None,
-                    ),
                 ),
             ],
             0,
@@ -1354,29 +1350,27 @@ mod tests {
     }
 
     #[test]
-    fn current_issue_enrichment_uses_the_configured_nested_page_size() {
+    fn current_issue_enrichment_uses_the_bounded_nested_page_size() {
         let (server, mut poller) = server_and_poller(
             [
-                step(
-                    "NagiCurrentIssue",
-                    Some(ISSUE_A),
-                    None,
-                    200,
-                    current_issue(Some(issue_node(
+                current_step(
+                    ISSUE_A,
+                    Some(issue_node(
                         ISSUE_A,
                         T1,
                         None,
                         &[LABEL_B],
                         true,
                         Some("current-label"),
-                    ))),
+                    )),
                 ),
-                step(
-                    "NagiIssueLabels",
-                    Some(ISSUE_A),
+                labels_step(
+                    ISSUE_A,
                     Some("current-label"),
-                    200,
-                    labels_page(ISSUE_A, T1, &[LABEL_A, LABEL_C], false, None),
+                    T1,
+                    &[LABEL_A, LABEL_C],
+                    false,
+                    None,
                 ),
             ],
             0,
@@ -1384,8 +1378,8 @@ mod tests {
         let current = poller.current_issue(ISSUE_A).expect("current issue");
         assert_eq!(current.label_ids, [LABEL_A, LABEL_B, LABEL_C]);
         let requests = server.requests();
-        assert_eq!(requests[0].first, Some(DEFAULT_PAGE_SIZE));
-        assert_eq!(requests[1].first, Some(DEFAULT_PAGE_SIZE));
+        assert_eq!(requests[0].first, Some(FIXED_PAGE_SIZE));
+        assert_eq!(requests[1].first, Some(FIXED_PAGE_SIZE));
         assert_eq!(server.remaining_steps(), 0);
     }
 
@@ -1393,20 +1387,8 @@ mod tests {
     fn empty_scan_does_not_advance_the_watermark_or_issue_a_page_retry() {
         let (server, mut poller) = server_and_poller(
             [
-                step(
-                    "NagiIssueUpperBound",
-                    None,
-                    None,
-                    200,
-                    upper_bound(Some(T1)),
-                ),
-                step(
-                    "NagiIssueScan",
-                    None,
-                    None,
-                    200,
-                    issue_page(Vec::new(), false, None),
-                ),
+                head_step(Some(T1)),
+                root_step(None, Vec::new(), false, None),
             ],
             T0,
         );
@@ -1420,16 +1402,7 @@ mod tests {
 
     #[test]
     fn empty_upper_bound_does_not_issue_a_page_request_or_advance_watermark() {
-        let (server, mut poller) = server_and_poller(
-            [step(
-                "NagiIssueUpperBound",
-                None,
-                None,
-                200,
-                upper_bound(None),
-            )],
-            T0,
-        );
+        let (server, mut poller) = server_and_poller([head_step(None)], T0);
         let batch = poller.poll_issues().expect("empty upper-bound scan");
         assert!(batch.observations.is_empty());
         assert_eq!(batch.watermark_ms, T0);
@@ -1445,74 +1418,35 @@ mod tests {
         let archived_at = T2 + 500;
         let (server, mut poller) = server_and_poller(
             [
-                step(
-                    "NagiIssueUpperBound",
+                head_step(Some(T0)),
+                root_step(
                     None,
+                    vec![issue_node(ISSUE_A, T0, None, &[], false, None)],
+                    false,
                     None,
-                    200,
-                    upper_bound(Some(T0)),
                 ),
-                step(
-                    "NagiIssueScan",
+                head_step(Some(T1)),
+                root_step(
                     None,
+                    vec![issue_node(ISSUE_A, T1, None, &[LABEL_A], false, None)],
+                    false,
                     None,
-                    200,
-                    issue_page(
-                        vec![issue_node(ISSUE_A, T0, None, &[], false, None)],
+                ),
+                head_step(Some(T2)),
+                root_step(
+                    None,
+                    vec![issue_node(
+                        ISSUE_A,
+                        T2,
+                        Some(archived_at),
+                        &[LABEL_A],
                         false,
                         None,
-                    ),
+                    )],
+                    false,
+                    None,
                 ),
-                step(
-                    "NagiIssueUpperBound",
-                    None,
-                    None,
-                    200,
-                    upper_bound(Some(T1)),
-                ),
-                step(
-                    "NagiIssueScan",
-                    None,
-                    None,
-                    200,
-                    issue_page(
-                        vec![issue_node(ISSUE_A, T1, None, &[LABEL_A], false, None)],
-                        false,
-                        None,
-                    ),
-                ),
-                step(
-                    "NagiIssueUpperBound",
-                    None,
-                    None,
-                    200,
-                    upper_bound(Some(T2)),
-                ),
-                step(
-                    "NagiIssueScan",
-                    None,
-                    None,
-                    200,
-                    issue_page(
-                        vec![issue_node(
-                            ISSUE_A,
-                            T2,
-                            Some(archived_at),
-                            &[LABEL_A],
-                            false,
-                            None,
-                        )],
-                        false,
-                        None,
-                    ),
-                ),
-                step(
-                    "NagiCurrentIssue",
-                    Some(ISSUE_A),
-                    None,
-                    200,
-                    current_issue(None),
-                ),
+                current_step(ISSUE_A, None),
             ],
             0,
         );
@@ -1538,22 +1472,7 @@ mod tests {
     #[test]
     fn invalid_cursor_and_nonprogressing_cursor_fail_closed() {
         let (server, mut poller) = server_and_poller(
-            [
-                step(
-                    "NagiIssueUpperBound",
-                    None,
-                    None,
-                    200,
-                    upper_bound(Some(T1)),
-                ),
-                step(
-                    "NagiIssueScan",
-                    None,
-                    None,
-                    200,
-                    issue_page(vec![], true, None),
-                ),
-            ],
+            [head_step(Some(T1)), root_step(None, Vec::new(), true, None)],
             0,
         );
         assert_eq!(poller.poll_issues(), Err(PollError::InvalidCursor));
@@ -1562,27 +1481,9 @@ mod tests {
 
         let (server, mut poller) = server_and_poller(
             [
-                step(
-                    "NagiIssueUpperBound",
-                    None,
-                    None,
-                    200,
-                    upper_bound(Some(T1)),
-                ),
-                step(
-                    "NagiIssueScan",
-                    None,
-                    None,
-                    200,
-                    issue_page(vec![], true, Some("same")),
-                ),
-                step(
-                    "NagiIssueScan",
-                    None,
-                    Some("same"),
-                    200,
-                    issue_page(vec![], true, Some("same")),
-                ),
+                head_step(Some(T1)),
+                root_step(None, Vec::new(), true, Some("same")),
+                root_step(Some("same"), Vec::new(), true, Some("same")),
             ],
             0,
         );
@@ -1592,13 +1493,7 @@ mod tests {
 
         let (server, mut poller) = server_and_poller(
             [
-                step(
-                    "NagiIssueUpperBound",
-                    None,
-                    None,
-                    200,
-                    upper_bound(Some(T1)),
-                ),
+                head_step(Some(T1)),
                 step(
                     "NagiIssueScan",
                     None,
@@ -1618,27 +1513,16 @@ mod tests {
     fn oversized_root_page_fails_closed_before_watermark_commit() {
         let (server, mut poller) = server_and_poller(
             [
-                step(
-                    "NagiIssueUpperBound",
+                head_step(Some(T1)),
+                root_step(
                     None,
+                    vec![
+                        issue_node(ISSUE_A, T1, None, &[], false, None),
+                        issue_node(ISSUE_B, T1, None, &[], false, None),
+                        issue_node("synthetic-issue-c", T1, None, &[], false, None),
+                    ],
+                    false,
                     None,
-                    200,
-                    upper_bound(Some(T1)),
-                ),
-                step(
-                    "NagiIssueScan",
-                    None,
-                    None,
-                    200,
-                    issue_page(
-                        vec![
-                            issue_node(ISSUE_A, T1, None, &[], false, None),
-                            issue_node(ISSUE_B, T1, None, &[], false, None),
-                            issue_node("synthetic-issue-c", T1, None, &[], false, None),
-                        ],
-                        false,
-                        None,
-                    ),
                 ),
             ],
             0,
@@ -1672,23 +1556,12 @@ mod tests {
 
         let (server, mut poller) = server_and_poller(
             [
-                step(
-                    "NagiIssueUpperBound",
+                head_step(Some(T1)),
+                root_step(
                     None,
+                    vec![issue_node(ISSUE_A, T1, None, &[], false, None)],
+                    false,
                     None,
-                    200,
-                    upper_bound(Some(T1)),
-                ),
-                step(
-                    "NagiIssueScan",
-                    None,
-                    None,
-                    200,
-                    issue_page(
-                        vec![issue_node(ISSUE_A, T1, None, &[], false, None)],
-                        false,
-                        None,
-                    ),
                 ),
                 step(
                     "NagiIssueUpperBound",
@@ -1710,31 +1583,14 @@ mod tests {
     fn rate_limit_after_root_or_nested_progress_does_not_commit_partial_state() {
         let (server, mut poller) = server_and_poller(
             [
-                step(
-                    "NagiIssueUpperBound",
+                head_step(Some(T1)),
+                root_step(
                     None,
-                    None,
-                    200,
-                    upper_bound(Some(T1)),
-                ),
-                step(
-                    "NagiIssueScan",
-                    None,
-                    None,
-                    200,
-                    issue_page(
-                        vec![issue_node(ISSUE_A, T1, None, &[], false, None)],
-                        true,
-                        Some("root-a"),
-                    ),
-                ),
-                step(
-                    "NagiIssueScan",
-                    None,
+                    vec![issue_node(ISSUE_A, T1, None, &[], false, None)],
+                    true,
                     Some("root-a"),
-                    429,
-                    json!({"error": "synthetic"}),
                 ),
+                root_response(Some("root-a"), 429, json!({"error": "synthetic"})),
             ],
             0,
         );
@@ -1745,38 +1601,21 @@ mod tests {
 
         let (server, mut poller) = server_and_poller(
             [
-                step(
-                    "NagiIssueUpperBound",
+                head_step(Some(T1)),
+                root_step(
                     None,
-                    None,
-                    200,
-                    upper_bound(Some(T1)),
-                ),
-                step(
-                    "NagiIssueScan",
-                    None,
-                    None,
-                    200,
-                    issue_page(
-                        vec![issue_node(
-                            ISSUE_A,
-                            T1,
-                            None,
-                            &[LABEL_A],
-                            true,
-                            Some("label-a"),
-                        )],
-                        false,
+                    vec![issue_node(
+                        ISSUE_A,
+                        T1,
                         None,
-                    ),
+                        &[LABEL_A],
+                        true,
+                        Some("label-a"),
+                    )],
+                    false,
+                    None,
                 ),
-                step(
-                    "NagiIssueLabels",
-                    Some(ISSUE_A),
-                    Some("label-a"),
-                    429,
-                    json!({"error": "synthetic"}),
-                ),
+                labels_response(ISSUE_A, Some("label-a"), 429, json!({"error": "synthetic"})),
             ],
             0,
         );
@@ -1793,20 +1632,8 @@ mod tests {
         malformed["updatedAt"] = Value::String("2026-02-29T00:00:00.000Z".to_owned());
         let (server, mut poller) = server_and_poller(
             [
-                step(
-                    "NagiIssueUpperBound",
-                    None,
-                    None,
-                    200,
-                    upper_bound(Some(T1)),
-                ),
-                step(
-                    "NagiIssueScan",
-                    None,
-                    None,
-                    200,
-                    issue_page(vec![malformed], false, None),
-                ),
+                head_step(Some(T1)),
+                root_step(None, vec![malformed], false, None),
             ],
             0,
         );
@@ -1818,20 +1645,8 @@ mod tests {
         malformed_archive["archivedAt"] = Value::String("not-a-timestamp".to_owned());
         let (_server, mut poller) = server_and_poller(
             [
-                step(
-                    "NagiIssueUpperBound",
-                    None,
-                    None,
-                    200,
-                    upper_bound(Some(T1)),
-                ),
-                step(
-                    "NagiIssueScan",
-                    None,
-                    None,
-                    200,
-                    issue_page(vec![malformed_archive], false, None),
-                ),
+                head_step(Some(T1)),
+                root_step(None, vec![malformed_archive], false, None),
             ],
             0,
         );
@@ -1840,38 +1655,21 @@ mod tests {
 
         let (server, mut poller) = server_and_poller(
             [
-                step(
-                    "NagiIssueUpperBound",
+                head_step(Some(T1)),
+                root_step(
                     None,
-                    None,
-                    200,
-                    upper_bound(Some(T1)),
-                ),
-                step(
-                    "NagiIssueScan",
-                    None,
-                    None,
-                    200,
-                    issue_page(
-                        vec![issue_node(
-                            ISSUE_A,
-                            T1,
-                            None,
-                            &[LABEL_A],
-                            true,
-                            Some("labels-1"),
-                        )],
-                        false,
+                    vec![issue_node(
+                        ISSUE_A,
+                        T1,
                         None,
-                    ),
+                        &[LABEL_A],
+                        true,
+                        Some("labels-1"),
+                    )],
+                    false,
+                    None,
                 ),
-                step(
-                    "NagiIssueLabels",
-                    Some(ISSUE_A),
-                    Some("labels-1"),
-                    200,
-                    labels_page(ISSUE_A, T2, &[LABEL_B], false, None),
-                ),
+                labels_step(ISSUE_A, Some("labels-1"), T2, &[LABEL_B], false, None),
             ],
             0,
         );
@@ -1882,10 +1680,113 @@ mod tests {
 
     #[test]
     fn response_errors_and_debug_are_redacted() {
-        let error = PollError::RateLimited;
-        let rendered = format!("{error:?} {error}");
-        assert!(!rendered.contains(ISSUE_A));
-        assert!(!rendered.contains("synthetic-access-token"));
-        assert!(!rendered.contains("cursor"));
+        const SENTINEL_BODY: &str = "provider-body-sentinel-7e9a";
+        const SENTINEL_CURSOR: &str = "provider-cursor-sentinel-7e9a";
+        const SENTINEL_ID: &str = "provider-id-sentinel-7e9a";
+        const SENTINEL_ERROR: &str = "provider-error-sentinel-7e9a";
+        const SENTINEL_SINCE: &str = "provider-since-sentinel-7e9a";
+        const SENTINEL_UNTIL: &str = "provider-until-sentinel-7e9a";
+
+        let (server, _poller) = server_and_poller(
+            [step(
+                "NagiIssueUpperBound",
+                None,
+                None,
+                400,
+                json!({
+                    "data": null,
+                    "errors": [{
+                        "message": SENTINEL_ERROR,
+                        "path": [SENTINEL_ID],
+                        "extensions": {"code": "RATELIMITED", "cursor": SENTINEL_CURSOR},
+                        "payload": SENTINEL_BODY,
+                    }],
+                }),
+            )],
+            0,
+        );
+        let request = GraphqlRequest::upper_bound(SYNTHETIC_TEAM_ID);
+        let mut transport = LoopbackTransport {
+            address: server.address(),
+        };
+        let response = transport.execute(&request).expect("sentinel response");
+        let response_body = String::from_utf8_lossy(&response.body);
+        assert!(response_body.contains(SENTINEL_BODY));
+        assert!(response_body.contains(SENTINEL_CURSOR));
+        assert!(response_body.contains(SENTINEL_ID));
+        assert!(response_body.contains(SENTINEL_ERROR));
+        let response_debug = format!("{response:?}");
+        let error = match decode::<UpperBoundData>(response) {
+            Err(error) => error,
+            Ok(_) => panic!("sentinel GraphQL error was accepted"),
+        };
+        let error_debug = format!("{error:?} {error}");
+        let request_with_sentinel = GraphqlRequest::current_issue(SENTINEL_ID, FIXED_PAGE_SIZE);
+        let request_body = String::from_utf8_lossy(&request_with_sentinel.body);
+        assert!(request_body.contains(SENTINEL_ID));
+        let request_debug = format!("{request_with_sentinel:?}");
+
+        let snapshot = IssueSnapshot {
+            id: SENTINEL_ID.to_owned(),
+            updated_at_ms: T1,
+            archived_at_ms: None,
+            label_ids: vec![SENTINEL_BODY.to_owned()],
+        };
+        let batch_debug = format!(
+            "{:?}",
+            PollBatch {
+                observations: vec![snapshot.clone()],
+                watermark_ms: T1,
+            }
+        );
+        let snapshot_debug = format!("{snapshot:?}");
+        let request_record_debug = format!(
+            "{:?}",
+            RequestRecord {
+                operation: "NagiIssueScan".to_owned(),
+                team_id: Some(SENTINEL_ID.to_owned()),
+                issue_id: Some(SENTINEL_ID.to_owned()),
+                first: Some(FIXED_PAGE_SIZE),
+                after: Some(SENTINEL_CURSOR.to_owned()),
+                since: Some(SENTINEL_SINCE.to_owned()),
+                until: Some(SENTINEL_UNTIL.to_owned()),
+            }
+        );
+
+        for rendered in [
+            response_debug,
+            error_debug,
+            request_debug,
+            snapshot_debug,
+            batch_debug,
+            request_record_debug,
+        ] {
+            assert!(
+                !rendered.contains(SENTINEL_BODY),
+                "provider body redaction failed"
+            );
+            assert!(
+                !rendered.contains(SENTINEL_CURSOR),
+                "provider cursor redaction failed"
+            );
+            assert!(
+                !rendered.contains(SENTINEL_ID),
+                "provider ID redaction failed"
+            );
+            assert!(
+                !rendered.contains(SENTINEL_ERROR),
+                "provider error redaction failed"
+            );
+            assert!(
+                !rendered.contains(SENTINEL_SINCE),
+                "provider since redaction failed"
+            );
+            assert!(
+                !rendered.contains(SENTINEL_UNTIL),
+                "provider until redaction failed"
+            );
+        }
+        assert_eq!(error, PollError::RateLimited);
+        assert_eq!(server.remaining_steps(), 0);
     }
 }
