@@ -70,6 +70,32 @@ contract passes a fixed Temporal client identity so a host name cannot enter
 synthetic history. It does not open the SQLite file itself, use a Temporal Rust
 SDK, run a production Worker, or contact a provider.
 
+Temporal message handling is a separate opt-in macOS contract, enabled with
+`NAGI_CONTRACT_TEMPORAL_MESSAGES=1 mise run contract:temporal-messages`. The
+wrapper requires a clean checked revision and builds the feature-gated
+`temporalio-sdk = "=0.7.0"` test with the locked `rust@1.98.0` and
+`aqua:protocolbuffers/protobuf/protoc@36.1` tools into the dedicated
+`target/nagi-temporal-message-contract` directory. The build uses private
+mode-0700 `HOME`, `CARGO_HOME`, and mise config/cache/state directories. It
+clone-copies only validated Cargo registry cache and index trees, then invokes
+Cargo offline with the lockfile, so developer Cargo configuration, credentials,
+and unpacked registry sources are not read. Exact `rustc`, `cargo`, and `protoc` probes
+must match before and after the build; the current-user native mise executable
+is validated and its SHA-256 must remain unchanged. Build, probe, and sidecar
+output stays in private bounded files. The wrapper runs exactly one validated
+test binary through the sidecar harness and removes the generated target only
+after bounded cleanup. The synthetic Workflow covers
+Signal-With-Start bootstrap, payload-level signal idempotency and conflicting
+digest rejection, Update validation and stable update IDs, Query reads, and a
+post-commit response-loss recovery that queries state before retrying the same
+ID. Because temporalio-client 0.7.0 generates the Signal-With-Start transport
+request ID internally and does not expose it through `WorkflowStartOptions`, the
+resend witness uses a stable application logical message ID and payload digest,
+and queries a delivery counter to prove the resend reached the Workflow before
+deduplication. The SDK and protoc are build-only contract dependencies; the
+standalone `nagi` binary and production runtime do not include this harness.
+No app bundle, provisioning profile, or signing identity is required.
+
 The live runner resolves the repository from its own script path, requires a
 clean checked revision, and builds the ordinary raw
 `target/nagi-contract/debug/nagi` executable in that exact checkout with

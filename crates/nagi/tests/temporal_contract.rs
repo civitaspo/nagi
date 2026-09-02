@@ -1,8 +1,9 @@
 //! Hermetic checks for the opt-in Temporal sidecar contract.
 //!
-//! The actual CLI/server round trip is deliberately outside the default test
-//! suite. `mise run contract:temporal` is the only command that enables it;
-//! this target checks that the opt-in boundary remains explicit and closed.
+//! The actual CLI/server round trips are deliberately outside the default test
+//! suite. The separate `mise run contract:temporal` and
+//! `mise run contract:temporal-messages` tasks enable them explicitly; this
+//! target checks that both opt-in boundaries remain explicit and closed.
 
 const TEMPORAL_SCRIPT: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -12,7 +13,16 @@ const TEMPORAL_PROVENANCE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../contracts/temporal-cli-provenance.json"
 ));
+const TEMPORAL_MESSAGE_SCRIPT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../scripts/contracts/temporal-messages.sh"
+));
+const TEMPORAL_MESSAGE_TEST: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/temporal_message_contract.rs"
+));
 const MISE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../mise.toml"));
+const NAGI_MANIFEST: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
 
 #[test]
 fn temporal_contract_is_explicitly_opt_in() {
@@ -22,6 +32,35 @@ fn temporal_contract_is_explicitly_opt_in() {
         TEMPORAL_SCRIPT
             .contains("SKIP: Temporal contract layer is opt-in; set NAGI_CONTRACT_TEMPORAL=1")
     );
+}
+
+#[test]
+fn temporal_message_contract_is_explicitly_opt_in_and_build_only() {
+    assert!(MISE.contains("[tasks.\"contract:temporal-messages\"]"));
+    assert!(MISE.contains("run = \"scripts/contracts/temporal-messages.sh\""));
+    assert!(MISE.contains("\"aqua:protocolbuffers/protobuf/protoc\" = \"36.1\""));
+    assert!(TEMPORAL_MESSAGE_SCRIPT.contains(
+        "SKIP: Temporal message contract is opt-in; set NAGI_CONTRACT_TEMPORAL_MESSAGES=1"
+    ));
+    assert!(TEMPORAL_MESSAGE_SCRIPT.contains("temporal-message-contract"));
+    assert!(TEMPORAL_MESSAGE_SCRIPT.contains("aqua:protocolbuffers/protobuf/protoc@36.1"));
+    assert!(TEMPORAL_MESSAGE_SCRIPT.contains("target/nagi-temporal-message-contract"));
+    assert!(TEMPORAL_MESSAGE_SCRIPT.contains("synthetic.temporal-message.v1"));
+    for required in [
+        "fn parse_loopback_address(value: &str) -> Option<Url>",
+        "Url::parse(value).ok()?",
+        "url.host_str() != Some(\"127.0.0.1\")",
+        "url.query().is_some()",
+        "url.fragment().is_some()",
+        "url.path() != \"/\"",
+    ] {
+        assert!(
+            TEMPORAL_MESSAGE_TEST.contains(required),
+            "Temporal message contract is missing {required:?}"
+        );
+    }
+    assert!(NAGI_MANIFEST.contains("temporalio-sdk = { version = \"=0.7.0\""));
+    assert!(NAGI_MANIFEST.contains("temporal-message-contract"));
 }
 
 #[test]
@@ -49,6 +88,12 @@ fn temporal_contract_has_stable_boundary_invariants() {
         "start_server_with_retry no",
         "stop_server",
         "evidence_layer=macos",
+        "message_contract_enabled=0",
+        "case \"$#\"",
+        "--message-contract",
+        "NAGI_CONTRACT_TEMPORAL_MESSAGE_BINARY_SHA256",
+        "message_binary_sha256_after",
+        "if [[ -L \"${path}\" ]]; then",
     ] {
         assert!(
             TEMPORAL_SCRIPT.contains(required),
@@ -82,6 +127,91 @@ fn temporal_contract_has_stable_boundary_invariants() {
     assert!(!TEMPORAL_SCRIPT.contains("--sqlite-pragma"));
     assert!(!TEMPORAL_SCRIPT.contains("--api-key"));
     assert!(!TEMPORAL_SCRIPT.contains("--namespace \"${NAGI_"));
+    assert!(!TEMPORAL_SCRIPT.contains("NAGI_CONTRACT_TEMPORAL_MESSAGES"));
+
+    let message_launcher = TEMPORAL_SCRIPT
+        .find("live_start_child_in_current_group_without_file_limit")
+        .expect("Temporal message mode must keep the sidecar in the wrapper process group");
+    let standard_launcher = TEMPORAL_SCRIPT
+        .find("live_start_child_without_file_limit")
+        .expect("P0-07 must retain the helper-created sidecar process group");
+    let start_server = TEMPORAL_SCRIPT
+        .find("start_server()")
+        .expect("Temporal contract must define its sidecar launcher");
+    assert!(start_server < message_launcher);
+    assert!(message_launcher < standard_launcher);
+    assert!(TEMPORAL_SCRIPT.contains(
+        r#"if [[ "${message_contract_enabled}" == "1" ]]; then
+    live_start_child_in_current_group_without_file_limit"#
+    ));
+    assert!(TEMPORAL_SCRIPT.contains(
+        r#"else
+    live_start_child_without_file_limit"#
+    ));
+
+    let mode_guard = TEMPORAL_SCRIPT
+        .find("case \"$#\"")
+        .expect("Temporal contract must guard its positional mode before execution");
+    let opt_in_guard = TEMPORAL_SCRIPT
+        .find("NAGI_CONTRACT_TEMPORAL")
+        .expect("Temporal contract must remain opt-in");
+    assert!(mode_guard < opt_in_guard);
+}
+
+#[test]
+fn temporal_message_wrapper_passes_the_internal_mode_and_binary_digest() {
+    assert!(TEMPORAL_MESSAGE_SCRIPT.contains("live_binary_sha256"));
+    assert!(TEMPORAL_MESSAGE_SCRIPT.contains("NAGI_CONTRACT_TEMPORAL_MESSAGE_BINARY_SHA256"));
+    assert!(
+        TEMPORAL_MESSAGE_SCRIPT.contains("/bin/bash \"${temporal_script}\" --message-contract")
+    );
+    assert!(!TEMPORAL_MESSAGE_SCRIPT.contains("NAGI_CONTRACT_TEMPORAL_MESSAGES_REVISION"));
+
+    let digest = TEMPORAL_SCRIPT
+        .find("local expected_message_binary_sha256")
+        .expect("Temporal inner mode must receive the wrapper's binary digest");
+    let before = TEMPORAL_SCRIPT
+        .find("message_binary_sha256_before=\"$(binary_sha256")
+        .expect("Temporal inner mode must check the test binary before running it");
+    let after = TEMPORAL_SCRIPT
+        .find("message_binary_sha256_after=\"$(binary_sha256")
+        .expect("Temporal inner mode must check the test binary after running it");
+    assert!(digest < before);
+    assert!(before < after);
+}
+
+#[test]
+fn temporal_message_wrapper_binds_the_private_locked_toolchain() {
+    for required in [
+        "current_uid",
+        "validate_mise_executable",
+        "stat -f '%u %l'",
+        "mise_expected_file_description",
+        "Mach-O 64-bit executable arm64",
+        "Mach-O 64-bit executable x86_64",
+        "mise_sha256_before",
+        "mise_sha256_after",
+        "message_tool_step",
+        "HOME=\"${build_home}\"",
+        "CARGO_HOME=\"${cargo_home}\"",
+        "MISE_CONFIG_DIR=\"${mise_config_directory}\"",
+        "MISE_CACHE_DIR=\"${mise_cache_directory}\"",
+        "MISE_STATE_DIR=\"${mise_state_directory}\"",
+        "rustc --version; cargo --version; protoc --version",
+        "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+        "cargo 1.98.0 (797e8a9bc 2026-08-05)",
+        "libprotoc 36.1",
+        "/usr/bin/cmp -s \"${probe_stdout}\" \"${expected_tool_probe}\"",
+    ] {
+        assert!(
+            TEMPORAL_MESSAGE_SCRIPT.contains(required),
+            "Temporal message wrapper is missing {required:?}"
+        );
+    }
+    assert!(TEMPORAL_MESSAGE_SCRIPT.contains(
+        r#"if live_supervise_child_without_file_limit \
+  "${sidecar_stdout}""#
+    ));
 }
 
 #[test]
@@ -195,4 +325,48 @@ fn temporal_contract_skips_without_running_external_tools() {
         "SKIP: Temporal contract layer is opt-in; set NAGI_CONTRACT_TEMPORAL=1 to request it.\n"
     );
     assert!(output.stderr.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn temporal_message_contract_skips_without_running_external_tools() {
+    use std::process::Command;
+
+    let output = Command::new("/bin/bash")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/contracts/temporal-messages.sh"
+        ))
+        .env_clear()
+        .env("PATH", "/nonexistent")
+        .output()
+        .expect("Temporal message contract preflight should start");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "SKIP: Temporal message contract is opt-in; set NAGI_CONTRACT_TEMPORAL_MESSAGES=1 to request it.\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn temporal_contract_rejects_unrecognized_positional_arguments() {
+    use std::process::Command;
+
+    let output = Command::new("/bin/bash")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/contracts/temporal.sh"
+        ))
+        .arg("unexpected")
+        .env_clear()
+        .output()
+        .expect("Temporal contract positional preflight should start");
+
+    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--message-contract"));
 }
