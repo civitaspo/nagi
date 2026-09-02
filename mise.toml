@@ -51,6 +51,10 @@ run = "mise run test"
 description = "Preflight explicitly enabled macOS contract tests"
 run = "scripts/contracts/macos.sh"
 
+[tasks."contract:temporal"]
+description = "Run the explicitly enabled local Temporal persistence contract"
+run = "scripts/contracts/temporal.sh"
+
 [tasks."contract:live"]
 description = "Preflight explicitly enabled live-provider contract tests"
 run = "scripts/contracts/live.sh"

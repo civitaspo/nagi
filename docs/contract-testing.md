@@ -32,6 +32,28 @@ scripted server proves client boundary and state handling only; it does not
 execute a live Linear schema or filter, and this spike does not prove the
 later durable SQLite/Temporal production poller.
 
+The Temporal sidecar boundary is an explicit macOS-only local contract, enabled
+only by `NAGI_CONTRACT_TEMPORAL=1` through `mise run contract:temporal`. It
+resolves the
+locked `aqua:temporalio/cli@1.8.2` binary, checks the exact CLI version and binds
+its SHA-256 for the complete run, then starts `server start-dev` with fixed
+loopback settings and a file-backed SQLite database. SQLite PRAGMA policy and
+crash-recovery details are owned by the later dual-database contract. The
+contract uses a unique owner-only temporary directory, randomized nonzero
+loopback ports, and an
+environment with config-file and config-environment loading disabled. It asks
+the service to handle a bounded visibility request, starts one fixed synthetic
+Workflow without a worker, records its opaque description and event history,
+force-kills and reaps the process group, and restarts the same database without
+the namespace declaration. The namespace, Workflow description, and byte-for-
+byte history comparison must all succeed after restart. The server's listeners
+are checked to be IPv4 loopback only, SQLite companion files are treated as a
+single temporary-store set, child output is never forwarded, and teardown is
+bounded; the temporary directory is removed only after process cleanup. The
+contract passes a fixed Temporal client identity so a host name cannot enter
+synthetic history. It does not open the SQLite file itself, use a Temporal Rust
+SDK, run a production Worker, or contact a provider.
+
 The live runner resolves the repository from its own script path, requires a
 clean checked revision, and builds the ordinary raw
 `target/nagi-contract/debug/nagi` executable in that exact checkout with
