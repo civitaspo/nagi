@@ -10,12 +10,6 @@ The Phase 0 harness has deliberate layers:
 
 The opt-in layers are intentionally not part of the default test or CI path. An unset layer skips. An explicitly requested but not-yet-implemented layer fails, so a future gate cannot be reported as passing by accident.
 
-The managed Codex authentication boundary is specified in
-[ADR-0002](adr/0002-managed-codex-authentication.md). The default Rust tests
-remain credential-free and hermetic; the opt-in runner above is the only live
-status smoke, and it never invokes a browser login or uses the user's default
-`CODEX_HOME`.
-
 The Linear polling boundary is covered by a credential-free loopback GraphQL
 server in the Rust unit-test target. Each request is matched to a scripted
 operation and cursor, so tests never enumerate a provider collection or need a
