@@ -417,6 +417,31 @@ fn temporal_activity_private_output_and_public_evidence_redaction_are_separate()
 }
 
 #[test]
+fn temporal_replay_private_and_sdk_output_redaction_are_separate() {
+    let replay_output_check = TEMPORAL_SCRIPT
+        .find("assert_replay_output_safe()")
+        .and_then(|start| {
+            TEMPORAL_SCRIPT[start..]
+                .find("run_replay_contract()")
+                .map(|end| &TEMPORAL_SCRIPT[start..start + end])
+        })
+        .expect("Temporal replay contract must define its private output check");
+    assert!(replay_output_check.contains(
+        "(authorization:|bearer[[:space:]]+|access[_-]?token|client[_-]?secret|password[=:]|/Users/|/private/|/home/)"
+    ));
+    assert!(replay_output_check.contains(
+        "(authorization:|bearer[[:space:]]+|access[_-]?token|client[_-]?secret|password[=:])"
+    ));
+    let sdk_output = replay_output_check
+        .find("\"${replay_stdout}\" \"${replay_stderr}\"; then")
+        .expect("Temporal replay contract must path-redact SDK output");
+    let private_sidecar_output = replay_output_check
+        .find("\"${stdout_file}\" \"${stderr_file}\"; then")
+        .expect("Temporal replay contract must credential-redact sidecar output");
+    assert!(sdk_output < private_sidecar_output);
+}
+
+#[test]
 fn temporal_message_contract_uses_full_signal_payload_and_one_state_query() {
     for required in [
         "derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)",

@@ -347,11 +347,18 @@ pub(crate) fn continue_as_new_run_id(history: &WorkflowHistory) -> String {
     {
         Some(Attributes::WorkflowExecutionContinuedAsNewEventAttributes(attributes)) => {
             assert!(valid_run_id(&attributes.new_execution_run_id));
-            assert_eq!(
-                ContinueAsNewInitiator::try_from(attributes.initiator)
-                    .expect("Continue-As-New event must advertise a known initiator"),
-                ContinueAsNewInitiator::Workflow,
-                "run A must be continued by the workflow itself"
+            // temporalio-sdk 0.7.0 does not expose an initiator field on its
+            // Continue-As-New command, so the server records the self-request
+            // as `UNSPECIFIED`. Reject retry/cron continuations while accepting
+            // both representations of an SDK-issued Continue-As-New.
+            let initiator = ContinueAsNewInitiator::try_from(attributes.initiator)
+                .expect("Continue-As-New event must advertise a known initiator");
+            assert!(
+                matches!(
+                    initiator,
+                    ContinueAsNewInitiator::Workflow | ContinueAsNewInitiator::Unspecified
+                ),
+                "run A must be continued by the workflow SDK"
             );
             attributes.new_execution_run_id.clone()
         }

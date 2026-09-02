@@ -706,9 +706,18 @@ assert_replay_output_safe() {
     size="$(live_file_size "${path}")"
     [[ "${size}" =~ ^[0-9]+$ ]] && ((size <= MAX_CHILD_OUTPUT_BYTES)) || return 1
   done
+  # The SDK test is the public-facing witness and must not expose filesystem
+  # paths. The sidecar output is private bounded diagnostic state; it may
+  # contain the expected run-private SQLite path, but it must still reject
+  # credential-shaped text.
   if /usr/bin/grep -Eiq \
     '(authorization:|bearer[[:space:]]+|access[_-]?token|client[_-]?secret|password[=:]|/Users/|/private/|/home/)' \
-    "${replay_stdout}" "${replay_stderr}" "${stdout_file}" "${stderr_file}"; then
+    "${replay_stdout}" "${replay_stderr}"; then
+    return 1
+  fi
+  if /usr/bin/grep -Eiq \
+    '(authorization:|bearer[[:space:]]+|access[_-]?token|client[_-]?secret|password[=:])' \
+    "${stdout_file}" "${stderr_file}"; then
     return 1
   fi
 }

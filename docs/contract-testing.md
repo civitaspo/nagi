@@ -182,7 +182,10 @@ public histories. The separate provenance manifest records the reviewed
 producer and artifact digests needed for binding, together with a signed clean producer revision.
 The sanitized corpus and
 manifest are intentionally committed and public, while raw captures never
-become public evidence.
+become public evidence. SDK test stdout/stderr are path- and credential-
+redacted; private sidecar stdout/stderr remain bounded and credential-redacted
+while retaining the expected run-private SQLite path when the CLI includes it
+in its startup banner.
 
 The default `mise run test` reads that checked corpus and replays it with the
 SDK `WorkflowReplayer` without connecting to the sidecar. Its structural
