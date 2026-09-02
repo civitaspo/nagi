@@ -1,9 +1,13 @@
-//! Minimal command-line boundary for local Linear OAuth credentials.
+//! Minimal command-line boundary for local Linear OAuth and Codex credentials.
 //!
 //! Argument parsing is intentionally manual and closed: there is no generic
 //! option parser that could accidentally accept a token, secret, or provider
-//! endpoint. The CLI never reads standard input.
+//! endpoint. Codex login deliberately inherits standard input for the official
+//! foreground browser flow; Nagi never reads or captures it itself.
 
+use crate::codex::CodexError;
+#[cfg(target_os = "macos")]
+use crate::codex::{self, CodexOperation};
 use crate::linear::ReadContractError;
 use crate::linear::credentials::CredentialError;
 #[cfg(target_os = "macos")]
@@ -49,19 +53,22 @@ pub enum CliError {
     Credential(CredentialError),
     /// The provider read contract rejected its bounded operation.
     ReadContract(ReadContractError),
+    /// The managed Codex authentication boundary rejected its operation.
+    Codex(CodexError),
 }
 
 impl fmt::Display for CliError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Usage => formatter.write_str(
-                "usage: nagi auth linear login | status | logout --confirm-revoke | nagi contract linear read",
+                "usage: nagi auth linear login | status | logout --confirm-revoke | nagi auth codex login | status | logout | nagi contract linear read",
             ),
             Self::Configuration => {
                 formatter.write_str("Linear OAuth local configuration is invalid")
             }
             Self::Credential(error) => error.fmt(formatter),
             Self::ReadContract(error) => error.fmt(formatter),
+            Self::Codex(error) => error.fmt(formatter),
         }
     }
 }
@@ -70,9 +77,12 @@ impl std::error::Error for CliError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Command {
-    Login,
-    Status,
-    Logout,
+    LinearLogin,
+    LinearStatus,
+    LinearLogout,
+    CodexLogin,
+    CodexStatus,
+    CodexLogout,
     ReadContract,
 }
 
@@ -124,35 +134,55 @@ where
             Command::ReadContract => Err(CliError::ReadContract(
                 ReadContractError::UnsupportedPlatform,
             )),
-            Command::Login | Command::Status | Command::Logout => {
+            Command::LinearLogin | Command::LinearStatus | Command::LinearLogout => {
                 Err(CliError::Credential(CredentialError::UnsupportedPlatform))
+            }
+            Command::CodexLogin | Command::CodexStatus | Command::CodexLogout => {
+                Err(CliError::Codex(CodexError::UnsupportedPlatform))
             }
         }
     }
 
     #[cfg(target_os = "macos")]
     {
-        reject_unknown_linear_configuration()?;
         match command {
-            Command::Status => {
+            Command::LinearStatus => {
+                reject_unknown_linear_configuration()?;
                 let mut manager =
                     CredentialManager::production_status().map_err(CliError::Credential)?;
                 println!("{}", manager.status());
             }
-            Command::Login => {
+            Command::LinearLogin => {
+                reject_unknown_linear_configuration()?;
                 let (client_id, callback_port) = read_login_configuration()?;
                 let mut manager = CredentialManager::production(client_id, callback_port)
                     .map_err(CliError::Credential)?;
                 manager.login().map_err(CliError::Credential)?;
                 println!("signed_in");
             }
-            Command::Logout => {
+            Command::LinearLogout => {
+                reject_unknown_linear_configuration()?;
                 let mut manager =
                     CredentialManager::production_logout().map_err(CliError::Credential)?;
                 manager.logout(true).map_err(CliError::Credential)?;
                 println!("signed_out");
             }
-            Command::ReadContract => run_read_contract()?,
+            Command::CodexLogin => {
+                codex::run(CodexOperation::Login).map_err(CliError::Codex)?;
+                println!("signed_in");
+            }
+            Command::CodexStatus => {
+                let status = codex::run(CodexOperation::Status).map_err(CliError::Codex)?;
+                println!("{status}");
+            }
+            Command::CodexLogout => {
+                codex::run(CodexOperation::Logout).map_err(CliError::Codex)?;
+                println!("signed_out");
+            }
+            Command::ReadContract => {
+                reject_unknown_linear_configuration()?;
+                run_read_contract()?;
+            }
         }
         Ok(())
     }
@@ -166,8 +196,22 @@ where
         return Err(CliError::Usage);
     };
     match first.to_str() {
-        Some("auth") => parse_auth_linear(arguments),
+        Some("auth") => parse_auth(arguments),
         Some("contract") => parse_contract_linear(arguments),
+        _ => Err(CliError::Usage),
+    }
+}
+
+fn parse_auth<I>(mut arguments: I) -> Result<Command, CliError>
+where
+    I: Iterator<Item = OsString>,
+{
+    let Some(provider) = arguments.next() else {
+        return Err(CliError::Usage);
+    };
+    match provider.to_str() {
+        Some("linear") => parse_auth_linear(arguments),
+        Some("codex") => parse_auth_codex(arguments),
         _ => Err(CliError::Usage),
     }
 }
@@ -176,20 +220,17 @@ fn parse_auth_linear<I>(mut arguments: I) -> Result<Command, CliError>
 where
     I: Iterator<Item = OsString>,
 {
-    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("linear")) {
-        return Err(CliError::Usage);
-    }
     let Some(operation) = arguments.next() else {
         return Err(CliError::Usage);
     };
     let operation = match operation.to_str() {
-        Some("login") => Command::Login,
-        Some("status") => Command::Status,
-        Some("logout") => Command::Logout,
+        Some("login") => Command::LinearLogin,
+        Some("status") => Command::LinearStatus,
+        Some("logout") => Command::LinearLogout,
         _ => return Err(CliError::Usage),
     };
     match operation {
-        Command::Logout => {
+        Command::LinearLogout => {
             let Some(flag) = arguments.next() else {
                 return Err(CliError::Usage);
             };
@@ -197,11 +238,33 @@ where
                 return Err(CliError::Usage);
             }
         }
-        Command::Login | Command::Status if arguments.next().is_some() => {
+        Command::LinearLogin | Command::LinearStatus if arguments.next().is_some() => {
             return Err(CliError::Usage);
         }
-        Command::Login | Command::Status => {}
+        Command::LinearLogin | Command::LinearStatus => {}
         Command::ReadContract => return Err(CliError::Usage),
+        Command::CodexLogin | Command::CodexStatus | Command::CodexLogout => {
+            return Err(CliError::Usage);
+        }
+    }
+    Ok(operation)
+}
+
+fn parse_auth_codex<I>(mut arguments: I) -> Result<Command, CliError>
+where
+    I: Iterator<Item = OsString>,
+{
+    let Some(operation) = arguments.next() else {
+        return Err(CliError::Usage);
+    };
+    let operation = match operation.to_str() {
+        Some("login") => Command::CodexLogin,
+        Some("status") => Command::CodexStatus,
+        Some("logout") => Command::CodexLogout,
+        _ => return Err(CliError::Usage),
+    };
+    if arguments.next().is_some() {
+        return Err(CliError::Usage);
     }
     Ok(operation)
 }
@@ -440,15 +503,27 @@ mod tests {
     fn parser_accepts_auth_operations_and_the_explicit_read_contract() {
         assert_eq!(
             parse_arguments(args(&["auth", "linear", "login"]).into_iter()),
-            Ok(Command::Login)
+            Ok(Command::LinearLogin)
         );
         assert_eq!(
             parse_arguments(args(&["auth", "linear", "status"]).into_iter()),
-            Ok(Command::Status)
+            Ok(Command::LinearStatus)
         );
         assert_eq!(
             parse_arguments(args(&["auth", "linear", "logout", "--confirm-revoke"]).into_iter()),
-            Ok(Command::Logout)
+            Ok(Command::LinearLogout)
+        );
+        assert_eq!(
+            parse_arguments(args(&["auth", "codex", "login"]).into_iter()),
+            Ok(Command::CodexLogin)
+        );
+        assert_eq!(
+            parse_arguments(args(&["auth", "codex", "status"]).into_iter()),
+            Ok(Command::CodexStatus)
+        );
+        assert_eq!(
+            parse_arguments(args(&["auth", "codex", "logout"]).into_iter()),
+            Ok(Command::CodexLogout)
         );
         assert_eq!(
             parse_arguments(args(&["contract", "linear", "read"]).into_iter()),
@@ -464,6 +539,9 @@ mod tests {
             &["auth", "linear", "login", "--token", "secret"][..],
             &["auth", "linear", "status", "--client-secret", "secret"][..],
             &["auth", "linear", "login", "--callback-port", "43872"][..],
+            &["auth", "codex", "logout", "--confirm-revoke"][..],
+            &["auth", "codex", "login", "--with-api-key", "secret"][..],
+            &["auth", "codex", "status", "--json"][..],
             &["auth", "linear", "unknown"][..],
             &["contract", "linear", "read", "extra"][..],
         ] {

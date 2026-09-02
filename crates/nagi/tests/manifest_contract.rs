@@ -10,6 +10,8 @@ const FIXTURE: &str = include_str!("../../../tests/fixtures/phase-zero.toml");
 const EVIDENCE_SCHEMA: &str = include_str!("../../../tests/evidence/v1.schema.json");
 const EVIDENCE_EXAMPLE: &str = include_str!("../../../tests/evidence/example.json");
 const VERSIONS: &str = include_str!("../../../contracts/versions.toml");
+const CODEX_PROVENANCE: &str = include_str!("../../../contracts/codex-cli-provenance.json");
+const CODEX_SOURCE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/codex.rs"));
 const MISE: &str = include_str!("../../../mise.toml");
 const MISE_LOCK: &str = include_str!("../../../mise.lock");
 const WORKSPACE_CARGO: &str = include_str!("../../../Cargo.toml");
@@ -19,6 +21,16 @@ const MACOS_SCRIPT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../scripts/contracts/macos.sh"
 );
+#[cfg(unix)]
+const CODEX_AUTH_SCRIPT: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../scripts/contracts/codex-auth.sh"
+);
+#[cfg(unix)]
+const CODEX_AUTH_SCRIPT_SOURCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../scripts/contracts/codex-auth.sh"
+));
 #[cfg(unix)]
 const LIVE_SCRIPT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -376,6 +388,147 @@ fn versions_are_a_strict_source_and_revision_manifest() {
 }
 
 #[test]
+fn codex_cli_provenance_is_strict_and_matches_the_pinned_release() {
+    let versions_source = parse_toml("version manifest", VERSIONS);
+    let versions = toml_table("version manifest", &versions_source);
+    let parsed = parse_json("Codex CLI provenance", CODEX_PROVENANCE);
+    let provenance = json_object("Codex CLI provenance", &parsed);
+    assert!(exact_json_keys(
+        provenance,
+        &[
+            "schemaVersion",
+            "tool",
+            "version",
+            "source",
+            "tag",
+            "revision",
+            "artifacts",
+        ]
+    ));
+    assert_eq!(
+        provenance.get("schemaVersion").and_then(Value::as_i64),
+        Some(1)
+    );
+    assert_eq!(
+        provenance.get("tool").and_then(Value::as_str),
+        Some("aqua:openai/codex")
+    );
+    let version = toml_string("version manifest", versions, "codex");
+    let source = toml_string("version manifest", versions, "codex_source");
+    let tag = toml_string("version manifest", versions, "codex_tag");
+    let revision = toml_string("version manifest", versions, "codex_revision");
+    assert_eq!(
+        provenance.get("version").and_then(Value::as_str),
+        Some(version)
+    );
+    assert_eq!(
+        provenance.get("source").and_then(Value::as_str),
+        Some(source)
+    );
+    assert_eq!(provenance.get("tag").and_then(Value::as_str), Some(tag));
+    assert_eq!(
+        provenance.get("revision").and_then(Value::as_str),
+        Some(revision)
+    );
+    assert_hex_revision(revision);
+
+    let lock_source = parse_toml("mise.lock", MISE_LOCK);
+    let lock = toml_table("mise.lock", &lock_source);
+    let lock_tools = toml_table(
+        "mise.lock tools",
+        lock.get("tools").expect("mise.lock tools"),
+    );
+    let lock_entries = lock_tools
+        .get("aqua:openai/codex")
+        .and_then(TomlValue::as_array)
+        .expect("mise.lock Codex entry");
+    assert_eq!(lock_entries.len(), 1);
+    let lock_entry = toml_table("mise.lock Codex", &lock_entries[0]);
+
+    let artifacts = json_object(
+        "Codex CLI provenance artifacts",
+        provenance.get("artifacts").expect("Codex artifacts"),
+    );
+    assert_eq!(
+        artifacts.keys().cloned().collect::<BTreeSet<_>>(),
+        BTreeSet::from(["macos-arm64".to_owned(), "macos-x64".to_owned()])
+    );
+    for (platform, architecture) in [("macos-arm64", "arm64"), ("macos-x64", "x86_64")] {
+        let artifact = json_object(
+            "Codex CLI provenance artifact",
+            artifacts.get(platform).expect("platform artifact"),
+        );
+        assert!(exact_json_keys(
+            artifact,
+            &[
+                "archiveUrl",
+                "archiveSha256",
+                "binarySha256",
+                "fileDescription",
+                "versionOutput",
+            ]
+        ));
+        let archive_url = artifact
+            .get("archiveUrl")
+            .and_then(Value::as_str)
+            .expect("artifact archive URL");
+        assert!(
+            archive_url.starts_with(&format!("{source}/releases/download/{tag}/codex-package-"))
+        );
+        assert!(archive_url.ends_with(".tar.gz"));
+        let archive_sha256 = artifact
+            .get("archiveSha256")
+            .and_then(Value::as_str)
+            .expect("artifact archive digest");
+        let binary_sha256 = artifact
+            .get("binarySha256")
+            .and_then(Value::as_str)
+            .expect("artifact binary digest");
+        let lock_platform = toml_table(
+            "mise.lock Codex platform",
+            lock_entry
+                .get(&format!("platforms.{platform}"))
+                .expect("matching mise.lock Codex platform"),
+        );
+        assert_eq!(
+            archive_url,
+            toml_string("mise.lock Codex platform", lock_platform, "url")
+        );
+        assert_eq!(
+            archive_sha256,
+            toml_string("mise.lock Codex platform", lock_platform, "checksum")
+                .strip_prefix("sha256:")
+                .expect("SHA-256 lock checksum")
+        );
+        for key in ["archiveSha256", "binarySha256"] {
+            let digest = artifact
+                .get(key)
+                .and_then(Value::as_str)
+                .expect("artifact digest");
+            assert_eq!(digest.len(), 64, "{platform}.{key} must be SHA-256");
+            assert!(
+                digest
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')),
+                "{platform}.{key} must be hexadecimal"
+            );
+        }
+        assert!(
+            CODEX_SOURCE.contains(binary_sha256),
+            "runtime Codex code must bind {platform} binary digest"
+        );
+        assert_eq!(
+            artifact.get("fileDescription").and_then(Value::as_str),
+            Some(format!("Mach-O 64-bit executable {architecture}").as_str())
+        );
+        assert_eq!(
+            artifact.get("versionOutput").and_then(Value::as_str),
+            Some(format!("codex-cli {version}").as_str())
+        );
+    }
+}
+
+#[test]
 fn tool_manifests_cross_check_declared_versions_and_backends() {
     let parsed = parse_toml("workspace Cargo.toml", WORKSPACE_CARGO);
     let workspace = toml_table("workspace Cargo.toml", &parsed);
@@ -494,12 +647,43 @@ fn macos_preflight_is_opt_in_and_platform_gated() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn codex_auth_contract_is_opt_in_and_status_only() {
+    let skip = command_output(CODEX_AUTH_SCRIPT, &[]);
+    assert_eq!(skip.status.code(), Some(0));
+    assert!(bytes_contain(&skip.stdout, b"SKIP"));
+    assert!(skip.stderr.is_empty());
+    assert!(CODEX_AUTH_SCRIPT_SOURCE.contains("NAGI_CONTRACT_CODEX_AUTH_REVISION"));
+    assert!(CODEX_AUTH_SCRIPT_SOURCE.contains("NAGI_CONTRACT_CODEX_AUTH_USE_REAL_HOME"));
+    assert!(CODEX_AUTH_SCRIPT_SOURCE.contains("live_validate_clean_revision"));
+    assert!(CODEX_AUTH_SCRIPT_SOURCE.contains("live_supervise_child_without_file_limit"));
+    assert!(CODEX_AUTH_SCRIPT_SOURCE.contains("/private/tmp/nagi-codex-auth-contract.XXXXXX"));
+    assert!(!CODEX_AUTH_SCRIPT_SOURCE.contains("mktemp -d /tmp/nagi-codex-auth-contract.XXXXXX"));
+    assert!(CODEX_AUTH_SCRIPT_SOURCE.contains("CODEX_HOME=/nagi-codex-auth-caller-home"));
+    assert!(CODEX_AUTH_SCRIPT_SOURCE.contains("auth codex status"));
+    assert!(CODEX_AUTH_SCRIPT_SOURCE.contains("live_binary_sha256"));
+    assert!(!CODEX_AUTH_SCRIPT_SOURCE.contains("auth codex login"));
+    assert!(!CODEX_AUTH_SCRIPT_SOURCE.contains("auth codex logout"));
+
+    if !cfg!(target_os = "macos") {
+        let explicit = command_output(CODEX_AUTH_SCRIPT, &[("NAGI_CONTRACT_CODEX_AUTH", "1")]);
+        assert_eq!(explicit.status.code(), Some(2));
+        assert!(!bytes_contain(&explicit.stdout, b"/"));
+        assert!(!bytes_contain(&explicit.stderr, b"/"));
+    }
+}
+
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn non_macos_build_keeps_error_boundary() {
     assert_eq!(
         nagi::linear::ReadContractError::UnsupportedPlatform.to_string(),
         "Linear read contract is unsupported on this host"
+    );
+    assert_eq!(
+        nagi::codex::CodexError::UnsupportedPlatform.to_string(),
+        "Codex authentication is unsupported on this host"
     );
 }
 

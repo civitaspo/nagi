@@ -58,6 +58,10 @@ run = "mise run test"
 description = "Preflight explicitly enabled macOS contract tests"
 run = "scripts/contracts/macos.sh"
 
+[tasks."contract:codex-auth"]
+description = "Run the explicitly enabled managed Codex authentication status contract"
+run = "scripts/contracts/codex-auth.sh"
+
 [tasks."contract:temporal"]
 description = "Run the explicitly enabled local Temporal persistence contract"
 run = "scripts/contracts/temporal.sh"
