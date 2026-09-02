@@ -482,7 +482,7 @@ run_message_contract() {
     return 1
   fi
   message_binary_candidates="$(/usr/bin/find "${message_target}/debug/deps" \
-    -type f -name 'temporal_message_contract-*' -perm -111 -links 1 -print 2>/dev/null || true)"
+    -type f -name 'temporal_message_contract-*' -perm -100 -links 1 -print 2>/dev/null || true)"
   if [[ -z "${message_binary_candidates}" || "${message_binary_candidates}" == *$'\n'* \
     || "${message_binary_candidates}" == *$'\r'* || "${message_binary_candidates}" == *$'\t'* ]]; then
     echo "Temporal message contract did not produce exactly one test binary." >&2
@@ -492,7 +492,8 @@ run_message_contract() {
   if ! live_validate_path_components "${message_binary}" \
     || [[ "${message_binary}" != "${message_target}/debug/deps/temporal_message_contract-"* ]] \
     || [[ ! -f "${message_binary}" || -L "${message_binary}" || ! -x "${message_binary}" ]] \
-    || [[ "$(/usr/bin/stat -f '%l' "${message_binary}" 2>/dev/null || true)" != "1" ]] \
+    || [[ "$(/usr/bin/stat -f '%u %Lp %l' "${message_binary}" 2>/dev/null || true)" \
+      != "$(/usr/bin/id -u) 700 1" ]] \
     || [[ "$(/usr/bin/file -b "${message_binary}" 2>/dev/null || true)" != "${expected_file_description}" ]]; then
     echo "Temporal message contract rejected the built test binary." >&2
     return 1

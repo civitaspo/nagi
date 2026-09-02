@@ -194,6 +194,20 @@ fn temporal_message_wrapper_passes_the_internal_mode_and_binary_digest() {
 }
 
 #[test]
+fn temporal_message_mode_accepts_only_private_owner_executable() {
+    let message_mode = TEMPORAL_SCRIPT
+        .find("run_message_contract()")
+        .map(|offset| &TEMPORAL_SCRIPT[offset..])
+        .expect("Temporal contract must define message mode");
+
+    assert!(message_mode.contains("-perm -100"));
+    assert!(message_mode.contains("stat -f '%u %Lp %l'"));
+    assert!(message_mode.contains("$(/usr/bin/id -u) 700 1"));
+    assert!(!message_mode.contains("-perm -111"));
+    assert!(!message_mode.contains("$(/usr/bin/id -u) 755 1"));
+}
+
+#[test]
 fn temporal_message_wrapper_binds_the_private_locked_toolchain() {
     for required in [
         "current_uid",
