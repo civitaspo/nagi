@@ -6,6 +6,7 @@
 //! vendor process. Prompts, report text, provider data, and credentials never
 //! enter durable state or public output.
 
+pub use crate::attempt_store::AttemptResolution;
 use crate::attempt_store::{
     AttemptBackend, AttemptRecord, AttemptState, AttemptStore, AttemptStoreError,
 };
@@ -34,6 +35,8 @@ const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_REPORT_BYTES: u64 = 16 * 1024;
 const MAX_PROMPT_BYTES: usize = 64 * 1024;
 const MAX_ATTEMPT_ID_BYTES: usize = 128;
+const MAX_LIST_ATTEMPTS: usize = 64;
+const MAX_LIST_OUTPUT_BYTES: usize = 16 * 1024;
 const REPOSITORY_TIMEOUT: Duration = Duration::from_secs(10);
 const REPOSITORY_OUTPUT_BYTES: usize = 16 * 1024;
 const WORKSPACE_LABEL_PREFIX: &str = "nagi-work-";
@@ -237,7 +240,7 @@ struct WorkConfigFile {
 
 /// The redacted machine-readable status emitted by `work start/status` and
 /// after interrupt reconciliation.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkStatus {
     attempt_id: String,
@@ -245,6 +248,9 @@ pub struct WorkStatus {
     backend: &'static str,
     observation_revision: u64,
 }
+
+/// One bounded, redacted record emitted by `work list`.
+pub type WorkListRecord = WorkStatus;
 
 impl WorkStatus {
     fn from_record(record: &AttemptRecord) -> Self {
@@ -528,6 +534,28 @@ pub fn run_status(config_path: &Path, attempt_id: &str) -> Result<WorkStatus, Wo
     Ok(WorkStatus::from_record(&record))
 }
 
+/// Lists nonterminal attempts without contacting Linear, Herdr, or a
+/// provider. The durable store fails closed when the bounded cap is exceeded.
+pub fn run_list(config_path: &Path) -> Result<Vec<WorkListRecord>, WorkError> {
+    let config = WorkConfig::load(config_path)?;
+    let store = AttemptStore::open(&config.attempt_db)?;
+    let records = store.list_nonterminal_bounded(MAX_LIST_ATTEMPTS)?;
+    Ok(records.iter().map(WorkStatus::from_record).collect())
+}
+
+/// Applies one explicit operator resolution without any external effect.
+pub fn run_resolve(
+    config_path: &Path,
+    attempt_id: &str,
+    resolution: AttemptResolution,
+) -> Result<WorkStatus, WorkError> {
+    let config = WorkConfig::load(config_path)?;
+    validate_attempt_id(attempt_id)?;
+    let mut store = AttemptStore::open(&config.attempt_db)?;
+    let record = store.resolve(attempt_id, resolution, now_ms()?)?;
+    Ok(WorkStatus::from_record(&record))
+}
+
 /// Runs the production `work interrupt` sequence.
 pub fn run_interrupt(config_path: &Path, attempt_id: &str) -> Result<WorkStatus, WorkError> {
     let config = WorkConfig::load(config_path)?;
@@ -554,6 +582,18 @@ pub fn run_collect(
 /// Serializes the bounded status object for the CLI.
 pub fn render_status(status: &WorkStatus) -> Result<String, WorkError> {
     serde_json::to_string(status).map_err(|_| WorkError::LocalRuntime)
+}
+
+/// Serializes bounded redacted records for the CLI.
+pub fn render_list(records: &[WorkListRecord]) -> Result<String, WorkError> {
+    if records.len() > MAX_LIST_ATTEMPTS {
+        return Err(WorkError::LocalRuntime);
+    }
+    let rendered = serde_json::to_string(records).map_err(|_| WorkError::LocalRuntime)?;
+    if rendered.len() > MAX_LIST_OUTPUT_BYTES {
+        return Err(WorkError::LocalRuntime);
+    }
+    Ok(rendered)
 }
 
 /// Serializes the bounded collect object for the CLI.
@@ -587,7 +627,7 @@ fn reconcile_start_with<B: AgentBackend>(
     let workspace_label = workspace_label_for_attempt(current.attempt_id())?;
     let agent_name = agent_name_for_attempt(current.attempt_id())?;
     match current.state() {
-        AttemptState::Created | AttemptState::WorkspacePending => {
+        AttemptState::Created => {
             if let Some(workspace) = backend.find_workspace(&workspace_label)? {
                 let workspace_ref = workspace.runtime_binding()?;
                 return store
@@ -604,16 +644,48 @@ fn reconcile_start_with<B: AgentBackend>(
                 .mark_workspace_ready(current.attempt_id(), &workspace_ref, now_ms)
                 .map_err(WorkError::from)
         }
-        AttemptState::WorkspaceReady => store
-            .mark_agent_pending(current.attempt_id(), now_ms)
-            .map_err(WorkError::from),
+        AttemptState::WorkspacePending => {
+            if let Some(workspace) = backend.find_workspace(&workspace_label)? {
+                let workspace_ref = workspace.runtime_binding()?;
+                return store
+                    .mark_workspace_ready(current.attempt_id(), &workspace_ref, now_ms)
+                    .map_err(WorkError::from);
+            }
+            Ok(current)
+        }
+        AttemptState::WorkspaceReady => {
+            let pending = store.mark_agent_pending(current.attempt_id(), now_ms)?;
+            let workspace_ref = pending
+                .workspace_ref()
+                .ok_or(WorkError::Attempt(AttemptStoreError::Database))?;
+            let Some(workspace) = backend.find_workspace(&workspace_label)? else {
+                return Ok(pending);
+            };
+            if workspace.runtime_binding()? != workspace_ref {
+                return Err(WorkError::Herdr(HerdrError::UnexpectedResponse));
+            }
+            if let Some(agent) = backend.find_agent(&workspace, &agent_name)? {
+                let agent_ref = agent.runtime_binding()?;
+                return store
+                    .mark_agent_ready(pending.attempt_id(), workspace_ref, &agent_ref, now_ms)
+                    .map_err(WorkError::from);
+            }
+            let Some(_config) = config else {
+                return Ok(pending);
+            };
+            let agent = backend.agent_start(&workspace, &agent_name)?;
+            let agent_ref = agent.runtime_binding()?;
+            store
+                .mark_agent_ready(pending.attempt_id(), workspace_ref, &agent_ref, now_ms)
+                .map_err(WorkError::from)
+        }
         AttemptState::AgentPending => {
             let workspace_ref = current
                 .workspace_ref()
                 .ok_or(WorkError::Attempt(AttemptStoreError::Database))?;
-            let workspace = backend
-                .find_workspace(&workspace_label)?
-                .ok_or(WorkError::Herdr(HerdrError::AgentNotFound))?;
+            let Some(workspace) = backend.find_workspace(&workspace_label)? else {
+                return Ok(current);
+            };
             if workspace.runtime_binding()? != workspace_ref {
                 return Err(WorkError::Herdr(HerdrError::UnexpectedResponse));
             }
@@ -623,14 +695,7 @@ fn reconcile_start_with<B: AgentBackend>(
                     .mark_agent_ready(current.attempt_id(), workspace_ref, &agent_ref, now_ms)
                     .map_err(WorkError::from);
             }
-            let Some(_config) = config else {
-                return Ok(current);
-            };
-            let agent = backend.agent_start(&workspace, &agent_name)?;
-            let agent_ref = agent.runtime_binding()?;
-            store
-                .mark_agent_ready(current.attempt_id(), workspace_ref, &agent_ref, now_ms)
-                .map_err(WorkError::from)
+            Ok(current)
         }
         AttemptState::AgentReady => {
             let Some(issue) = issue else {
@@ -1135,6 +1200,35 @@ mod tests {
     }
 
     #[test]
+    fn list_output_is_bounded_and_contains_only_redacted_status_fields() {
+        let records = vec![WorkStatus {
+            attempt_id: "attempt-1".to_owned(),
+            state: AttemptState::WorkspacePending.as_str(),
+            backend: AttemptBackend::HerdrCodex.as_str(),
+            observation_revision: 0,
+        }];
+        let output = render_list(&records).expect("list");
+        let value: serde_json::Value = serde_json::from_str(&output).expect("list JSON");
+        assert_eq!(
+            value[0]
+                .as_object()
+                .expect("record")
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([
+                "attemptId",
+                "backend",
+                "observationRevision",
+                "state"
+            ])
+        );
+        assert!(!output.contains("issue"));
+        assert!(!output.contains("workspaceRef"));
+        assert!(render_list(&vec![records[0].clone(); MAX_LIST_ATTEMPTS + 1]).is_err());
+    }
+
+    #[test]
     fn config_shape_rejects_unknown_or_secret_fields() {
         let value = json!({
             "client_id": "client",
@@ -1285,7 +1379,7 @@ mod tests {
         assert_eq!(pending.state(), AttemptState::WorkspacePending);
 
         backend.fail_workspace_create = false;
-        let ready = status_with_config(
+        let still_pending = status_with_config(
             Some(&config()),
             None,
             &mut store,
@@ -1293,12 +1387,28 @@ mod tests {
             pending.attempt_id(),
             101,
         )
+        .expect("retain ambiguous workspace");
+        assert_eq!(still_pending.state(), AttemptState::WorkspacePending);
+        assert_eq!(backend.calls(), ["workspace", "find_workspace"]);
+
+        store
+            .resolve(pending.attempt_id(), AttemptResolution::ConfirmAbsent, 102)
+            .expect("confirm workspace absent");
+        let ready = status_with_config(
+            Some(&config()),
+            None,
+            &mut store,
+            &mut backend,
+            pending.attempt_id(),
+            103,
+        )
         .expect("reconcile workspace");
         assert_eq!(ready.state(), AttemptState::AgentReady);
         assert_eq!(
             backend.calls(),
             [
                 "workspace",
+                "find_workspace",
                 "find_workspace",
                 "workspace",
                 "find_workspace",
@@ -1319,13 +1429,31 @@ mod tests {
         assert_eq!(pending.state(), AttemptState::AgentPending);
 
         backend.fail_agent_start = false;
-        let ready = status_with_config(
+        let still_pending = status_with_config(
             Some(&config()),
             None,
             &mut store,
             &mut backend,
             pending.attempt_id(),
             101,
+        )
+        .expect("retain ambiguous agent");
+        assert_eq!(still_pending.state(), AttemptState::AgentPending);
+        assert_eq!(
+            backend.calls(),
+            ["workspace", "start", "find_workspace", "find_agent"]
+        );
+
+        store
+            .resolve(pending.attempt_id(), AttemptResolution::ConfirmAbsent, 102)
+            .expect("confirm agent absent");
+        let ready = status_with_config(
+            Some(&config()),
+            None,
+            &mut store,
+            &mut backend,
+            pending.attempt_id(),
+            103,
         )
         .expect("reconcile agent");
         assert_eq!(ready.state(), AttemptState::AgentReady);
@@ -1334,6 +1462,8 @@ mod tests {
             [
                 "workspace",
                 "start",
+                "find_workspace",
+                "find_agent",
                 "find_workspace",
                 "find_agent",
                 "start"

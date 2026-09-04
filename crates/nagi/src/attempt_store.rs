@@ -143,6 +143,15 @@ pub enum AttemptState {
     InterruptPending,
 }
 
+/// An explicit operator decision for an ambiguous external effect.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttemptResolution {
+    /// The pending create or prompt effect was not delivered.
+    ConfirmAbsent,
+    /// The pending prompt effect was delivered.
+    ConfirmDelivered,
+}
+
 impl AttemptState {
     /// Returns the stable persisted lifecycle identifier.
     pub const fn as_str(self) -> &'static str {
@@ -349,34 +358,12 @@ impl AttemptStore {
         attempt_id: &str,
         now_ms: i64,
     ) -> Result<AttemptRecord, AttemptStoreError> {
-        validate_attempt_id(attempt_id)?;
-        validate_timestamp(now_ms)?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|_| AttemptStoreError::Database)?;
-        let current = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::NotFound)?;
-        validate_update_timestamp(&current, now_ms)?;
-        if current.state == AttemptState::WorkspacePending {
-            transaction
-                .commit()
-                .map_err(|_| AttemptStoreError::Database)?;
-            return Ok(current);
-        }
-        if current.state != AttemptState::Created {
-            return Err(AttemptStoreError::InvalidTransition);
-        }
-        transition_without_refs(
-            &transaction,
+        self.transition_idempotent(
             attempt_id,
+            AttemptState::Created,
             AttemptState::WorkspacePending,
             now_ms,
-        )?;
-        let record = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::Database)?;
-        transaction
-            .commit()
-            .map_err(|_| AttemptStoreError::Database)?;
-        Ok(record)
+        )
     }
 
     /// Binds the workspace produced by one create effect before any agent
@@ -430,29 +417,12 @@ impl AttemptStore {
         attempt_id: &str,
         now_ms: i64,
     ) -> Result<AttemptRecord, AttemptStoreError> {
-        validate_attempt_id(attempt_id)?;
-        validate_timestamp(now_ms)?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|_| AttemptStoreError::Database)?;
-        let current = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::NotFound)?;
-        validate_update_timestamp(&current, now_ms)?;
-        if current.state == AttemptState::AgentPending {
-            transaction
-                .commit()
-                .map_err(|_| AttemptStoreError::Database)?;
-            return Ok(current);
-        }
-        if current.state != AttemptState::WorkspaceReady {
-            return Err(AttemptStoreError::InvalidTransition);
-        }
-        transition_without_refs(&transaction, attempt_id, AttemptState::AgentPending, now_ms)?;
-        let record = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::Database)?;
-        transaction
-            .commit()
-            .map_err(|_| AttemptStoreError::Database)?;
-        Ok(record)
+        self.transition_idempotent(
+            attempt_id,
+            AttemptState::WorkspaceReady,
+            AttemptState::AgentPending,
+            now_ms,
+        )
     }
 
     /// Binds an agent discovered or created during reconciliation.
@@ -510,34 +480,12 @@ impl AttemptStore {
         attempt_id: &str,
         now_ms: i64,
     ) -> Result<AttemptRecord, AttemptStoreError> {
-        validate_attempt_id(attempt_id)?;
-        validate_timestamp(now_ms)?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|_| AttemptStoreError::Database)?;
-        let current = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::NotFound)?;
-        validate_update_timestamp(&current, now_ms)?;
-        if current.state == AttemptState::PromptPending {
-            transaction
-                .commit()
-                .map_err(|_| AttemptStoreError::Database)?;
-            return Ok(current);
-        }
-        if current.state != AttemptState::AgentReady {
-            return Err(AttemptStoreError::InvalidTransition);
-        }
-        transition_without_refs(
-            &transaction,
+        self.transition_idempotent(
             attempt_id,
+            AttemptState::AgentReady,
             AttemptState::PromptPending,
             now_ms,
-        )?;
-        let record = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::Database)?;
-        transaction
-            .commit()
-            .map_err(|_| AttemptStoreError::Database)?;
-        Ok(record)
+        )
     }
 
     /// Confirms the prompt effect after the adapter reports success.
@@ -546,44 +494,24 @@ impl AttemptStore {
         attempt_id: &str,
         now_ms: i64,
     ) -> Result<AttemptRecord, AttemptStoreError> {
-        validate_attempt_id(attempt_id)?;
-        validate_timestamp(now_ms)?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|_| AttemptStoreError::Database)?;
-        let current = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::NotFound)?;
-        validate_update_timestamp(&current, now_ms)?;
-        if current.state == AttemptState::Running {
-            transaction
-                .commit()
-                .map_err(|_| AttemptStoreError::Database)?;
-            return Ok(current);
-        }
-        if current.state != AttemptState::PromptPending {
-            return Err(AttemptStoreError::InvalidTransition);
-        }
-        transition_without_refs(&transaction, attempt_id, AttemptState::Running, now_ms)?;
-        let record = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::Database)?;
-        transaction
-            .commit()
-            .map_err(|_| AttemptStoreError::Database)?;
-        Ok(record)
+        self.transition_idempotent(
+            attempt_id,
+            AttemptState::PromptPending,
+            AttemptState::Running,
+            now_ms,
+        )
     }
 
-    /// Marks a created attempt running while atomically binding its required
-    /// workspace and agent references. Repeating the same binding is
-    /// idempotent; a changed binding or later lifecycle state is rejected.
-    pub fn mark_started(
+    /// Applies one explicit operator decision to a pending external effect.
+    /// This changes only durable controller state and performs no external
+    /// operation. Repeated or inapplicable decisions fail closed.
+    pub fn resolve(
         &mut self,
         attempt_id: &str,
-        workspace_ref: &str,
-        agent_ref: &str,
+        resolution: AttemptResolution,
         now_ms: i64,
     ) -> Result<AttemptRecord, AttemptStoreError> {
         validate_attempt_id(attempt_id)?;
-        validate_opaque_ref(workspace_ref)?;
-        validate_opaque_ref(agent_ref)?;
         validate_timestamp(now_ms)?;
         let transaction = self
             .connection
@@ -591,32 +519,25 @@ impl AttemptStore {
             .map_err(|_| AttemptStoreError::Database)?;
         let current = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::NotFound)?;
         validate_update_timestamp(&current, now_ms)?;
-        if current.state == AttemptState::Running {
-            if current.workspace_ref.as_deref() != Some(workspace_ref)
-                || current.agent_ref.as_deref() != Some(agent_ref)
-            {
-                return Err(AttemptStoreError::DuplicateConflict);
+        let target = match (resolution, current.state) {
+            (AttemptResolution::ConfirmAbsent, AttemptState::WorkspacePending) => {
+                AttemptState::Created
             }
-            transaction
-                .commit()
-                .map_err(|_| AttemptStoreError::Database)?;
-            return Ok(current);
-        }
-        if matches!(current.state, AttemptState::WorkspaceReady)
-            && current.workspace_ref.as_deref() != Some(workspace_ref)
-        {
-            return Err(AttemptStoreError::DuplicateConflict);
-        }
-        if !matches!(
-            current.state,
-            AttemptState::Created | AttemptState::WorkspaceReady
-        ) {
-            return Err(AttemptStoreError::InvalidTransition);
-        }
+            (AttemptResolution::ConfirmAbsent, AttemptState::AgentPending) => {
+                AttemptState::WorkspaceReady
+            }
+            (AttemptResolution::ConfirmAbsent, AttemptState::PromptPending) => {
+                AttemptState::AgentReady
+            }
+            (AttemptResolution::ConfirmDelivered, AttemptState::PromptPending) => {
+                AttemptState::Running
+            }
+            _ => return Err(AttemptStoreError::InvalidTransition),
+        };
         transaction
             .execute(
-                "UPDATE attempts SET lifecycle = 'running', workspace_ref = ?1, agent_ref = ?2, updated_at_ms = ?3 WHERE attempt_id = ?4",
-                params![workspace_ref, agent_ref, now_ms, attempt_id],
+                "UPDATE attempts SET lifecycle = ?1, updated_at_ms = ?2 WHERE attempt_id = ?3",
+                params![target.as_str(), now_ms, attempt_id],
             )
             .map_err(|_| AttemptStoreError::Database)?;
         let record = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::Database)?;
@@ -864,6 +785,72 @@ impl AttemptStore {
             )?);
         }
         Ok(records)
+    }
+
+    /// Returns at most `limit` nonterminal attempts, failing closed if more
+    /// rows exist. This keeps operator-facing discovery bounded.
+    pub fn list_nonterminal_bounded(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<AttemptRecord>, AttemptStoreError> {
+        if limit == 0 {
+            return Err(AttemptStoreError::InvalidInput);
+        }
+        let query_limit = i64::try_from(limit)
+            .ok()
+            .and_then(|limit| limit.checked_add(1))
+            .ok_or(AttemptStoreError::InvalidInput)?;
+        let mut statement = self
+            .connection
+            .prepare(&format!(
+                "SELECT {SELECT_COLUMNS} FROM attempts WHERE lifecycle != 'failed' ORDER BY created_at_ms, attempt_id LIMIT ?1"
+            ))
+            .map_err(|_| AttemptStoreError::Database)?;
+        let mut rows = statement
+            .query(params![query_limit])
+            .map_err(|_| AttemptStoreError::Database)?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next().map_err(|_| AttemptStoreError::Database)? {
+            records.push(decode_raw(
+                raw_from_row(row).map_err(|_| AttemptStoreError::Database)?,
+            )?);
+        }
+        if records.len() > limit {
+            return Err(AttemptStoreError::InvalidInput);
+        }
+        Ok(records)
+    }
+
+    fn transition_idempotent(
+        &mut self,
+        attempt_id: &str,
+        source: AttemptState,
+        target: AttemptState,
+        now_ms: i64,
+    ) -> Result<AttemptRecord, AttemptStoreError> {
+        validate_attempt_id(attempt_id)?;
+        validate_timestamp(now_ms)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| AttemptStoreError::Database)?;
+        let current = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::NotFound)?;
+        validate_update_timestamp(&current, now_ms)?;
+        if current.state == target {
+            transaction
+                .commit()
+                .map_err(|_| AttemptStoreError::Database)?;
+            return Ok(current);
+        }
+        if current.state != source {
+            return Err(AttemptStoreError::InvalidTransition);
+        }
+        transition_without_refs(&transaction, attempt_id, target, now_ms)?;
+        let record = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::Database)?;
+        transaction
+            .commit()
+            .map_err(|_| AttemptStoreError::Database)?;
+        Ok(record)
     }
 }
 
@@ -1334,9 +1321,7 @@ mod tests {
                     .state(),
                 AttemptState::Created
             );
-            store
-                .mark_started(ATTEMPT_ID, "workspace-1", "agent-1", 200)
-                .expect("start");
+            mark_started_for_test(&mut store, ATTEMPT_ID, "workspace-1", "agent-1", 200);
             let record = store
                 .record_observation(ATTEMPT_ID, AttemptState::Observed, 1, 300)
                 .expect("observation");
@@ -1364,22 +1349,35 @@ mod tests {
             Err(AttemptStoreError::InvalidTransition)
         );
         assert_eq!(
-            store.mark_started(ATTEMPT_ID, "", "agent-1", 120),
+            store.mark_workspace_ready(ATTEMPT_ID, "", 120),
             Err(AttemptStoreError::InvalidInput)
         );
+        store
+            .mark_workspace_pending(ATTEMPT_ID, 120)
+            .expect("workspace intent");
+        store
+            .mark_workspace_ready(ATTEMPT_ID, "workspace-1", 120)
+            .expect("workspace ready");
+        store
+            .mark_agent_pending(ATTEMPT_ID, 120)
+            .expect("agent intent");
         let started = store
-            .mark_started(ATTEMPT_ID, "workspace-1", "agent-1", 120)
-            .expect("start");
+            .mark_agent_ready(ATTEMPT_ID, "workspace-1", "agent-1", 120)
+            .expect("agent ready");
         assert_eq!(
             store
-                .mark_started(ATTEMPT_ID, "workspace-1", "agent-1", 120)
+                .mark_agent_ready(ATTEMPT_ID, "workspace-1", "agent-1", 120)
                 .expect("identical start retry"),
             started
         );
         assert_eq!(
-            store.mark_started(ATTEMPT_ID, "workspace-2", "agent-1", 121),
+            store.mark_agent_ready(ATTEMPT_ID, "workspace-2", "agent-1", 121),
             Err(AttemptStoreError::DuplicateConflict)
         );
+        store
+            .mark_prompt_pending(ATTEMPT_ID, 121)
+            .expect("prompt intent");
+        store.confirm_prompt(ATTEMPT_ID, 121).expect("prompt");
         let first = store
             .record_observation(ATTEMPT_ID, AttemptState::Observed, 2, 130)
             .expect("first observation");
@@ -1405,7 +1403,7 @@ mod tests {
             Err(AttemptStoreError::StaleTimestamp)
         );
         assert_eq!(
-            store.mark_started(ATTEMPT_ID, "workspace-1", "agent-1", 160),
+            store.mark_agent_ready(ATTEMPT_ID, "workspace-1", "agent-1", 160),
             Err(AttemptStoreError::InvalidTransition)
         );
     }
@@ -1422,9 +1420,7 @@ mod tests {
             store.record_report(ATTEMPT_ID, &report, 105),
             Err(AttemptStoreError::ReportBindingMismatch)
         );
-        store
-            .mark_started(ATTEMPT_ID, "workspace-1", "agent-1", 110)
-            .expect("start");
+        mark_started_for_test(&mut store, ATTEMPT_ID, "workspace-1", "agent-1", 110);
         let record = store
             .record_report(ATTEMPT_ID, &report, 120)
             .expect("report");
@@ -1465,15 +1461,130 @@ mod tests {
         store
             .create("attempt-2", ISSUE_ID, AttemptBackend::HerdrCodex, 2)
             .expect("create two");
-        store
-            .mark_started("attempt-2", "workspace-2", "agent-2", 3)
-            .expect("start two");
+        mark_started_for_test(&mut store, "attempt-2", "workspace-2", "agent-2", 3);
         store
             .record_observation("attempt-2", AttemptState::Failed, 1, 4)
             .expect("fail two");
         let records = store.list_nonterminal().expect("list");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].attempt_id(), "attempt-1");
+    }
+
+    #[test]
+    fn operator_resolution_is_closed_and_effect_free() {
+        let database = TestDatabase::new();
+        let mut store = AttemptStore::open(&database.path).expect("open store");
+        store
+            .create(ATTEMPT_ID, ISSUE_ID, AttemptBackend::HerdrCodex, 1)
+            .expect("create");
+        assert_eq!(
+            store.resolve(ATTEMPT_ID, AttemptResolution::ConfirmAbsent, 2),
+            Err(AttemptStoreError::InvalidTransition)
+        );
+        store
+            .mark_workspace_pending(ATTEMPT_ID, 2)
+            .expect("workspace intent");
+        assert_eq!(
+            store
+                .resolve(ATTEMPT_ID, AttemptResolution::ConfirmAbsent, 3)
+                .expect("confirm workspace absent")
+                .state(),
+            AttemptState::Created
+        );
+        assert_eq!(
+            store.resolve(ATTEMPT_ID, AttemptResolution::ConfirmAbsent, 4),
+            Err(AttemptStoreError::InvalidTransition)
+        );
+
+        store
+            .mark_workspace_pending(ATTEMPT_ID, 4)
+            .expect("workspace intent retry");
+        store
+            .mark_workspace_ready(ATTEMPT_ID, "workspace-1", 4)
+            .expect("workspace ready");
+        store
+            .mark_agent_pending(ATTEMPT_ID, 4)
+            .expect("agent intent");
+        assert_eq!(
+            store
+                .resolve(ATTEMPT_ID, AttemptResolution::ConfirmAbsent, 5)
+                .expect("confirm agent absent")
+                .state(),
+            AttemptState::WorkspaceReady
+        );
+        store
+            .mark_agent_pending(ATTEMPT_ID, 5)
+            .expect("agent intent retry");
+        store
+            .mark_agent_ready(ATTEMPT_ID, "workspace-1", "agent-1", 5)
+            .expect("agent ready");
+        store
+            .mark_prompt_pending(ATTEMPT_ID, 5)
+            .expect("prompt intent");
+        assert_eq!(
+            store
+                .resolve(ATTEMPT_ID, AttemptResolution::ConfirmAbsent, 6)
+                .expect("confirm prompt absent")
+                .state(),
+            AttemptState::AgentReady
+        );
+        store
+            .mark_prompt_pending(ATTEMPT_ID, 6)
+            .expect("prompt intent retry");
+        assert_eq!(
+            store
+                .resolve(ATTEMPT_ID, AttemptResolution::ConfirmDelivered, 7)
+                .expect("confirm prompt delivered")
+                .state(),
+            AttemptState::Running
+        );
+        assert_eq!(
+            store.resolve(ATTEMPT_ID, AttemptResolution::ConfirmDelivered, 8),
+            Err(AttemptStoreError::InvalidTransition)
+        );
+    }
+
+    #[test]
+    fn bounded_nonterminal_listing_fails_closed_over_the_limit() {
+        let database = TestDatabase::new();
+        let mut store = AttemptStore::open(&database.path).expect("open store");
+        for attempt_id in ["attempt-1", "attempt-2"] {
+            store
+                .create(attempt_id, ISSUE_ID, AttemptBackend::HerdrCodex, 1)
+                .expect("create");
+        }
+        assert_eq!(
+            store.list_nonterminal_bounded(1),
+            Err(AttemptStoreError::InvalidInput)
+        );
+        assert_eq!(
+            store
+                .list_nonterminal_bounded(2)
+                .expect("bounded list")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn bounded_nonterminal_listing_rejects_corrupt_rows() {
+        let database = TestDatabase::new();
+        {
+            let mut store = AttemptStore::open(&database.path).expect("open store");
+            store
+                .create(ATTEMPT_ID, ISSUE_ID, AttemptBackend::HerdrCodex, 1)
+                .expect("create");
+        }
+        let connection = Connection::open(&database.path).expect("raw database");
+        connection
+            .execute("UPDATE attempts SET workspace_ref = 'unexpected'", [])
+            .expect("corrupt row");
+        drop(connection);
+        let store = AttemptStore::open(&database.path).expect("reopen store");
+        assert_eq!(
+            store.list_nonterminal_bounded(1),
+            Err(AttemptStoreError::Database)
+        );
     }
 
     #[cfg(unix)]
@@ -1597,9 +1708,7 @@ mod tests {
         );
         assert_corrupt_row(
             |store| {
-                store
-                    .mark_started(ATTEMPT_ID, "workspace-1", "agent-1", 2)
-                    .expect("start");
+                mark_started_for_test(store, ATTEMPT_ID, "workspace-1", "agent-1", 2);
             },
             |connection| {
                 connection
@@ -1609,9 +1718,7 @@ mod tests {
         );
         assert_corrupt_row(
             |store| {
-                store
-                    .mark_started(ATTEMPT_ID, "workspace-1", "agent-1", 2)
-                    .expect("start");
+                mark_started_for_test(store, ATTEMPT_ID, "workspace-1", "agent-1", 2);
                 store
                     .record_observation(ATTEMPT_ID, AttemptState::Observed, 1, 3)
                     .expect("observe");
@@ -1624,9 +1731,7 @@ mod tests {
         );
         assert_corrupt_row(
             |store| {
-                store
-                    .mark_started(ATTEMPT_ID, "workspace-1", "agent-1", 2)
-                    .expect("start");
+                mark_started_for_test(store, ATTEMPT_ID, "workspace-1", "agent-1", 2);
                 store
                     .record_observation(ATTEMPT_ID, AttemptState::Observed, 1, 3)
                     .expect("observe");
@@ -1640,9 +1745,7 @@ mod tests {
         let report = report_json(ATTEMPT_ID, "herdr+codex", "agent-1");
         assert_corrupt_row(
             |store| {
-                store
-                    .mark_started(ATTEMPT_ID, "workspace-1", "agent-1", 2)
-                    .expect("start");
+                mark_started_for_test(store, ATTEMPT_ID, "workspace-1", "agent-1", 2);
             },
             |connection| {
                 connection
@@ -1656,9 +1759,7 @@ mod tests {
         let report = report_json(ATTEMPT_ID, "herdr+codex", "agent-1");
         assert_corrupt_row(
             |store| {
-                store
-                    .mark_started(ATTEMPT_ID, "workspace-1", "agent-1", 2)
-                    .expect("start");
+                mark_started_for_test(store, ATTEMPT_ID, "workspace-1", "agent-1", 2);
                 store.record_report(ATTEMPT_ID, &report, 3).expect("report");
             },
             |connection| {
@@ -1670,9 +1771,7 @@ mod tests {
         let report = report_json(ATTEMPT_ID, "herdr+codex", "agent-1");
         assert_corrupt_row(
             |store| {
-                store
-                    .mark_started(ATTEMPT_ID, "workspace-1", "agent-1", 2)
-                    .expect("start");
+                mark_started_for_test(store, ATTEMPT_ID, "workspace-1", "agent-1", 2);
                 store.record_report(ATTEMPT_ID, &report, 3).expect("report");
             },
             |connection| {
@@ -1703,9 +1802,7 @@ mod tests {
         store
             .create(ATTEMPT_ID, ISSUE_ID, AttemptBackend::HerdrCodex, 1)
             .expect("create");
-        store
-            .mark_started(ATTEMPT_ID, "workspace-1", "agent-1", 2)
-            .expect("start");
+        mark_started_for_test(&mut store, ATTEMPT_ID, "workspace-1", "agent-1", 2);
         let record = store
             .record_observation(ATTEMPT_ID, AttemptState::Observed, 1, 3)
             .expect("observation");
@@ -1732,6 +1829,33 @@ mod tests {
             "summary": "synthetic observation"
         })
         .to_string()
+    }
+
+    fn mark_started_for_test(
+        store: &mut AttemptStore,
+        attempt_id: &str,
+        workspace_ref: &str,
+        agent_ref: &str,
+        now_ms: i64,
+    ) -> AttemptRecord {
+        store
+            .mark_workspace_pending(attempt_id, now_ms)
+            .expect("workspace intent");
+        store
+            .mark_workspace_ready(attempt_id, workspace_ref, now_ms)
+            .expect("workspace ready");
+        store
+            .mark_agent_pending(attempt_id, now_ms)
+            .expect("agent intent");
+        store
+            .mark_agent_ready(attempt_id, workspace_ref, agent_ref, now_ms)
+            .expect("agent ready");
+        store
+            .mark_prompt_pending(attempt_id, now_ms)
+            .expect("prompt intent");
+        store
+            .confirm_prompt(attempt_id, now_ms)
+            .expect("prompt confirmed")
     }
 
     fn assert_corrupt_row<Setup, Corrupt>(setup: Setup, corrupt: Corrupt)

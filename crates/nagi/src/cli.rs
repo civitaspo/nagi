@@ -15,7 +15,7 @@ use crate::linear::credentials::{CredentialManager, bounded_client_id};
 #[cfg(target_os = "macos")]
 use crate::linear::read::{self, LinearIssueBinding};
 #[cfg(target_os = "macos")]
-use crate::work::{self, WorkError};
+use crate::work::{self, AttemptResolution, WorkError};
 #[cfg(target_os = "macos")]
 use serde::Serialize;
 #[cfg(all(target_os = "macos", feature = "macos-keychain-contract"))]
@@ -66,7 +66,7 @@ impl fmt::Display for CliError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Usage => formatter.write_str(
-                "usage: nagi auth linear login|status|logout --confirm-revoke | nagi auth codex login|status|logout | nagi contract linear read | nagi work start --config PATH | nagi work status|interrupt --config PATH --attempt ID | nagi work collect --config PATH --attempt ID --report PATH",
+                "usage: nagi auth linear login|status|logout --confirm-revoke | nagi auth codex login|status|logout | nagi contract linear read | nagi work start --config PATH | nagi work status|interrupt --config PATH --attempt ID | nagi work list --config PATH | nagi work resolve --config PATH --attempt ID --confirm-absent|--confirm-delivered | nagi work collect --config PATH --attempt ID --report PATH",
             ),
             Self::Configuration => {
                 formatter.write_str("Linear OAuth local configuration is invalid")
@@ -104,6 +104,14 @@ enum WorkCommand {
     Status {
         config: std::path::PathBuf,
         attempt_id: String,
+    },
+    List {
+        config: std::path::PathBuf,
+    },
+    Resolve {
+        config: std::path::PathBuf,
+        attempt_id: String,
+        resolution: AttemptResolution,
     },
     Interrupt {
         config: std::path::PathBuf,
@@ -222,6 +230,19 @@ where
                     let status = work::run_status(&config, &attempt_id).map_err(CliError::Work)?;
                     println!("{}", work::render_status(&status).map_err(CliError::Work)?);
                 }
+                WorkCommand::List { config } => {
+                    let records = work::run_list(&config).map_err(CliError::Work)?;
+                    println!("{}", work::render_list(&records).map_err(CliError::Work)?);
+                }
+                WorkCommand::Resolve {
+                    config,
+                    attempt_id,
+                    resolution,
+                } => {
+                    let status = work::run_resolve(&config, &attempt_id, resolution)
+                        .map_err(CliError::Work)?;
+                    println!("{}", work::render_status(&status).map_err(CliError::Work)?);
+                }
                 WorkCommand::Interrupt { config, attempt_id } => {
                     let status =
                         work::run_interrupt(&config, &attempt_id).map_err(CliError::Work)?;
@@ -283,9 +304,41 @@ where
         "start" if arguments.next().is_none() => Ok(Command::Work(WorkCommand::Start { config })),
         "status" => parse_work_attempt(arguments, config, false),
         "interrupt" => parse_work_attempt(arguments, config, true),
+        "list" if arguments.next().is_none() => Ok(Command::Work(WorkCommand::List { config })),
+        "resolve" => parse_work_resolve(arguments, config),
         "collect" => parse_work_collect(arguments, config),
         _ => Err(CliError::Usage),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn parse_work_resolve<I>(mut arguments: I, config: std::path::PathBuf) -> Result<Command, CliError>
+where
+    I: Iterator<Item = OsString>,
+{
+    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--attempt")) {
+        return Err(CliError::Usage);
+    }
+    let Some(attempt_id) = arguments.next().and_then(|value| value.into_string().ok()) else {
+        return Err(CliError::Usage);
+    };
+    let resolution = match arguments.next().as_deref() {
+        Some(flag) if flag == std::ffi::OsStr::new("--confirm-absent") => {
+            AttemptResolution::ConfirmAbsent
+        }
+        Some(flag) if flag == std::ffi::OsStr::new("--confirm-delivered") => {
+            AttemptResolution::ConfirmDelivered
+        }
+        _ => return Err(CliError::Usage),
+    };
+    if arguments.next().is_some() {
+        return Err(CliError::Usage);
+    }
+    Ok(Command::Work(WorkCommand::Resolve {
+        config,
+        attempt_id,
+        resolution,
+    }))
 }
 
 #[cfg(target_os = "macos")]
@@ -719,9 +772,55 @@ mod tests {
                 .into_iter()
             ),
             Ok(Command::Work(WorkCommand::Collect {
-                config,
+                config: config.clone(),
                 attempt_id: "attempt-1".to_owned(),
                 report: std::path::PathBuf::from("/private/nagi/report.json"),
+            }))
+        );
+        assert_eq!(
+            parse_arguments(
+                args(&["work", "list", "--config", "/private/nagi/work.json"]).into_iter()
+            ),
+            Ok(Command::Work(WorkCommand::List {
+                config: config.clone()
+            }))
+        );
+        assert_eq!(
+            parse_arguments(
+                args(&[
+                    "work",
+                    "resolve",
+                    "--config",
+                    "/private/nagi/work.json",
+                    "--attempt",
+                    "attempt-1",
+                    "--confirm-absent",
+                ])
+                .into_iter()
+            ),
+            Ok(Command::Work(WorkCommand::Resolve {
+                config: config.clone(),
+                attempt_id: "attempt-1".to_owned(),
+                resolution: AttemptResolution::ConfirmAbsent,
+            }))
+        );
+        assert_eq!(
+            parse_arguments(
+                args(&[
+                    "work",
+                    "resolve",
+                    "--config",
+                    "/private/nagi/work.json",
+                    "--attempt",
+                    "attempt-1",
+                    "--confirm-delivered",
+                ])
+                .into_iter()
+            ),
+            Ok(Command::Work(WorkCommand::Resolve {
+                config,
+                attempt_id: "attempt-1".to_owned(),
+                resolution: AttemptResolution::ConfirmDelivered,
             }))
         );
         for values in [
@@ -749,6 +848,31 @@ mod tests {
                 "/private/nagi/work.json",
                 "--attempt",
                 "attempt-1",
+            ][..],
+            &[
+                "work",
+                "list",
+                "--config",
+                "/private/nagi/work.json",
+                "extra",
+            ][..],
+            &[
+                "work",
+                "resolve",
+                "--config",
+                "/private/nagi/work.json",
+                "--attempt",
+                "attempt-1",
+            ][..],
+            &[
+                "work",
+                "resolve",
+                "--config",
+                "/private/nagi/work.json",
+                "--attempt",
+                "attempt-1",
+                "--confirm-absent",
+                "--confirm-delivered",
             ][..],
         ] {
             assert_eq!(

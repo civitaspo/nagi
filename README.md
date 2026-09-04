@@ -37,6 +37,9 @@ and one exact Linear issue UUID:
 ```text
 nagi work start --config CONFIG
 nagi work status --config CONFIG --attempt ATTEMPT
+nagi work list --config CONFIG
+nagi work resolve --config CONFIG --attempt ATTEMPT --confirm-absent
+nagi work resolve --config CONFIG --attempt ATTEMPT --confirm-delivered
 nagi work interrupt --config CONFIG --attempt ATTEMPT
 nagi work collect --config CONFIG --attempt ATTEMPT --report REPORT
 ```
@@ -47,6 +50,11 @@ directory, and managed `CODEX_HOME`. Nagi reads one issue in memory, delegates
 workspace and vendor process ownership to Herdr, and prints only bounded status
 or report metadata. Herdr lifecycle is observational; no command changes
 Linear state or installs hooks/configuration.
+
+`work list` is bounded and prints only local attempt metadata. If a workspace,
+agent, or prompt effect is ambiguous, `work status` never retries it when a
+snapshot is absent; use the explicit `work resolve` confirmation before the
+next newly authorized effect.
 
 ## Project documentation
 
