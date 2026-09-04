@@ -365,14 +365,6 @@ impl UnixSocketTransport {
             timeout: SOCKET_TIMEOUT,
         }
     }
-
-    #[cfg(test)]
-    fn with_timeout(timeout: Duration) -> Result<Self, HerdrError> {
-        if timeout.is_zero() || timeout > Duration::from_secs(60) {
-            return Err(HerdrError::InvalidInput);
-        }
-        Ok(Self { timeout })
-    }
 }
 
 #[cfg(unix)]
@@ -2369,8 +2361,9 @@ mod tests {
                 .write_all(b"{\"id\":\"nagi-observe\",\"result\":{}}\n")
                 .expect("snapshot response");
         });
-        let mut socket = UnixSocketTransport::with_timeout(Duration::from_secs(1))
-            .expect("bounded socket timeout");
+        let mut socket = UnixSocketTransport {
+            timeout: Duration::from_secs(1),
+        };
         let response = socket
             .snapshot(&socket_path, SNAPSHOT_REQUEST)
             .expect("snapshot response");
@@ -2396,8 +2389,9 @@ mod tests {
             let _ = stream.read(&mut request);
             stream.write_all(b"{}").expect("partial response");
         });
-        let mut socket = UnixSocketTransport::with_timeout(Duration::from_secs(1))
-            .expect("bounded socket timeout");
+        let mut socket = UnixSocketTransport {
+            timeout: Duration::from_secs(1),
+        };
         assert_eq!(
             socket.snapshot(&no_line_path, b"x\n"),
             Err(TransportError::Failed)
@@ -2410,8 +2404,9 @@ mod tests {
             let (_stream, _) = listener.accept().expect("socket client");
             std::thread::sleep(Duration::from_millis(100));
         });
-        let mut socket = UnixSocketTransport::with_timeout(Duration::from_millis(20))
-            .expect("short bounded socket timeout");
+        let mut socket = UnixSocketTransport {
+            timeout: Duration::from_millis(20),
+        };
         assert_eq!(
             socket.snapshot(&timeout_path, b"x\n"),
             Err(TransportError::TimedOut)
@@ -2428,8 +2423,9 @@ mod tests {
             response.push(b'\n');
             let _ = stream.write_all(&response);
         });
-        let mut socket = UnixSocketTransport::with_timeout(Duration::from_secs(1))
-            .expect("bounded socket timeout");
+        let mut socket = UnixSocketTransport {
+            timeout: Duration::from_secs(1),
+        };
         assert_eq!(
             socket.snapshot(&oversized_path, b"x\n"),
             Err(TransportError::OutputTooLarge)
@@ -2454,8 +2450,9 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(20));
             }
         });
-        let mut socket = UnixSocketTransport::with_timeout(Duration::from_millis(70))
-            .expect("short bounded socket timeout");
+        let mut socket = UnixSocketTransport {
+            timeout: Duration::from_millis(70),
+        };
         let started = Instant::now();
         assert_eq!(
             socket.snapshot(&socket_path, b"x\n"),
