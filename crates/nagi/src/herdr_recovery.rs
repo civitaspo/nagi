@@ -5,7 +5,6 @@
 //! the reconciler only accepts a fresh, contiguous stream for one exact
 //! source/attempt binding.  Lifecycle and report values remain observations.
 
-use std::borrow::Borrow;
 use std::collections::VecDeque;
 use std::fmt;
 
@@ -75,8 +74,6 @@ pub enum ReconcileError {
     FutureTimestamp,
     /// An event used a different source/attempt binding.
     BindingMismatch,
-    /// A session reference changed within one reconciled generation.
-    SessionReferenceMismatch,
     /// A sequence was reused with different canonical event content.
     SequenceConflict,
     /// An event arrived behind the contiguous stream without a matching copy.
@@ -102,7 +99,6 @@ impl fmt::Display for ReconcileError {
             Self::Expired => "Herdr recovery observation has expired",
             Self::FutureTimestamp => "Herdr recovery observation is too far in the future",
             Self::BindingMismatch => "Herdr recovery source or attempt binding mismatched",
-            Self::SessionReferenceMismatch => "Herdr recovery session reference mismatched",
             Self::SequenceConflict => "Herdr recovery sequence was reused with different content",
             Self::OutOfOrder => "Herdr recovery observation was out of order",
             Self::UnknownValue => "Herdr recovery event or lifecycle value is unknown",
@@ -143,17 +139,6 @@ impl LifecycleState {
             _ => Err(ReconcileError::UnknownValue),
         }
     }
-
-    /// Returns the canonical wire value.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Idle => "idle",
-            Self::Running => "running",
-            Self::Blocked => "blocked",
-            Self::Done => "done",
-            Self::Failed => "failed",
-        }
-    }
 }
 
 /// The closed hook event-kind vocabulary.
@@ -181,17 +166,6 @@ impl HookEventKind {
             "report_ready" => Ok(Self::ReportReady),
             "session_exited" => Ok(Self::SessionExited),
             _ => Err(ReconcileError::UnknownValue),
-        }
-    }
-
-    /// Returns the canonical wire value.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::SessionStarted => "session_started",
-            Self::SessionRestored => "session_restored",
-            Self::Lifecycle => "lifecycle",
-            Self::ReportReady => "report_ready",
-            Self::SessionExited => "session_exited",
         }
     }
 }
@@ -783,14 +757,14 @@ impl Reconciler {
     }
 
     /// Applies a fresh snapshot and resets the event generation.
-    pub fn apply_snapshot<S>(&mut self, snapshot: S, now_ms: u64) -> Result<(), ReconcileError>
-    where
-        S: Borrow<SnapshotBaseline>,
-    {
+    pub fn apply_snapshot(
+        &mut self,
+        snapshot: &SnapshotBaseline,
+        now_ms: u64,
+    ) -> Result<(), ReconcileError> {
         if !self.needs_snapshot() {
             return Err(ReconcileError::InvalidOrdering);
         }
-        let snapshot = snapshot.borrow();
         snapshot.validate()?;
         validate_freshness(snapshot.timestamp_ms, snapshot.ttl_ms, now_ms)?;
 
@@ -857,9 +831,12 @@ impl Reconciler {
         self.generation
     }
 
-    /// Returns the last accepted sequence, if any event has been accepted.
+    /// Returns the last sequence covered by the current snapshot or applied
+    /// stream. A first sequence of `1` has no covered prior sequence and
+    /// returns `None`.
     pub fn last_sequence(&self) -> Option<u64> {
-        self.expected_sequence.and_then(|next| next.checked_sub(1))
+        self.expected_sequence
+            .and_then(|next| next.checked_sub(1).filter(|sequence| *sequence > 0))
     }
 
     /// Returns the latest observed lifecycle value.
@@ -878,11 +855,11 @@ impl Reconciler {
     }
 
     /// Accepts one event if it is fresh, bound, contiguous, and ordered.
-    pub fn ingest<E>(&mut self, event: E, now_ms: u64) -> Result<ReconcileOutcome, ReconcileError>
-    where
-        E: Borrow<HookObservation>,
-    {
-        let event = event.borrow();
+    pub fn ingest(
+        &mut self,
+        event: &HookObservation,
+        now_ms: u64,
+    ) -> Result<ReconcileOutcome, ReconcileError> {
         event.validate()?;
 
         let StreamStatus::Ready = self.stream else {
@@ -904,12 +881,6 @@ impl Reconciler {
             .ok_or(ReconcileError::NeedSnapshot(NeedSnapshot::new(
                 NeedSnapshotReason::NotInitialized,
             )))?;
-        if event.generation != generation {
-            self.invalidate(NeedSnapshotReason::GenerationChanged);
-            return Err(ReconcileError::NeedSnapshot(NeedSnapshot::new(
-                NeedSnapshotReason::GenerationChanged,
-            )));
-        }
         let expected =
             self.expected_sequence
                 .ok_or(ReconcileError::NeedSnapshot(NeedSnapshot::new(
@@ -920,6 +891,13 @@ impl Reconciler {
         // duplicates.  An expired duplicate must not be accepted as a way to
         // bypass the observation TTL.
         validate_freshness(event.timestamp_ms, event.ttl_ms, now_ms)?;
+
+        if event.generation != generation {
+            self.invalidate(NeedSnapshotReason::GenerationChanged);
+            return Err(ReconcileError::NeedSnapshot(NeedSnapshot::new(
+                NeedSnapshotReason::GenerationChanged,
+            )));
+        }
 
         if event.sequence < expected {
             if self.history.iter().any(|applied| applied == event) {
@@ -988,11 +966,6 @@ impl Reconciler {
         match &event.event {
             HookEvent::SessionStarted { session_ref }
             | HookEvent::SessionRestored { session_ref } => {
-                if let Some(previous) = &self.session_ref
-                    && previous != session_ref
-                {
-                    return Err(ReconcileError::SessionReferenceMismatch);
-                }
                 if self.session_ref.is_none() {
                     self.session_ref = Some(session_ref.clone());
                 }
@@ -1123,6 +1096,25 @@ mod tests {
             .expect("valid event")
     }
 
+    fn event_at(
+        generation: u64,
+        sequence: u64,
+        timestamp_ms: u64,
+        ttl_ms: u64,
+        event: HookEvent,
+    ) -> HookObservation {
+        HookObservation::new(
+            SOURCE,
+            ATTEMPT,
+            generation,
+            sequence,
+            timestamp_ms,
+            ttl_ms,
+            event,
+        )
+        .expect("valid event")
+    }
+
     fn started(sequence: u64) -> HookObservation {
         event(sequence, HookEvent::session_started(SESSION))
     }
@@ -1148,23 +1140,27 @@ mod tests {
     fn snapshot_initializes_and_accepts_contiguous_ordered_events() {
         let mut reconciler = Reconciler::new();
         assert_eq!(
-            reconciler.ingest(started(1), NOW),
+            reconciler.ingest(&started(1), NOW),
             Err(ReconcileError::NeedSnapshot(NeedSnapshot::new(
                 NeedSnapshotReason::NotInitialized
             )))
         );
         reconciler
-            .apply_snapshot(snapshot(1), NOW)
+            .apply_snapshot(&snapshot(1), NOW)
             .expect("snapshot");
         assert_eq!(reconciler.phase(), ReconcilerPhase::AwaitingSession);
+        assert_eq!(reconciler.last_sequence(), None);
         assert_eq!(
-            reconciler.ingest(started(1), NOW),
+            reconciler.ingest(&started(1), NOW),
             Ok(ReconcileOutcome::Applied)
         );
         assert_eq!(reconciler.phase(), ReconcilerPhase::Active);
         assert_eq!(reconciler.session_ref(), Some(SESSION));
         assert_eq!(
-            reconciler.ingest(event(2, HookEvent::lifecycle(LifecycleState::Running)), NOW),
+            reconciler.ingest(
+                &event(2, HookEvent::lifecycle(LifecycleState::Running)),
+                NOW,
+            ),
             Ok(ReconcileOutcome::Applied)
         );
         assert_eq!(reconciler.lifecycle(), Some(LifecycleState::Running));
@@ -1174,7 +1170,7 @@ mod tests {
     fn exact_duplicate_is_idempotent_but_changed_sequence_is_rejected() {
         let mut reconciler = Reconciler::new();
         reconciler
-            .apply_snapshot(snapshot(1), NOW)
+            .apply_snapshot(&snapshot(1), NOW)
             .expect("snapshot");
         let first = started(1);
         assert_eq!(
@@ -1187,7 +1183,7 @@ mod tests {
         );
         let changed = event(1, HookEvent::session_started("other-session"));
         assert_eq!(
-            reconciler.ingest(changed, NOW),
+            reconciler.ingest(&changed, NOW),
             Err(ReconcileError::SequenceConflict)
         );
         assert_eq!(reconciler.last_sequence(), Some(1));
@@ -1197,10 +1193,10 @@ mod tests {
     fn snapshots_are_only_accepted_when_the_stream_is_invalidated() {
         let mut reconciler = Reconciler::new();
         reconciler
-            .apply_snapshot(snapshot(1), NOW)
+            .apply_snapshot(&snapshot(1), NOW)
             .expect("snapshot");
         assert_eq!(
-            reconciler.apply_snapshot(snapshot(1), NOW),
+            reconciler.apply_snapshot(&snapshot(1), NOW),
             Err(ReconcileError::InvalidOrdering)
         );
         assert_eq!(reconciler.phase(), ReconcilerPhase::AwaitingSession);
@@ -1211,41 +1207,41 @@ mod tests {
     fn gaps_and_reconnects_block_until_a_fresh_snapshot() {
         let mut reconciler = Reconciler::new();
         reconciler
-            .apply_snapshot(snapshot(1), NOW)
+            .apply_snapshot(&snapshot(1), NOW)
             .expect("snapshot");
         assert_eq!(
-            reconciler.ingest(started(2), NOW),
+            reconciler.ingest(&started(2), NOW),
             Err(ReconcileError::NeedSnapshot(NeedSnapshot::new(
                 NeedSnapshotReason::SequenceGap
             )))
         );
         assert!(reconciler.needs_snapshot());
         assert_eq!(
-            reconciler.ingest(started(1), NOW),
+            reconciler.ingest(&started(1), NOW),
             Err(ReconcileError::NeedSnapshot(NeedSnapshot::new(
                 NeedSnapshotReason::SequenceGap
             )))
         );
         reconciler
-            .apply_snapshot(snapshot(1), NOW)
+            .apply_snapshot(&snapshot(1), NOW)
             .expect("resnapshot");
         assert_eq!(
-            reconciler.ingest(started(1), NOW),
+            reconciler.ingest(&started(1), NOW),
             Ok(ReconcileOutcome::Applied)
         );
         reconciler.reconnect();
         assert_eq!(
-            reconciler.ingest(event(2, HookEvent::lifecycle(LifecycleState::Idle)), NOW),
+            reconciler.ingest(&event(2, HookEvent::lifecycle(LifecycleState::Idle)), NOW,),
             Err(ReconcileError::NeedSnapshot(NeedSnapshot::new(
                 NeedSnapshotReason::Reconnected
             )))
         );
         reconciler
-            .apply_snapshot(snapshot(2), NOW)
+            .apply_snapshot(&snapshot(2), NOW)
             .expect("fresh generation");
         assert_eq!(
             reconciler.ingest(
-                HookObservation::new(
+                &HookObservation::new(
                     SOURCE,
                     ATTEMPT,
                     GENERATION,
@@ -1265,35 +1261,35 @@ mod tests {
     fn lifecycle_report_and_exit_require_start_and_exit_closes_ordering() {
         let mut reconciler = Reconciler::new();
         reconciler
-            .apply_snapshot(snapshot(1), NOW)
+            .apply_snapshot(&snapshot(1), NOW)
             .expect("snapshot");
         assert_eq!(
-            reconciler.ingest(event(1, HookEvent::lifecycle(LifecycleState::Done)), NOW),
+            reconciler.ingest(&event(1, HookEvent::lifecycle(LifecycleState::Done)), NOW,),
             Err(ReconcileError::InvalidOrdering)
         );
         assert_eq!(
-            reconciler.ingest(event(1, HookEvent::report_ready(REPORT)), NOW),
+            reconciler.ingest(&event(1, HookEvent::report_ready(REPORT)), NOW,),
             Err(ReconcileError::InvalidOrdering)
         );
         assert_eq!(
-            reconciler.ingest(event(1, HookEvent::session_exited()), NOW),
+            reconciler.ingest(&event(1, HookEvent::session_exited()), NOW),
             Err(ReconcileError::InvalidOrdering)
         );
-        reconciler.ingest(started(1), NOW).expect("start");
+        reconciler.ingest(&started(1), NOW).expect("start");
         reconciler
-            .ingest(event(2, HookEvent::report_ready(REPORT)), NOW)
+            .ingest(&event(2, HookEvent::report_ready(REPORT)), NOW)
             .expect("report reference");
         assert_eq!(reconciler.report_ref(), Some(REPORT));
         reconciler
-            .ingest(event(3, HookEvent::session_exited()), NOW)
+            .ingest(&event(3, HookEvent::session_exited()), NOW)
             .expect("exit");
         assert_eq!(reconciler.phase(), ReconcilerPhase::Exited);
         assert_eq!(
-            reconciler.ingest(event(4, HookEvent::lifecycle(LifecycleState::Idle)), NOW),
+            reconciler.ingest(&event(4, HookEvent::lifecycle(LifecycleState::Idle)), NOW,),
             Err(ReconcileError::EventAfterExit)
         );
         assert_eq!(
-            reconciler.ingest(event(3, HookEvent::session_exited()), NOW),
+            reconciler.ingest(&event(3, HookEvent::session_exited()), NOW),
             Ok(ReconcileOutcome::Duplicate)
         );
     }
@@ -1302,7 +1298,7 @@ mod tests {
     fn binding_and_generation_mismatches_fail_closed() {
         let mut reconciler = Reconciler::new();
         reconciler
-            .apply_snapshot(snapshot(1), NOW)
+            .apply_snapshot(&snapshot(1), NOW)
             .expect("snapshot");
 
         let wrong_source = HookObservation::new(
@@ -1316,7 +1312,7 @@ mod tests {
         )
         .expect("valid mismatched event");
         assert_eq!(
-            reconciler.ingest(wrong_source, NOW),
+            reconciler.ingest(&wrong_source, NOW),
             Err(ReconcileError::BindingMismatch)
         );
         assert!(!reconciler.needs_snapshot());
@@ -1325,12 +1321,12 @@ mod tests {
             .expect("valid mismatched snapshot");
         reconciler.reconnect();
         assert_eq!(
-            reconciler.apply_snapshot(wrong_attempt, NOW),
+            reconciler.apply_snapshot(&wrong_attempt, NOW),
             Err(ReconcileError::BindingMismatch)
         );
         assert!(reconciler.needs_snapshot());
         reconciler
-            .apply_snapshot(snapshot(1), NOW)
+            .apply_snapshot(&snapshot(1), NOW)
             .expect("valid recovery snapshot");
 
         let changed_generation = HookObservation::new(
@@ -1344,7 +1340,71 @@ mod tests {
         )
         .expect("valid generation change");
         assert_eq!(
-            reconciler.ingest(changed_generation, NOW),
+            reconciler.ingest(&changed_generation, NOW),
+            Err(ReconcileError::NeedSnapshot(NeedSnapshot::new(
+                NeedSnapshotReason::GenerationChanged
+            )))
+        );
+        assert!(reconciler.needs_snapshot());
+    }
+
+    #[test]
+    fn stale_or_future_generation_mismatch_keeps_state_until_valid_mismatch() {
+        let mut reconciler = Reconciler::new();
+        reconciler
+            .apply_snapshot(&snapshot(1), NOW)
+            .expect("snapshot");
+        reconciler.ingest(&started(1), NOW).expect("start");
+        reconciler
+            .ingest(
+                &event(2, HookEvent::lifecycle(LifecycleState::Running)),
+                NOW,
+            )
+            .expect("lifecycle");
+
+        let future = event_at(
+            GENERATION + 1,
+            3,
+            NOW + MAX_FUTURE_SKEW_MS + 1,
+            TTL,
+            HookEvent::lifecycle(LifecycleState::Idle),
+        );
+        assert_eq!(
+            reconciler.ingest(&future, NOW),
+            Err(ReconcileError::FutureTimestamp)
+        );
+        assert_eq!(reconciler.phase(), ReconcilerPhase::Active);
+        assert_eq!(reconciler.generation(), Some(GENERATION));
+        assert_eq!(reconciler.last_sequence(), Some(2));
+        assert_eq!(reconciler.lifecycle(), Some(LifecycleState::Running));
+        assert!(!reconciler.needs_snapshot());
+
+        let expired = event_at(
+            GENERATION + 1,
+            3,
+            NOW,
+            1,
+            HookEvent::lifecycle(LifecycleState::Idle),
+        );
+        assert_eq!(
+            reconciler.ingest(&expired, NOW + 1),
+            Err(ReconcileError::Expired)
+        );
+        assert_eq!(reconciler.phase(), ReconcilerPhase::Active);
+        assert_eq!(reconciler.generation(), Some(GENERATION));
+        assert_eq!(reconciler.last_sequence(), Some(2));
+        assert_eq!(reconciler.lifecycle(), Some(LifecycleState::Running));
+        assert!(!reconciler.needs_snapshot());
+
+        let changed_generation = event_at(
+            GENERATION + 1,
+            3,
+            NOW,
+            TTL,
+            HookEvent::lifecycle(LifecycleState::Idle),
+        );
+        assert_eq!(
+            reconciler.ingest(&changed_generation, NOW),
             Err(ReconcileError::NeedSnapshot(NeedSnapshot::new(
                 NeedSnapshotReason::GenerationChanged
             )))
@@ -1356,23 +1416,24 @@ mod tests {
     fn unseen_older_events_and_expired_duplicates_are_rejected() {
         let mut reconciler = Reconciler::new();
         reconciler
-            .apply_snapshot(snapshot(3), NOW)
+            .apply_snapshot(&snapshot(3), NOW)
             .expect("snapshot");
+        assert_eq!(reconciler.last_sequence(), Some(2));
         assert_eq!(
-            reconciler.ingest(event(2, HookEvent::lifecycle(LifecycleState::Idle)), NOW),
+            reconciler.ingest(&event(2, HookEvent::lifecycle(LifecycleState::Idle)), NOW,),
             Err(ReconcileError::OutOfOrder)
         );
 
         let mut duplicate_reconciler = Reconciler::new();
         duplicate_reconciler
-            .apply_snapshot(snapshot(1), NOW)
+            .apply_snapshot(&snapshot(1), NOW)
             .expect("snapshot");
         let first = started(1);
         duplicate_reconciler
             .ingest(&first, NOW)
             .expect("initial event");
         assert_eq!(
-            duplicate_reconciler.ingest(first, NOW + TTL),
+            duplicate_reconciler.ingest(&first, NOW + TTL),
             Err(ReconcileError::Expired)
         );
         assert_eq!(duplicate_reconciler.last_sequence(), Some(1));
@@ -1382,7 +1443,7 @@ mod tests {
     fn active_snapshot_restores_state_without_a_restore_hook() {
         let mut reconciler = Reconciler::new();
         reconciler
-            .apply_snapshot(active_snapshot(1), NOW)
+            .apply_snapshot(&active_snapshot(1), NOW)
             .expect("active snapshot");
         assert_eq!(reconciler.phase(), ReconcilerPhase::Active);
         assert_eq!(reconciler.session_ref(), Some(SESSION));
@@ -1390,11 +1451,11 @@ mod tests {
         assert_eq!(reconciler.report_ref(), Some(REPORT));
 
         assert_eq!(
-            reconciler.ingest(started(1), NOW),
+            reconciler.ingest(&started(1), NOW),
             Err(ReconcileError::InvalidOrdering)
         );
         assert_eq!(
-            reconciler.ingest(event(1, HookEvent::lifecycle(LifecycleState::Idle)), NOW),
+            reconciler.ingest(&event(1, HookEvent::lifecycle(LifecycleState::Idle)), NOW,),
             Ok(ReconcileOutcome::Applied)
         );
         assert_eq!(reconciler.lifecycle(), Some(LifecycleState::Idle));
@@ -1450,12 +1511,12 @@ mod tests {
         )
         .expect("shape-valid future snapshot");
         assert_eq!(
-            reconciler.apply_snapshot(future, NOW),
+            reconciler.apply_snapshot(&future, NOW),
             Err(ReconcileError::FutureTimestamp)
         );
         let expired = SnapshotBaseline::new(SOURCE, ATTEMPT, GENERATION, 1, 1, 1).expect("shape");
         assert_eq!(
-            reconciler.apply_snapshot(expired, NOW),
+            reconciler.apply_snapshot(&expired, NOW),
             Err(ReconcileError::Expired)
         );
     }
@@ -1466,9 +1527,7 @@ mod tests {
         let active_snapshot = active_snapshot(1);
         let observation = started(1);
         let mut reconciler = Reconciler::new();
-        reconciler
-            .apply_snapshot(snapshot.clone(), NOW)
-            .expect("snapshot");
+        reconciler.apply_snapshot(&snapshot, NOW).expect("snapshot");
         let snapshot_debug = format!("{snapshot:?}");
         let active_snapshot_debug = format!("{active_snapshot:?}");
         let observation_debug = format!("{observation:?}");
