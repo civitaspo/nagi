@@ -711,11 +711,10 @@ server_pid=""
 server_group=""
 session_state="${session_directory}/session.json"
 session_state_mode="$(/usr/bin/stat -f '%Lp' "${session_state}" 2>/dev/null || true)"
-# Herdr writes this metadata file as 0644; its 0700 parent keeps the synthetic
-# session state private to the contract user.
+# Herdr writes this metadata file as 0600 under the contract's private umask.
 if [[ ! -f "${session_state}" || -L "${session_state}" \
   || "$(/usr/bin/stat -f '%u' "${session_state}" 2>/dev/null || true)" != "${current_uid}" \
-  || "${session_state_mode}" != "644" ]]; then
+  || "${session_state_mode}" != "600" ]]; then
   echo "Herdr CLI/socket contract did not persist the named session safely." >&2
   exit 1
 fi
