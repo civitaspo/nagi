@@ -745,8 +745,11 @@ fn herdr_contract_is_opt_in_and_socket_only() {
     if !cfg!(target_os = "macos") {
         let explicit = command_output(HERDR_SCRIPT, &[("NAGI_CONTRACT_HERDR", "1")]);
         assert_eq!(explicit.status.code(), Some(2));
-        assert!(!bytes_contain(&explicit.stdout, b"/"));
-        assert!(!bytes_contain(&explicit.stderr, b"/"));
+        assert!(explicit.stdout.is_empty());
+        assert_eq!(
+            explicit.stderr,
+            b"Herdr CLI/socket contract requires macOS for its local runtime witness.\n"
+        );
     }
 }
 
