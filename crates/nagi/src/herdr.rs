@@ -2387,8 +2387,8 @@ mod tests {
         let listener = UnixListener::bind(&no_line_path).expect("no-line socket");
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("socket client");
-            let mut request = [0_u8; 1];
-            let _ = stream.read(&mut request);
+            let mut request = [0_u8; 2];
+            stream.read_exact(&mut request).expect("no-line request");
             stream.write_all(b"{}").expect("partial response");
         });
         let mut socket = UnixSocketTransport {
@@ -2419,8 +2419,8 @@ mod tests {
         let listener = UnixListener::bind(&oversized_path).expect("oversized socket");
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("socket client");
-            let mut request = [0_u8; 1];
-            let _ = stream.read(&mut request);
+            let mut request = [0_u8; 2];
+            stream.read_exact(&mut request).expect("oversized request");
             let mut response = vec![b'x'; MAX_SOCKET_RESPONSE_BYTES + 1];
             response.push(b'\n');
             let _ = stream.write_all(&response);
