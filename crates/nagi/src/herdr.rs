@@ -16,6 +16,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 /// The backend identifier for this adapter.
 pub const BACKEND: &str = "herdr+codex";
@@ -35,46 +36,12 @@ const MAX_REQUEST_BYTES: usize = 128 * 1024;
 const MAX_RESPONSE_ID_BYTES: usize = 128;
 const MAX_CLI_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_SOCKET_RESPONSE_BYTES: usize = 1024 * 1024;
+const CLI_TIMEOUT: Duration = Duration::from_secs(30);
+const SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
+const SAFE_PATH: &str = "/usr/bin:/bin";
 const SNAPSHOT_REQUEST_ID: &str = "nagi-observe";
 const SNAPSHOT_REQUEST: &[u8] = br#"{"id":"nagi-observe","method":"session.snapshot","params":{}}
 "#;
-
-/// The eight operations shared by agent backends.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AgentOperation {
-    /// Create an isolated Herdr workspace.
-    WorkspaceCreate,
-    /// Start the selected agent in an existing Herdr pane.
-    AgentStart,
-    /// Submit one prompt to a running agent.
-    Prompt,
-    /// Observe one bounded Herdr session snapshot.
-    Observe,
-    /// Send the documented interrupt key sequence to an agent.
-    Interrupt,
-    /// Resume an agent attempt when the backend exposes that operation.
-    Resume,
-    /// Parse one adapter-sanitized normalized report.
-    CollectReport,
-    /// Close a Herdr-owned workspace.
-    Stop,
-}
-
-impl fmt::Display for AgentOperation {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
-            Self::WorkspaceCreate => "workspace_create",
-            Self::AgentStart => "agent_start",
-            Self::Prompt => "prompt",
-            Self::Observe => "observe",
-            Self::Interrupt => "interrupt",
-            Self::Resume => "resume",
-            Self::CollectReport => "collect_report",
-            Self::Stop => "stop",
-        };
-        formatter.write_str(name)
-    }
-}
 
 /// Coarse, redacted transport failures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -83,6 +50,8 @@ pub enum TransportError {
     Unavailable,
     /// The effect returned a failure status.
     Failed,
+    /// The effect did not complete within its bounded wait.
+    TimedOut,
     /// The effect returned more bytes than this boundary accepts.
     OutputTooLarge,
 }
@@ -92,6 +61,7 @@ impl fmt::Display for TransportError {
         let message = match self {
             Self::Unavailable => "Herdr transport is unavailable",
             Self::Failed => "Herdr transport failed",
+            Self::TimedOut => "Herdr transport timed out",
             Self::OutputTooLarge => "Herdr transport output exceeded its bound",
         };
         formatter.write_str(message)
@@ -120,8 +90,18 @@ pub enum HerdrError {
     InvalidReport,
     /// The report was valid but was not produced for this backend.
     BackendMismatch,
+    /// The report was valid but did not match the caller's attempt/session binding.
+    ReportBindingMismatch,
     /// The pinned Herdr CLI has no direct implementation of this operation.
-    UnsupportedOperation(AgentOperation),
+    UnsupportedOperation,
+    /// The explicitly selected Herdr executable is unavailable.
+    ExecutableUnavailable,
+    /// The explicitly selected Herdr executable failed its safety checks.
+    ExecutableUntrusted,
+    /// The selected executable did not report the pinned Herdr version.
+    VersionMismatch,
+    /// The explicitly selected private Herdr runtime is unavailable or unsafe.
+    RuntimeUnavailable,
 }
 
 impl fmt::Display for HerdrError {
@@ -134,9 +114,12 @@ impl fmt::Display for HerdrError {
             Self::AgentNotFound => "Herdr agent was not found in the session snapshot",
             Self::InvalidReport => "normalized agent report is invalid",
             Self::BackendMismatch => "normalized agent report backend is not herdr+codex",
-            Self::UnsupportedOperation(operation) => {
-                return write!(formatter, "Herdr operation {operation} is unsupported");
-            }
+            Self::ReportBindingMismatch => "normalized agent report binding does not match",
+            Self::UnsupportedOperation => "Herdr agent resume is unsupported by this release",
+            Self::ExecutableUnavailable => "Herdr executable is unavailable",
+            Self::ExecutableUntrusted => "Herdr executable failed its safety checks",
+            Self::VersionMismatch => "Herdr executable version is not supported",
+            Self::RuntimeUnavailable => "Herdr private runtime is unavailable or unsafe",
         };
         formatter.write_str(message)
     }
@@ -147,30 +130,6 @@ impl std::error::Error for HerdrError {}
 impl From<TransportError> for HerdrError {
     fn from(error: TransportError) -> Self {
         Self::Transport(error)
-    }
-}
-
-/// A response owned by an injected effect.
-///
-/// The bytes are intentionally not exposed. The runner parses them immediately
-/// and does not retain or publish raw Herdr JSON, terminal text, or prompts.
-pub struct TransportResponse {
-    bytes: Vec<u8>,
-}
-
-impl TransportResponse {
-    /// Creates a test or transport response from bounded JSON text.
-    pub fn from_json(json: &str) -> Result<Self, TransportError> {
-        if json.len() > MAX_SOCKET_RESPONSE_BYTES {
-            return Err(TransportError::OutputTooLarge);
-        }
-        Ok(Self {
-            bytes: json.as_bytes().to_vec(),
-        })
-    }
-
-    fn bytes(&self) -> &[u8] {
-        &self.bytes
     }
 }
 
@@ -192,17 +151,13 @@ impl CliRequest {
 /// Injectable process/CLI effect for the adapter.
 pub trait CliTransport {
     /// Executes one already-validated Herdr CLI request.
-    fn run(&mut self, request: &CliRequest) -> Result<TransportResponse, TransportError>;
+    fn run(&mut self, request: &CliRequest) -> Result<Vec<u8>, TransportError>;
 }
 
 /// Injectable Unix-socket snapshot effect for the adapter.
 pub trait SocketSnapshotTransport {
     /// Sends one already-validated `session.snapshot` request to `socket_path`.
-    fn snapshot(
-        &mut self,
-        socket_path: &Path,
-        request: &[u8],
-    ) -> Result<TransportResponse, TransportError>;
+    fn snapshot(&mut self, socket_path: &Path, request: &[u8]) -> Result<Vec<u8>, TransportError>;
 }
 
 /// The isolated named-session values used by a Herdr runner.
@@ -249,6 +204,230 @@ impl fmt::Debug for HerdrRuntime {
             .field("session", &"[redacted]")
             .field("socket_path", &"[redacted]")
             .finish()
+    }
+}
+
+/// Explicit private process settings for the production Herdr adapter.
+///
+/// Every path is supplied by the caller. The adapter never reads `HOME`, the
+/// normal Herdr configuration, or the ambient environment. The paths must
+/// refer to a private runtime prepared by the caller (typically mode `0700`
+/// directories and a mode `0600` configuration file).
+#[derive(Clone)]
+pub struct HerdrProcessConfig {
+    executable: PathBuf,
+    home: PathBuf,
+    tmpdir: PathBuf,
+    config_path: PathBuf,
+    runtime: HerdrRuntime,
+}
+
+impl HerdrProcessConfig {
+    /// Creates an explicit process configuration without discovering local
+    /// Herdr state. Filesystem ownership/mode checks run before construction of
+    /// the production CLI transport.
+    pub fn new(
+        executable: impl Into<PathBuf>,
+        home: impl Into<PathBuf>,
+        tmpdir: impl Into<PathBuf>,
+        config_path: impl Into<PathBuf>,
+        runtime: HerdrRuntime,
+    ) -> Result<Self, HerdrError> {
+        let executable = executable.into();
+        let home = home.into();
+        let tmpdir = tmpdir.into();
+        let config_path = config_path.into();
+        for path in [&executable, &home, &tmpdir, &config_path] {
+            validate_runtime_path(path)?;
+        }
+        Ok(Self {
+            executable,
+            home,
+            tmpdir,
+            config_path,
+            runtime,
+        })
+    }
+}
+
+impl fmt::Debug for HerdrProcessConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HerdrProcessConfig")
+            .field("executable", &"[redacted]")
+            .field("home", &"[redacted]")
+            .field("tmpdir", &"[redacted]")
+            .field("config_path", &"[redacted]")
+            .field("runtime", &self.runtime)
+            .finish()
+    }
+}
+
+/// The production CLI transport for an explicitly configured Herdr binary.
+///
+/// Construction verifies the executable and requires the exact `herdr 0.8.2`
+/// version output before any workspace, agent, prompt, interrupt, or stop
+/// operation can be issued. Each invocation clears the inherited environment,
+/// supplies only the private runtime settings, and bounds both output streams
+/// and process lifetime.
+pub struct HerdrCliTransport {
+    config: HerdrProcessConfig,
+}
+
+impl HerdrCliTransport {
+    /// Validates the private runtime and verifies the selected Herdr release.
+    pub fn new(config: HerdrProcessConfig) -> Result<Self, HerdrError> {
+        validate_process_config(&config)?;
+        let transport = Self { config };
+        transport.verify_version()?;
+        Ok(transport)
+    }
+
+    fn verify_version(&self) -> Result<(), HerdrError> {
+        let version = self
+            .run_command(&["--version"])
+            .map_err(|_| HerdrError::ExecutableUnavailable)?;
+        let expected = format!("herdr {HERDR_VERSION}\n");
+        if version != expected.as_bytes() {
+            return Err(HerdrError::VersionMismatch);
+        }
+        Ok(())
+    }
+
+    fn run_command(&self, args: &[&str]) -> Result<Vec<u8>, TransportError> {
+        validate_existing_executable(&self.config.executable)
+            .map_err(|_| TransportError::Unavailable)?;
+        let home = self
+            .config
+            .home
+            .to_str()
+            .ok_or(TransportError::Unavailable)?;
+        let tmpdir = self
+            .config
+            .tmpdir
+            .to_str()
+            .ok_or(TransportError::Unavailable)?;
+        let config_path = self
+            .config
+            .config_path
+            .to_str()
+            .ok_or(TransportError::Unavailable)?;
+        let session = self.config.runtime.session();
+
+        let mut command = std::process::Command::new(&self.config.executable);
+        command.args(args);
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .env_clear()
+            .env("PATH", SAFE_PATH)
+            .env("HOME", home)
+            .env("TMPDIR", tmpdir)
+            .env("HERDR_CONFIG_PATH", config_path)
+            .env("HERDR_SESSION", session)
+            .env("TERM", "xterm-256color");
+        run_bounded_command(command, CLI_TIMEOUT, MAX_CLI_RESPONSE_BYTES)
+    }
+}
+
+impl fmt::Debug for HerdrCliTransport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HerdrCliTransport")
+            .field("config", &self.config)
+            .finish()
+    }
+}
+
+impl CliTransport for HerdrCliTransport {
+    fn run(&mut self, request: &CliRequest) -> Result<Vec<u8>, TransportError> {
+        // Do not log or format `request.args()`: prompts are necessarily one
+        // argv element and can be visible to local process-list observers for
+        // the lifetime of this command.
+        self.verify_version()
+            .map_err(|_| TransportError::Unavailable)?;
+        self.run_command(
+            request
+                .args()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .as_slice(),
+        )
+    }
+}
+
+/// The production Unix-socket transport used for bounded snapshots.
+#[derive(Clone, Copy, Debug)]
+pub struct UnixSocketTransport {
+    timeout: Duration,
+}
+
+impl UnixSocketTransport {
+    /// Creates a socket transport with the fixed bounded timeout.
+    pub fn new() -> Self {
+        Self {
+            timeout: SOCKET_TIMEOUT,
+        }
+    }
+
+    /// Creates a socket transport with a caller-selected bounded timeout.
+    pub fn with_timeout(timeout: Duration) -> Result<Self, HerdrError> {
+        if timeout.is_zero() || timeout > Duration::from_secs(60) {
+            return Err(HerdrError::InvalidInput);
+        }
+        Ok(Self { timeout })
+    }
+}
+
+impl Default for UnixSocketTransport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(unix)]
+impl SocketSnapshotTransport for UnixSocketTransport {
+    fn snapshot(&mut self, socket_path: &Path, request: &[u8]) -> Result<Vec<u8>, TransportError> {
+        validate_socket_path(socket_path).map_err(|_| TransportError::Unavailable)?;
+        if request.is_empty() || request.len() > MAX_REQUEST_BYTES || !request.ends_with(b"\n") {
+            return Err(TransportError::Failed);
+        }
+        let mut stream = connect_unix_socket(socket_path, self.timeout)?;
+        stream
+            .set_write_timeout(Some(self.timeout))
+            .map_err(map_socket_error)?;
+        stream
+            .set_read_timeout(Some(self.timeout))
+            .map_err(map_socket_error)?;
+        std::io::Write::write_all(&mut stream, request).map_err(map_socket_error)?;
+        read_bounded_line(&mut stream)
+    }
+}
+
+#[cfg(not(unix))]
+impl SocketSnapshotTransport for UnixSocketTransport {
+    fn snapshot(
+        &mut self,
+        _socket_path: &Path,
+        _request: &[u8],
+    ) -> Result<Vec<u8>, TransportError> {
+        Err(TransportError::Unavailable)
+    }
+}
+
+/// A directly callable production runner using the validated process and
+/// socket transports. The alias keeps the generic test seam out of callers.
+pub type ProductionHerdrCodexRunner = HerdrCodexRunner<HerdrCliTransport, UnixSocketTransport>;
+
+impl ProductionHerdrCodexRunner {
+    /// Builds a production runner after verifying the exact Herdr executable
+    /// and private runtime configuration.
+    pub fn connect(config: HerdrProcessConfig) -> Result<Self, HerdrError> {
+        let runtime = config.runtime.clone();
+        let cli = HerdrCliTransport::new(config)?;
+        Ok(Self::new(cli, UnixSocketTransport::new(), runtime))
     }
 }
 
@@ -337,6 +516,7 @@ pub enum AgentStatus {
     /// Herdr observed an idle agent after unseen background work.
     Done,
     /// Herdr could not classify the agent state.
+    #[serde(other)]
     Unknown,
 }
 
@@ -401,8 +581,14 @@ pub trait AgentBackend {
     fn interrupt(&mut self, agent: &AgentHandle) -> Result<(), HerdrError>;
     /// Requests native resume; unsupported by Herdr 0.8.2 and fails closed.
     fn resume(&mut self, agent: &AgentHandle) -> Result<(), HerdrError>;
-    /// Parses one adapter-sanitized normalized report.
-    fn collect_report(&mut self, report_json: &str) -> Result<AgentReport, HerdrError>;
+    /// Parses one adapter-sanitized report bound to the caller's exact attempt
+    /// and stable Herdr agent session reference.
+    fn collect_report(
+        &mut self,
+        expected_attempt_id: &str,
+        expected_agent_session_ref: &str,
+        report_json: &str,
+    ) -> Result<AgentReport, HerdrError>;
     /// Closes the Herdr-owned workspace.
     fn stop(&mut self, workspace: &WorkspaceHandle) -> Result<(), HerdrError>;
 }
@@ -449,11 +635,17 @@ where
         ])?;
         expect_result_type(&response.result_type, "workspace_created")?;
         let workspace_id = validated_workspace_id(&response.workspace.workspace_id)?;
-        let tab_id = validated_tab_id(&response.tab.tab_id)?;
-        let pane_id = validated_pane_id(&response.root_pane.pane_id)?;
-        validate_optional_workspace_id(response.tab.workspace_id.as_deref(), &workspace_id)?;
-        validate_optional_workspace_id(response.root_pane.workspace_id.as_deref(), &workspace_id)?;
-        validate_optional_tab_id(response.root_pane.tab_id.as_deref(), &tab_id)?;
+        let tab_id = validated_tab_id_for_workspace(&response.tab.tab_id, &workspace_id)?;
+        let pane_id = validated_pane_id_for_workspace(&response.root_pane.pane_id, &workspace_id)?;
+        let tab_workspace_id = validated_workspace_id(&response.tab.workspace_id)?;
+        let pane_workspace_id = validated_workspace_id(&response.root_pane.workspace_id)?;
+        let pane_tab_id = validated_tab_id(&response.root_pane.tab_id)?;
+        if tab_workspace_id != workspace_id
+            || pane_workspace_id != workspace_id
+            || pane_tab_id != tab_id
+        {
+            return Err(HerdrError::UnexpectedResponse);
+        }
         Ok(WorkspaceHandle {
             workspace_id,
             tab_id,
@@ -466,8 +658,9 @@ where
         workspace: &WorkspaceHandle,
         name: &str,
     ) -> Result<AgentHandle, HerdrError> {
+        validate_workspace_handle(workspace)?;
         validate_agent_name(name)?;
-        let response: AgentStartedResult = self.run_cli([
+        let response: AgentResult = self.run_cli([
             "agent",
             "start",
             name,
@@ -477,8 +670,9 @@ where
             workspace.pane_id(),
         ])?;
         expect_result_type(&response.result_type, "agent_started")?;
-        let pane_id = validated_pane_id(&response.agent.pane_id)?;
         let response_workspace_id = validated_workspace_id(&response.agent.workspace_id)?;
+        let pane_id =
+            validated_pane_id_for_workspace(&response.agent.pane_id, &response_workspace_id)?;
         if pane_id != workspace.pane_id() || response_workspace_id != workspace.workspace_id() {
             return Err(HerdrError::UnexpectedResponse);
         }
@@ -500,12 +694,12 @@ where
     }
 
     fn prompt(&mut self, agent: &AgentHandle, text: &str) -> Result<(), HerdrError> {
+        validate_agent_handle(agent)?;
         validate_prompt(text)?;
-        let response: AgentPromptedResult =
-            self.run_cli(["agent", "prompt", agent.name(), text])?;
+        let response: AgentResult = self.run_cli(["agent", "prompt", agent.name(), text])?;
         expect_result_type(&response.result_type, "agent_prompted")?;
-        let pane_id = validated_pane_id(&response.agent.pane_id)?;
         let workspace_id = validated_workspace_id(&response.agent.workspace_id)?;
+        let pane_id = validated_pane_id_for_workspace(&response.agent.pane_id, &workspace_id)?;
         if pane_id != agent.pane_id() || workspace_id != agent.workspace_id() {
             return Err(HerdrError::UnexpectedResponse);
         }
@@ -523,9 +717,7 @@ where
     }
 
     fn observe(&mut self, agent: &AgentHandle) -> Result<AgentObservation, HerdrError> {
-        if SNAPSHOT_REQUEST.len() > MAX_REQUEST_BYTES {
-            return Err(HerdrError::InvalidInput);
-        }
+        validate_agent_handle(agent)?;
         let response = self
             .socket
             .snapshot(self.runtime.socket_path(), SNAPSHOT_REQUEST)
@@ -534,24 +726,39 @@ where
     }
 
     fn interrupt(&mut self, agent: &AgentHandle) -> Result<(), HerdrError> {
+        validate_agent_handle(agent)?;
         let response: OkResult = self.run_cli(["agent", "send-keys", agent.name(), "ctrl+c"])?;
         expect_result_type(&response.result_type, "ok")?;
         Ok(())
     }
 
-    fn resume(&mut self, _agent: &AgentHandle) -> Result<(), HerdrError> {
-        Err(HerdrError::UnsupportedOperation(AgentOperation::Resume))
+    fn resume(&mut self, agent: &AgentHandle) -> Result<(), HerdrError> {
+        validate_agent_handle(agent)?;
+        Err(HerdrError::UnsupportedOperation)
     }
 
-    fn collect_report(&mut self, report_json: &str) -> Result<AgentReport, HerdrError> {
+    fn collect_report(
+        &mut self,
+        expected_attempt_id: &str,
+        expected_agent_session_ref: &str,
+        report_json: &str,
+    ) -> Result<AgentReport, HerdrError> {
+        validate_report_binding(expected_attempt_id)?;
+        validate_report_binding(expected_agent_session_ref)?;
         let report = AgentReport::parse_json(report_json).map_err(|_| HerdrError::InvalidReport)?;
         if report.backend() != BACKEND {
             return Err(HerdrError::BackendMismatch);
+        }
+        if report.attempt_id() != expected_attempt_id
+            || report.agent_session_ref() != expected_agent_session_ref
+        {
+            return Err(HerdrError::ReportBindingMismatch);
         }
         Ok(report)
     }
 
     fn stop(&mut self, workspace: &WorkspaceHandle) -> Result<(), HerdrError> {
+        validate_workspace_handle(workspace)?;
         let workspace_id = validated_workspace_id(workspace.workspace_id())?;
         let response: OkResult = self.run_cli(["workspace", "close", &workspace_id])?;
         expect_result_type(&response.result_type, "ok")?;
@@ -581,11 +788,11 @@ where
         }
         let request = CliRequest { args };
         let response = self.cli.run(&request).map_err(HerdrError::Transport)?;
-        if response.bytes().len() > MAX_CLI_RESPONSE_BYTES {
+        if response.len() > MAX_CLI_RESPONSE_BYTES {
             return Err(HerdrError::Transport(TransportError::OutputTooLarge));
         }
-        let envelope: CliEnvelope<T> =
-            serde_json::from_slice(response.bytes()).map_err(|_| HerdrError::MalformedResponse)?;
+        let envelope: RpcEnvelope<T> =
+            serde_json::from_slice(&response).map_err(|_| HerdrError::MalformedResponse)?;
         validate_response_id(&envelope.id)?;
         Ok(envelope.result)
     }
@@ -593,14 +800,7 @@ where
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CliEnvelope<T> {
-    id: String,
-    result: T,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SocketEnvelope<T> {
+struct RpcEnvelope<T> {
     id: String,
     result: T,
 }
@@ -615,14 +815,7 @@ struct WorkspaceCreatedResult {
 }
 
 #[derive(Deserialize)]
-struct AgentStartedResult {
-    #[serde(rename = "type")]
-    result_type: String,
-    agent: AgentRef,
-}
-
-#[derive(Deserialize)]
-struct AgentPromptedResult {
+struct AgentResult {
     #[serde(rename = "type")]
     result_type: String,
     agent: AgentRef,
@@ -642,17 +835,14 @@ struct WorkspaceRef {
 #[derive(Deserialize)]
 struct TabRef {
     tab_id: String,
-    #[serde(default)]
-    workspace_id: Option<String>,
+    workspace_id: String,
 }
 
 #[derive(Deserialize)]
 struct PaneRef {
     pane_id: String,
-    #[serde(default)]
-    workspace_id: Option<String>,
-    #[serde(default)]
-    tab_id: Option<String>,
+    workspace_id: String,
+    tab_id: String,
 }
 
 #[derive(Deserialize)]
@@ -712,15 +902,12 @@ fn validate_response_id(value: &str) -> Result<(), HerdrError> {
     Ok(())
 }
 
-fn parse_snapshot(
-    response: TransportResponse,
-    agent: &AgentHandle,
-) -> Result<AgentObservation, HerdrError> {
-    if response.bytes().len() > MAX_SOCKET_RESPONSE_BYTES {
+fn parse_snapshot(response: Vec<u8>, agent: &AgentHandle) -> Result<AgentObservation, HerdrError> {
+    if response.len() > MAX_SOCKET_RESPONSE_BYTES {
         return Err(HerdrError::Transport(TransportError::OutputTooLarge));
     }
-    let envelope: SocketEnvelope<SnapshotResult> =
-        serde_json::from_slice(response.bytes()).map_err(|_| HerdrError::MalformedResponse)?;
+    let envelope: RpcEnvelope<SnapshotResult> =
+        serde_json::from_slice(&response).map_err(|_| HerdrError::MalformedResponse)?;
     validate_response_id(&envelope.id)?;
     if envelope.id != SNAPSHOT_REQUEST_ID {
         return Err(HerdrError::UnexpectedResponse);
@@ -742,7 +929,7 @@ fn parse_snapshot(
     if workspace_id != agent.workspace_id() {
         return Err(HerdrError::UnexpectedResponse);
     }
-    let pane_id = validated_pane_id(&snapshot_agent.pane_id)?;
+    let pane_id = validated_pane_id_for_workspace(&snapshot_agent.pane_id, &workspace_id)?;
     if let Some(response_name) = snapshot_agent.name.as_deref()
         && response_name != agent.name()
     {
@@ -838,6 +1025,439 @@ fn validate_runtime_path(path: &Path) -> Result<(), HerdrError> {
     Ok(())
 }
 
+fn validate_process_config(config: &HerdrProcessConfig) -> Result<(), HerdrError> {
+    validate_existing_executable(&config.executable)?;
+    validate_private_directory(&config.home)?;
+    validate_private_directory(&config.tmpdir)?;
+    validate_private_config(&config.config_path)?;
+    Ok(())
+}
+
+fn validate_existing_executable(path: &Path) -> Result<(), HerdrError> {
+    validate_runtime_path(path).map_err(|_| HerdrError::ExecutableUnavailable)?;
+    validate_no_symlink_components(path).map_err(|_| HerdrError::ExecutableUntrusted)?;
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|_| HerdrError::ExecutableUnavailable)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(HerdrError::ExecutableUntrusted);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mode = metadata.permissions().mode();
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.nlink() != 1
+            || mode & 0o500 != 0o500
+            || mode & 0o022 != 0
+            || mode & 0o7000 != 0
+        {
+            return Err(HerdrError::ExecutableUntrusted);
+        }
+    }
+    Ok(())
+}
+
+fn validate_private_directory(path: &Path) -> Result<(), HerdrError> {
+    validate_runtime_path(path).map_err(|_| HerdrError::RuntimeUnavailable)?;
+    validate_no_symlink_components(path).map_err(|_| HerdrError::RuntimeUnavailable)?;
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| HerdrError::RuntimeUnavailable)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(HerdrError::RuntimeUnavailable);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mode = metadata.permissions().mode();
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || mode & 0o777 != 0o700
+            || mode & 0o7000 != 0
+        {
+            return Err(HerdrError::RuntimeUnavailable);
+        }
+    }
+    Ok(())
+}
+
+fn validate_private_config(path: &Path) -> Result<(), HerdrError> {
+    validate_runtime_path(path).map_err(|_| HerdrError::RuntimeUnavailable)?;
+    let parent = path.parent().ok_or(HerdrError::RuntimeUnavailable)?;
+    validate_no_symlink_components(parent).map_err(|_| HerdrError::RuntimeUnavailable)?;
+    let parent_metadata =
+        std::fs::symlink_metadata(parent).map_err(|_| HerdrError::RuntimeUnavailable)?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        return Err(HerdrError::RuntimeUnavailable);
+    }
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| HerdrError::RuntimeUnavailable)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(HerdrError::RuntimeUnavailable);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let parent_mode = parent_metadata.permissions().mode();
+        let mode = metadata.permissions().mode();
+        if parent_metadata.uid() != unsafe { libc::geteuid() }
+            || parent_mode & 0o077 != 0
+            || parent_mode & 0o7000 != 0
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.nlink() != 1
+            || mode & 0o777 != 0o600
+            || mode & 0o7000 != 0
+        {
+            return Err(HerdrError::RuntimeUnavailable);
+        }
+    }
+    Ok(())
+}
+
+fn validate_no_symlink_components(path: &Path) -> Result<(), HerdrError> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(std::path::MAIN_SEPARATOR.to_string()),
+            Component::Normal(value) => current.push(value),
+            Component::CurDir | Component::ParentDir => return Err(HerdrError::InvalidInput),
+        }
+        let metadata =
+            std::fs::symlink_metadata(&current).map_err(|_| HerdrError::RuntimeUnavailable)?;
+        if metadata.file_type().is_symlink() {
+            return Err(HerdrError::RuntimeUnavailable);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_socket_path(path: &Path) -> Result<(), HerdrError> {
+    validate_runtime_path(path).map_err(|_| HerdrError::InvalidInput)?;
+    let parent = path.parent().ok_or(HerdrError::InvalidInput)?;
+    validate_no_symlink_components(parent).map_err(|_| HerdrError::InvalidInput)?;
+    let parent_metadata =
+        std::fs::symlink_metadata(parent).map_err(|_| HerdrError::InvalidInput)?;
+    if !parent_metadata.is_dir() {
+        return Err(HerdrError::InvalidInput);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mode = parent_metadata.permissions().mode();
+        if parent_metadata.uid() != unsafe { libc::geteuid() }
+            || mode & 0o077 != 0
+            || mode & 0o7000 != 0
+        {
+            return Err(HerdrError::InvalidInput);
+        }
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(HerdrError::InvalidInput),
+        Ok(metadata) => {
+            use std::os::unix::fs::FileTypeExt;
+            use std::os::unix::fs::MetadataExt;
+            if metadata.file_type().is_socket() && metadata.uid() == unsafe { libc::geteuid() } {
+                Ok(())
+            } else {
+                Err(HerdrError::InvalidInput)
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(HerdrError::InvalidInput),
+    }
+}
+
+fn run_bounded_command(
+    mut command: std::process::Command,
+    timeout: Duration,
+    output_limit: usize,
+) -> Result<Vec<u8>, TransportError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Keep the child and any helper it starts in a private process group so
+        // timeout/failure cleanup does not leave a writer holding our pipes.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    let mut child = command.spawn().map_err(|_| TransportError::Unavailable)?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        terminate_child(&mut child);
+        TransportError::Failed
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        terminate_child(&mut child);
+        TransportError::Failed
+    })?;
+    let stdout_exceeded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stderr_exceeded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stdout_failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stderr_failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stdout_thread = spawn_bounded_reader(
+        stdout,
+        output_limit,
+        stdout_exceeded.clone(),
+        stdout_failed.clone(),
+    );
+    let stderr_thread = spawn_bounded_reader(
+        stderr,
+        output_limit,
+        stderr_exceeded.clone(),
+        stderr_failed.clone(),
+    );
+
+    let started = std::time::Instant::now();
+    let mut status = None;
+    let mut timed_out = false;
+    let mut supervision_failed = false;
+    loop {
+        if stdout_exceeded.load(std::sync::atomic::Ordering::Acquire)
+            || stderr_exceeded.load(std::sync::atomic::Ordering::Acquire)
+            || stdout_failed.load(std::sync::atomic::Ordering::Acquire)
+            || stderr_failed.load(std::sync::atomic::Ordering::Acquire)
+        {
+            terminate_child(&mut child);
+            break;
+        }
+        match child.try_wait() {
+            Ok(Some(exit_status)) => {
+                status = Some(exit_status);
+                break;
+            }
+            Ok(None) => {}
+            Err(_) => {
+                supervision_failed = true;
+                terminate_child(&mut child);
+                break;
+            }
+        }
+        if started.elapsed() >= timeout {
+            timed_out = true;
+            terminate_child(&mut child);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    if status.is_none() {
+        status = child.wait().ok();
+    }
+    let stdout_result = stdout_thread.join().unwrap_or(Err(()));
+    let stderr_result = stderr_thread.join().unwrap_or(Err(()));
+    if stdout_exceeded.load(std::sync::atomic::Ordering::Acquire)
+        || stderr_exceeded.load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Err(TransportError::OutputTooLarge);
+    }
+    if timed_out {
+        return Err(TransportError::TimedOut);
+    }
+    if supervision_failed
+        || stdout_failed.load(std::sync::atomic::Ordering::Acquire)
+        || stderr_failed.load(std::sync::atomic::Ordering::Acquire)
+        || stdout_result.is_err()
+        || stderr_result.is_err()
+    {
+        return Err(TransportError::Failed);
+    }
+    if !status.is_some_and(|exit_status| exit_status.success()) {
+        return Err(TransportError::Failed);
+    }
+    stdout_result.map_err(|_| TransportError::Failed)
+}
+
+fn spawn_bounded_reader<R>(
+    mut reader: R,
+    output_limit: usize,
+    exceeded: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<Result<Vec<u8>, ()>>
+where
+    R: std::io::Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let mut output = Vec::with_capacity(output_limit.min(8 * 1024));
+        let mut buffer = [0_u8; 8 * 1024];
+        let mut over_limit = false;
+        loop {
+            let count = match std::io::Read::read(&mut reader, &mut buffer) {
+                Ok(count) => count,
+                Err(_) => {
+                    failed.store(true, std::sync::atomic::Ordering::Release);
+                    return Err(());
+                }
+            };
+            if count == 0 {
+                break;
+            }
+            if output.len().saturating_add(count) > output_limit {
+                over_limit = true;
+                exceeded.store(true, std::sync::atomic::Ordering::Release);
+            } else if !over_limit {
+                output.extend_from_slice(&buffer[..count]);
+            }
+        }
+        if over_limit { Err(()) } else { Ok(output) }
+    })
+}
+
+fn terminate_child(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let process_group = -(child.id() as i32);
+        // The direct kill below handles a child that has already left its
+        // process group; both calls are intentionally best effort before wait.
+        unsafe {
+            let _ = libc::kill(process_group, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+fn map_socket_error(error: std::io::Error) -> TransportError {
+    match error.kind() {
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => TransportError::TimedOut,
+        std::io::ErrorKind::NotFound
+        | std::io::ErrorKind::ConnectionRefused
+        | std::io::ErrorKind::ConnectionReset
+        | std::io::ErrorKind::BrokenPipe => TransportError::Unavailable,
+        _ => TransportError::Failed,
+    }
+}
+
+#[cfg(unix)]
+fn connect_unix_socket(
+    path: &Path,
+    timeout: Duration,
+) -> Result<std::os::unix::net::UnixStream, TransportError> {
+    use std::os::fd::FromRawFd;
+
+    let path_text = path.to_str().ok_or(TransportError::Unavailable)?;
+    let path_bytes = path_text.as_bytes();
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let path_capacity = address.sun_path.len();
+    if path_bytes.len().saturating_add(1) > path_capacity {
+        return Err(TransportError::Unavailable);
+    }
+    address.sun_family = libc::AF_UNIX as _;
+    for (destination, source) in address.sun_path.iter_mut().zip(path_bytes.iter().copied()) {
+        *destination = source as _;
+    }
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(map_socket_error(std::io::Error::last_os_error()));
+    }
+    let close = || unsafe {
+        let _ = libc::close(fd);
+    };
+    let descriptor_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if descriptor_flags < 0
+        || unsafe { libc::fcntl(fd, libc::F_SETFD, descriptor_flags | libc::FD_CLOEXEC) } < 0
+    {
+        close();
+        return Err(TransportError::Failed);
+    }
+    let original_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if original_flags < 0
+        || unsafe { libc::fcntl(fd, libc::F_SETFL, original_flags | libc::O_NONBLOCK) } < 0
+    {
+        close();
+        return Err(TransportError::Failed);
+    }
+    let address_length = (std::mem::offset_of!(libc::sockaddr_un, sun_path) + path_bytes.len() + 1)
+        as libc::socklen_t;
+    let result = unsafe {
+        libc::connect(
+            fd,
+            (&address as *const libc::sockaddr_un).cast::<libc::sockaddr>(),
+            address_length,
+        )
+    };
+    if result < 0 {
+        let error = std::io::Error::last_os_error();
+        if !matches!(
+            error.raw_os_error(),
+            Some(code)
+                if code == libc::EINPROGRESS || code == libc::EALREADY || code == libc::EINTR
+        ) {
+            close();
+            return Err(map_socket_error(error));
+        }
+        let timeout_millis = timeout.as_millis().min(i32::MAX as u128) as i32;
+        let mut poll = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let poll_result = unsafe { libc::poll(&mut poll, 1, timeout_millis) };
+        if poll_result == 0 {
+            close();
+            return Err(TransportError::TimedOut);
+        }
+        if poll_result < 0 {
+            let error = std::io::Error::last_os_error();
+            close();
+            return Err(map_socket_error(error));
+        }
+        let mut socket_error = 0_i32;
+        let mut socket_error_length = std::mem::size_of::<i32>() as libc::socklen_t;
+        let getsockopt_result = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                (&mut socket_error as *mut i32).cast::<libc::c_void>(),
+                &mut socket_error_length,
+            )
+        };
+        if getsockopt_result < 0 || socket_error != 0 {
+            let error = if getsockopt_result < 0 {
+                std::io::Error::last_os_error()
+            } else {
+                std::io::Error::from_raw_os_error(socket_error)
+            };
+            close();
+            return Err(map_socket_error(error));
+        }
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, original_flags) } < 0 {
+        close();
+        return Err(TransportError::Failed);
+    }
+    Ok(unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn read_bounded_line(
+    stream: &mut std::os::unix::net::UnixStream,
+) -> Result<Vec<u8>, TransportError> {
+    let mut output = Vec::with_capacity(8 * 1024);
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let count = std::io::Read::read(stream, &mut buffer).map_err(map_socket_error)?;
+        if count == 0 {
+            return Err(TransportError::Failed);
+        }
+        if let Some(newline) = buffer[..count].iter().position(|byte| *byte == b'\n') {
+            let line_length = output.len().saturating_add(newline + 1);
+            if line_length > MAX_SOCKET_RESPONSE_BYTES {
+                return Err(TransportError::OutputTooLarge);
+            }
+            output.extend_from_slice(&buffer[..newline + 1]);
+            return Ok(output);
+        }
+        if output.len().saturating_add(count) >= MAX_SOCKET_RESPONSE_BYTES {
+            return Err(TransportError::OutputTooLarge);
+        }
+        output.extend_from_slice(&buffer[..count]);
+    }
+}
+
 fn validated_workspace_id(value: &str) -> Result<String, HerdrError> {
     if value.len() > MAX_SESSION_BYTES
         || !value.strip_prefix('w').is_some_and(|digits| {
@@ -860,6 +1480,20 @@ fn validated_tab_id(value: &str) -> Result<String, HerdrError> {
     Ok(value.to_owned())
 }
 
+fn validated_tab_id_for_workspace(
+    value: &str,
+    expected_workspace: &str,
+) -> Result<String, HerdrError> {
+    let tab_id = validated_tab_id(value)?;
+    let (workspace, _) = tab_id
+        .split_once(":t")
+        .ok_or(HerdrError::MalformedResponse)?;
+    if workspace != expected_workspace {
+        return Err(HerdrError::UnexpectedResponse);
+    }
+    Ok(tab_id)
+}
+
 fn validated_pane_id(value: &str) -> Result<String, HerdrError> {
     let (workspace, pane) = value
         .split_once(":p")
@@ -871,20 +1505,59 @@ fn validated_pane_id(value: &str) -> Result<String, HerdrError> {
     Ok(value.to_owned())
 }
 
-fn validate_optional_workspace_id(value: Option<&str>, expected: &str) -> Result<(), HerdrError> {
-    if let Some(value) = value
-        && validated_workspace_id(value)? != expected
-    {
+fn validated_pane_id_for_workspace(
+    value: &str,
+    expected_workspace: &str,
+) -> Result<String, HerdrError> {
+    let pane_id = validated_pane_id(value)?;
+    let (workspace, _) = pane_id
+        .split_once(":p")
+        .ok_or(HerdrError::MalformedResponse)?;
+    if workspace != expected_workspace {
         return Err(HerdrError::UnexpectedResponse);
+    }
+    Ok(pane_id)
+}
+
+fn validate_workspace_handle(workspace: &WorkspaceHandle) -> Result<(), HerdrError> {
+    let workspace_id =
+        validated_workspace_id(workspace.workspace_id()).map_err(|_| HerdrError::InvalidInput)?;
+    let tab_id = validated_tab_id_for_workspace(workspace.tab_id(), &workspace_id)
+        .map_err(|_| HerdrError::InvalidInput)?;
+    validated_pane_id_for_workspace(workspace.pane_id(), &workspace_id)
+        .map_err(|_| HerdrError::InvalidInput)?;
+    let (tab_workspace, _) = tab_id.split_once(":t").ok_or(HerdrError::InvalidInput)?;
+    if tab_workspace != workspace_id {
+        return Err(HerdrError::InvalidInput);
     }
     Ok(())
 }
 
-fn validate_optional_tab_id(value: Option<&str>, expected: &str) -> Result<(), HerdrError> {
-    if let Some(value) = value
-        && validated_tab_id(value)? != expected
+fn validate_agent_handle(agent: &AgentHandle) -> Result<(), HerdrError> {
+    validate_agent_name(agent.name())?;
+    let workspace_id =
+        validated_workspace_id(agent.workspace_id()).map_err(|_| HerdrError::InvalidInput)?;
+    validated_pane_id_for_workspace(agent.pane_id(), &workspace_id)
+        .map_err(|_| HerdrError::InvalidInput)?;
+    Ok(())
+}
+
+fn validate_report_binding(value: &str) -> Result<(), HerdrError> {
+    if value.is_empty()
+        || value.len() > MAX_RESPONSE_ID_BYTES
+        || !value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        || !value
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
     {
-        return Err(HerdrError::UnexpectedResponse);
+        return Err(HerdrError::InvalidInput);
     }
     Ok(())
 }
@@ -895,6 +1568,14 @@ mod tests {
     use crate::agent_report::{AgentOutcome, ValidationStatus};
     use serde_json::json;
     use std::collections::VecDeque;
+    #[cfg(unix)]
+    use std::io::{Read, Write};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::os::unix::net::UnixListener;
+    #[cfg(unix)]
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const SESSION: &str = "nagi-herdr-test";
     const SOCKET: &str = "/synthetic/herdr.sock";
@@ -904,27 +1585,25 @@ mod tests {
     const AGENT_NAME: &str = "codex";
 
     struct FakeCli {
-        responses: VecDeque<Result<TransportResponse, TransportError>>,
+        responses: VecDeque<Result<Vec<u8>, TransportError>>,
         requests: Vec<Vec<String>>,
     }
 
     impl FakeCli {
-        fn new(
-            responses: impl IntoIterator<Item = Result<TransportResponse, TransportError>>,
-        ) -> Self {
+        fn new(responses: impl IntoIterator<Item = Result<Vec<u8>, TransportError>>) -> Self {
             Self {
                 responses: responses.into_iter().collect(),
                 requests: Vec::new(),
             }
         }
 
-        fn response(value: serde_json::Value) -> Result<TransportResponse, TransportError> {
-            TransportResponse::from_json(&value.to_string())
+        fn response(value: serde_json::Value) -> Result<Vec<u8>, TransportError> {
+            Ok(value.to_string().into_bytes())
         }
     }
 
     impl CliTransport for FakeCli {
-        fn run(&mut self, request: &CliRequest) -> Result<TransportResponse, TransportError> {
+        fn run(&mut self, request: &CliRequest) -> Result<Vec<u8>, TransportError> {
             self.requests.push(request.args().to_vec());
             self.responses
                 .pop_front()
@@ -933,7 +1612,7 @@ mod tests {
     }
 
     struct FakeSocket {
-        response: Result<TransportResponse, TransportError>,
+        response: Result<Vec<u8>, TransportError>,
         path: Option<PathBuf>,
         request: Option<Vec<u8>>,
     }
@@ -943,7 +1622,7 @@ mod tests {
             &mut self,
             socket_path: &Path,
             request: &[u8],
-        ) -> Result<TransportResponse, TransportError> {
+        ) -> Result<Vec<u8>, TransportError> {
             self.path = Some(socket_path.to_owned());
             self.request = Some(request.to_vec());
             std::mem::replace(&mut self.response, Err(TransportError::Unavailable))
@@ -1020,8 +1699,8 @@ mod tests {
     }
 
     fn runner(
-        cli_responses: impl IntoIterator<Item = Result<TransportResponse, TransportError>>,
-        socket_response: Result<TransportResponse, TransportError>,
+        cli_responses: impl IntoIterator<Item = Result<Vec<u8>, TransportError>>,
+        socket_response: Result<Vec<u8>, TransportError>,
     ) -> HerdrCodexRunner<FakeCli, FakeSocket> {
         HerdrCodexRunner::new(
             FakeCli::new(cli_responses),
@@ -1140,10 +1819,7 @@ mod tests {
             workspace_id: WORKSPACE_ID.to_owned(),
             pane_id: PANE_ID.to_owned(),
         });
-        assert_eq!(
-            result,
-            Err(HerdrError::UnsupportedOperation(AgentOperation::Resume))
-        );
+        assert_eq!(result, Err(HerdrError::UnsupportedOperation));
         assert!(runner.cli.requests.is_empty());
     }
 
@@ -1160,19 +1836,138 @@ mod tests {
         });
         let mut runner = runner([], Err(TransportError::Unavailable));
         let report = runner
-            .collect_report(&report.to_string())
+            .collect_report("attempt-1", "session-1", &report.to_string())
             .expect("strict report");
         assert_eq!(report.outcome(), AgentOutcome::Done);
         assert_eq!(report.validation_status(), ValidationStatus::Passed);
         assert_eq!(
-            runner.collect_report("{\"outcome\":\"done\"}"),
+            runner.collect_report("attempt-1", "session-1", "{\"outcome\":\"done\"}"),
             Err(HerdrError::InvalidReport)
         );
     }
 
     #[test]
+    fn report_binding_requires_exact_caller_refs_and_backend() {
+        let report = json!({
+            "schemaVersion": 1,
+            "attemptId": "attempt-1",
+            "backend": BACKEND,
+            "agentSessionRef": "session-1",
+            "outcome": "continue",
+            "validation": {"status": "not_run"},
+            "summary": "synthetic observation"
+        })
+        .to_string();
+        let mut runner = runner([], Err(TransportError::Unavailable));
+        assert_eq!(
+            runner.collect_report("attempt-2", "session-1", &report),
+            Err(HerdrError::ReportBindingMismatch)
+        );
+        assert_eq!(
+            runner.collect_report("attempt-1", "session-2", &report),
+            Err(HerdrError::ReportBindingMismatch)
+        );
+        assert_eq!(
+            runner.collect_report("bad ref", "session-1", &report),
+            Err(HerdrError::InvalidInput)
+        );
+        let wrong_backend = report.replace(BACKEND, "other-backend");
+        assert_eq!(
+            runner.collect_report("attempt-1", "session-1", &wrong_backend),
+            Err(HerdrError::BackendMismatch)
+        );
+    }
+
+    #[test]
+    fn workspace_response_requires_and_cross_binds_all_resource_ids() {
+        let missing_explicit_fields = envelope(
+            "cli:workspace:create",
+            json!({
+                "type": "workspace_created",
+                "workspace": {"workspace_id": WORKSPACE_ID},
+                "tab": {"tab_id": TAB_ID},
+                "root_pane": {"pane_id": PANE_ID}
+            }),
+        );
+        let mut missing_runner = runner(
+            [FakeCli::response(missing_explicit_fields)],
+            Err(TransportError::Unavailable),
+        );
+        assert_eq!(
+            missing_runner.workspace_create(Path::new("/synthetic/workspace"), "synthetic"),
+            Err(HerdrError::MalformedResponse)
+        );
+
+        let mismatched_tab = envelope(
+            "cli:workspace:create",
+            json!({
+                "type": "workspace_created",
+                "workspace": {"workspace_id": WORKSPACE_ID},
+                "tab": {"tab_id": "w2:t1", "workspace_id": WORKSPACE_ID},
+                "root_pane": {
+                    "pane_id": PANE_ID,
+                    "workspace_id": WORKSPACE_ID,
+                    "tab_id": "w2:t1"
+                }
+            }),
+        );
+        let mut tab_runner = runner(
+            [FakeCli::response(mismatched_tab)],
+            Err(TransportError::Unavailable),
+        );
+        assert_eq!(
+            tab_runner.workspace_create(Path::new("/synthetic/workspace"), "synthetic"),
+            Err(HerdrError::UnexpectedResponse)
+        );
+
+        let mismatched_pane = envelope(
+            "cli:workspace:create",
+            json!({
+                "type": "workspace_created",
+                "workspace": {"workspace_id": WORKSPACE_ID},
+                "tab": {"tab_id": TAB_ID, "workspace_id": WORKSPACE_ID},
+                "root_pane": {
+                    "pane_id": "w2:p1",
+                    "workspace_id": WORKSPACE_ID,
+                    "tab_id": TAB_ID
+                }
+            }),
+        );
+        let mut pane_runner = runner(
+            [FakeCli::response(mismatched_pane)],
+            Err(TransportError::Unavailable),
+        );
+        assert_eq!(
+            pane_runner.workspace_create(Path::new("/synthetic/workspace"), "synthetic"),
+            Err(HerdrError::UnexpectedResponse)
+        );
+
+        let mismatched_pane_tab = envelope(
+            "cli:workspace:create",
+            json!({
+                "type": "workspace_created",
+                "workspace": {"workspace_id": WORKSPACE_ID},
+                "tab": {"tab_id": TAB_ID, "workspace_id": WORKSPACE_ID},
+                "root_pane": {
+                    "pane_id": PANE_ID,
+                    "workspace_id": WORKSPACE_ID,
+                    "tab_id": "w1:t2"
+                }
+            }),
+        );
+        let mut pane_tab_runner = runner(
+            [FakeCli::response(mismatched_pane_tab)],
+            Err(TransportError::Unavailable),
+        );
+        assert_eq!(
+            pane_tab_runner.workspace_create(Path::new("/synthetic/workspace"), "synthetic"),
+            Err(HerdrError::UnexpectedResponse)
+        );
+    }
+
+    #[test]
     fn malformed_and_oversized_transport_output_fails_closed_without_payload_in_error() {
-        let malformed = TransportResponse::from_json("{\"id\":\"x\",\"result\":null}");
+        let malformed = Ok(br#"{"id":"x","result":null}"#.to_vec());
         let mut malformed_runner = runner([malformed], Err(TransportError::Unavailable));
         let error = malformed_runner
             .workspace_create(Path::new("/synthetic/workspace"), "synthetic")
@@ -1180,9 +1975,8 @@ mod tests {
         assert_eq!(error, HerdrError::MalformedResponse);
         assert!(!error.to_string().contains("synthetic"));
 
-        let oversized = TransportResponse::from_json(&"x".repeat(MAX_CLI_RESPONSE_BYTES + 1))
-            .expect("transport response uses the socket bound");
-        let mut oversized_runner = runner([Ok(oversized)], Err(TransportError::Unavailable));
+        let oversized = Ok(vec![b'x'; MAX_CLI_RESPONSE_BYTES + 1]);
+        let mut oversized_runner = runner([oversized], Err(TransportError::Unavailable));
         assert_eq!(
             oversized_runner.workspace_create(Path::new("/synthetic/workspace"), "synthetic"),
             Err(HerdrError::Transport(TransportError::OutputTooLarge))
@@ -1208,8 +2002,213 @@ mod tests {
     }
 
     impl FakeSocket {
-        fn new_response(value: serde_json::Value) -> Result<TransportResponse, TransportError> {
-            TransportResponse::from_json(&value.to_string())
+        fn new_response(value: serde_json::Value) -> Result<Vec<u8>, TransportError> {
+            Ok(value.to_string().into_bytes())
         }
+    }
+
+    #[cfg(unix)]
+    struct PrivateRuntime {
+        root: PathBuf,
+        config: HerdrProcessConfig,
+    }
+
+    #[cfg(unix)]
+    impl PrivateRuntime {
+        fn new() -> Self {
+            static NEXT_RUNTIME: AtomicUsize = AtomicUsize::new(0);
+            let root = std::env::current_dir()
+                .expect("test current directory")
+                .join(format!(
+                    ".nagi-herdr-test-{}-{}",
+                    std::process::id(),
+                    NEXT_RUNTIME.fetch_add(1, Ordering::Relaxed)
+                ));
+            std::fs::create_dir(&root).expect("private test root");
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+                .expect("private test root mode");
+            let home = root.join("home");
+            let tmpdir = root.join("tmp");
+            std::fs::create_dir(&home).expect("private test home");
+            std::fs::create_dir(&tmpdir).expect("private test tmpdir");
+            for directory in [&home, &tmpdir] {
+                std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+                    .expect("private test directory mode");
+            }
+            let config_path = root.join("config.toml");
+            std::fs::write(&config_path, b"# synthetic\n").expect("private test config");
+            std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600))
+                .expect("private test config mode");
+            let executable = root.join("herdr");
+            std::fs::write(
+                &executable,
+                b"#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'herdr 0.8.2\\n'; else printf '%s|%s|%s|%s|%s\\n' \"$HOME\" \"$TMPDIR\" \"$HERDR_CONFIG_PATH\" \"$HERDR_SESSION\" \"$PATH\"; fi\n",
+            )
+            .expect("fake Herdr executable");
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+                .expect("fake Herdr executable mode");
+            let runtime = HerdrRuntime::new(SESSION, root.join("herdr.sock"))
+                .expect("valid production test runtime");
+            let config = HerdrProcessConfig::new(executable, home, tmpdir, config_path, runtime)
+                .expect("valid production test config");
+            Self { root, config }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for PrivateRuntime {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn production_constructor_verifies_version_and_uses_isolated_process_environment() {
+        let runtime = PrivateRuntime::new();
+        let mut cli = HerdrCliTransport::new(runtime.config.clone()).expect("verified fake Herdr");
+        let request = CliRequest {
+            args: vec!["--session".into(), SESSION.into(), "probe".into()],
+        };
+        let output = cli.run(&request).expect("bounded process response");
+        let output = String::from_utf8(output).expect("synthetic environment output");
+        assert!(output.contains("|/usr/bin:/bin\n"));
+        assert!(output.contains(&format!("{}|", runtime.config.home.display())));
+        assert!(output.contains(&format!("|{}|", runtime.config.tmpdir.display())));
+        assert!(output.contains(&format!("|{}|", runtime.config.config_path.display())));
+        assert!(output.contains(&format!("|{}|", SESSION)));
+        let _runner = ProductionHerdrCodexRunner::connect(runtime.config.clone())
+            .expect("production runner constructor");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn production_constructor_rejects_wrong_herdr_version() {
+        let runtime = PrivateRuntime::new();
+        std::fs::write(
+            &runtime.config.executable,
+            b"#!/bin/sh\nprintf 'herdr 0.8.1\\n'\n",
+        )
+        .expect("replace synthetic executable");
+        std::fs::set_permissions(
+            &runtime.config.executable,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("restore synthetic executable mode");
+        assert!(matches!(
+            HerdrCliTransport::new(runtime.config.clone()),
+            Err(HerdrError::VersionMismatch)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_process_supervision_kills_on_timeout_output_limit_and_failure() {
+        let mut timeout = std::process::Command::new("/bin/sh");
+        timeout
+            .args(["-c", "sleep 5"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        assert_eq!(
+            run_bounded_command(timeout, std::time::Duration::from_millis(20), 1024),
+            Err(TransportError::TimedOut)
+        );
+
+        let mut output = std::process::Command::new("/usr/bin/yes");
+        output
+            .arg("x")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        assert_eq!(
+            run_bounded_command(output, std::time::Duration::from_secs(1), 1024),
+            Err(TransportError::OutputTooLarge)
+        );
+
+        let mut failure = std::process::Command::new("/bin/sh");
+        failure
+            .args(["-c", "exit 7"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        assert_eq!(
+            run_bounded_command(failure, std::time::Duration::from_secs(1), 1024),
+            Err(TransportError::Failed)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_socket_transport_reads_one_bounded_response_line() {
+        let runtime = PrivateRuntime::new();
+        let socket_path = runtime.root.join("snapshot.sock");
+        let listener = UnixListener::bind(&socket_path).expect("synthetic Unix socket");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("socket client");
+            let mut request = vec![0_u8; SNAPSHOT_REQUEST.len()];
+            stream.read_exact(&mut request).expect("snapshot request");
+            assert_eq!(request, SNAPSHOT_REQUEST);
+            stream
+                .write_all(b"{\"id\":\"nagi-observe\",\"result\":{}}\n")
+                .expect("snapshot response");
+        });
+        let mut socket = UnixSocketTransport::with_timeout(Duration::from_secs(1))
+            .expect("bounded socket timeout");
+        let response = socket
+            .snapshot(&socket_path, SNAPSHOT_REQUEST)
+            .expect("snapshot response");
+        server.join().expect("socket server");
+        assert_eq!(response, b"{\"id\":\"nagi-observe\",\"result\":{}}\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_socket_transport_fails_closed_on_missing_line_timeout_and_oversize() {
+        let runtime = PrivateRuntime::new();
+        let no_line_path = runtime.root.join("no-line.sock");
+        let listener = UnixListener::bind(&no_line_path).expect("no-line socket");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("socket client");
+            let mut request = [0_u8; 1];
+            let _ = stream.read(&mut request);
+            stream.write_all(b"{}").expect("partial response");
+        });
+        let mut socket = UnixSocketTransport::with_timeout(Duration::from_secs(1))
+            .expect("bounded socket timeout");
+        assert_eq!(
+            socket.snapshot(&no_line_path, b"x\n"),
+            Err(TransportError::Failed)
+        );
+        server.join().expect("no-line server");
+
+        let timeout_path = runtime.root.join("timeout.sock");
+        let listener = UnixListener::bind(&timeout_path).expect("timeout socket");
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("socket client");
+            std::thread::sleep(Duration::from_millis(100));
+        });
+        let mut socket = UnixSocketTransport::with_timeout(Duration::from_millis(20))
+            .expect("short bounded socket timeout");
+        assert_eq!(
+            socket.snapshot(&timeout_path, b"x\n"),
+            Err(TransportError::TimedOut)
+        );
+        server.join().expect("timeout server");
+
+        let oversized_path = runtime.root.join("oversized.sock");
+        let listener = UnixListener::bind(&oversized_path).expect("oversized socket");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("socket client");
+            let mut request = [0_u8; 1];
+            let _ = stream.read(&mut request);
+            let mut response = vec![b'x'; MAX_SOCKET_RESPONSE_BYTES + 1];
+            response.push(b'\n');
+            let _ = stream.write_all(&response);
+        });
+        let mut socket = UnixSocketTransport::with_timeout(Duration::from_secs(1))
+            .expect("bounded socket timeout");
+        assert_eq!(
+            socket.snapshot(&oversized_path, b"x\n"),
+            Err(TransportError::OutputTooLarge)
+        );
+        server.join().expect("oversized server");
     }
 }

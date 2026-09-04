@@ -60,6 +60,12 @@ The spike covers:
   typed unsupported/deferred result; session restore remains part of the
   later observation and recovery gate. Stopping delegates to Herdr's
   workspace close operation and never kills a vendor process directly.
+  The production CLI transport receives an explicitly selected Herdr
+  executable and private `HOME`, `TMPDIR`, and configuration paths, clears the
+  inherited environment, verifies the exact `herdr 0.8.2` version, and bounds
+  process output and lifetime. A prompt is necessarily passed as one Herdr
+  CLI argv element, so a local process-list observer may see it while that
+  short-lived command runs; Nagi never logs or persists the argv.
 - Narrow hooks that report session start, restore, and exit; semantic lifecycle
   state when supported; stable session references; and a candidate,
   machine-readable result report, including a hook-validated report when
