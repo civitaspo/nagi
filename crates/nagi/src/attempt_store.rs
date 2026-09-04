@@ -4,10 +4,14 @@
 //! prompt, terminal output, provider payload, credential, or machine path as
 //! row data. External integrations remain responsible for producing the
 //! bounded values accepted here.
+//!
+//! Opening binds the database's checked Unix device/inode across the open and
+//! validates existing WAL/SHM sidecars as owner-only regular files. This is a
+//! bounded defense within rusqlite, not a race-free path proof: a same-UID
+//! actor can still replace a parent or final path after those checks.
 
-use crate::agent_report::{AgentOutcome, AgentReport, ValidationStatus};
+use crate::agent_report::AgentReport;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params};
-use serde_json::{Map, Value, json};
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::path::{Component, Path, PathBuf};
@@ -267,13 +271,20 @@ impl AttemptStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, AttemptStoreError> {
         let path = path.as_ref().to_owned();
         validate_database_path(&path)?;
-        ensure_database_file(&path)?;
+        let identity = ensure_database_file(&path)?;
+        validate_sidecars(&path, identity)?;
         let mut connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE)
             .map_err(|_| AttemptStoreError::Database)?;
-        validate_database_file(&path)?;
+        if validate_database_file(&path)? != identity {
+            return Err(AttemptStoreError::UnsafePath);
+        }
+        validate_sidecars(&path, identity)?;
         configure_connection(&mut connection)?;
         initialize_schema(&mut connection)?;
-        validate_database_file(&path)?;
+        if validate_database_file(&path)? != identity {
+            return Err(AttemptStoreError::UnsafePath);
+        }
+        validate_sidecars(&path, identity)?;
         Ok(Self { connection })
     }
 
@@ -364,19 +375,16 @@ impl AttemptStore {
 
     /// Records one observation with a strictly increasing revision.
     /// Same-revision identical observations are idempotent; conflicting ones
-    /// fail closed. Only observation states can be supplied.
+    /// fail closed. Only observation states can be supplied; the workspace and
+    /// agent bindings established at start remain unchanged.
     pub fn record_observation(
         &mut self,
         attempt_id: &str,
         state: AttemptState,
-        workspace_ref: Option<&str>,
-        agent_ref: Option<&str>,
         revision: u64,
         now_ms: i64,
     ) -> Result<AttemptRecord, AttemptStoreError> {
         validate_attempt_id(attempt_id)?;
-        validate_optional_ref(workspace_ref)?;
-        validate_optional_ref(agent_ref)?;
         let revision = revision_to_sql(revision)?;
         validate_timestamp(now_ms)?;
         if !matches!(
@@ -395,10 +403,7 @@ impl AttemptStore {
             return Err(AttemptStoreError::StaleRevision);
         }
         if revision == current.observation_revision as i64 {
-            if current.state == state
-                && current.workspace_ref.as_deref() == workspace_ref
-                && current.agent_ref.as_deref() == agent_ref
-            {
+            if current.state == state {
                 transaction
                     .commit()
                     .map_err(|_| AttemptStoreError::Database)?;
@@ -414,15 +419,8 @@ impl AttemptStore {
         }
         transaction
             .execute(
-                "UPDATE attempts SET lifecycle = ?1, workspace_ref = ?2, agent_ref = ?3, observation_revision = ?4, updated_at_ms = ?5 WHERE attempt_id = ?6",
-                params![
-                    state.as_str(),
-                    workspace_ref,
-                    agent_ref,
-                    revision,
-                    now_ms,
-                    attempt_id
-                ],
+                "UPDATE attempts SET lifecycle = ?1, observation_revision = ?2, updated_at_ms = ?3 WHERE attempt_id = ?4",
+                params![state.as_str(), revision, now_ms, attempt_id],
             )
             .map_err(|_| AttemptStoreError::Database)?;
         let record = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::Database)?;
@@ -444,7 +442,9 @@ impl AttemptStore {
         validate_timestamp(now_ms)?;
         let report =
             AgentReport::parse_json(report_json).map_err(|_| AttemptStoreError::InvalidReport)?;
-        let normalized_report = canonical_report_json(&report)?;
+        let normalized_report = report
+            .canonical_json()
+            .map_err(|_| AttemptStoreError::InvalidReport)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -456,6 +456,12 @@ impl AttemptStore {
         }
         if report.backend() != current.backend.as_str() {
             return Err(AttemptStoreError::BackendMismatch);
+        }
+        let Some(agent_ref) = current.agent_ref.as_deref() else {
+            return Err(AttemptStoreError::ReportBindingMismatch);
+        };
+        if report.agent_session_ref() != agent_ref {
+            return Err(AttemptStoreError::ReportBindingMismatch);
         }
         if current.state == AttemptState::ReportReady {
             if current.report_json.as_deref() == Some(normalized_report.as_str()) {
@@ -568,27 +574,41 @@ fn decode_raw(raw: RawAttempt) -> Result<AttemptRecord, AttemptStoreError> {
     if raw.updated_at_ms < raw.created_at_ms {
         return Err(AttemptStoreError::Database);
     }
-    validate_optional_ref(raw.workspace_ref.as_deref()).map_err(|_| AttemptStoreError::Database)?;
-    validate_optional_ref(raw.agent_ref.as_deref()).map_err(|_| AttemptStoreError::Database)?;
+    if let Some(workspace_ref) = raw.workspace_ref.as_deref() {
+        validate_opaque_ref(workspace_ref).map_err(|_| AttemptStoreError::Database)?;
+    }
+    if let Some(agent_ref) = raw.agent_ref.as_deref() {
+        validate_opaque_ref(agent_ref).map_err(|_| AttemptStoreError::Database)?;
+    }
     let report_json = match raw.report_json {
         Some(report_json) => {
             let report =
                 AgentReport::parse_json(&report_json).map_err(|_| AttemptStoreError::Database)?;
-            if report.attempt_id() != raw.attempt_id || report.backend() != raw.backend {
+            if report.attempt_id() != raw.attempt_id
+                || report.backend() != raw.backend
+                || raw.agent_ref.as_deref() != Some(report.agent_session_ref())
+            {
                 return Err(AttemptStoreError::Database);
             }
-            Some(canonical_report_json(&report).map_err(|_| AttemptStoreError::Database)?)
+            Some(
+                report
+                    .canonical_json()
+                    .map_err(|_| AttemptStoreError::Database)?,
+            )
         }
         None => None,
     };
-    if (state == AttemptState::ReportReady) != report_json.is_some() {
-        return Err(AttemptStoreError::Database);
-    }
-    if matches!(
-        state,
-        AttemptState::Observed | AttemptState::Blocked | AttemptState::Failed
-    ) && observation_revision == 0
-    {
+    let refs_present = raw.workspace_ref.is_some() && raw.agent_ref.is_some();
+    let refs_absent = raw.workspace_ref.is_none() && raw.agent_ref.is_none();
+    let valid_lifecycle = match state {
+        AttemptState::Created => refs_absent && observation_revision == 0 && report_json.is_none(),
+        AttemptState::Running => refs_present && observation_revision == 0 && report_json.is_none(),
+        AttemptState::Observed | AttemptState::Blocked | AttemptState::Failed => {
+            refs_present && observation_revision > 0 && report_json.is_none()
+        }
+        AttemptState::ReportReady => refs_present && report_json.is_some(),
+    };
+    if !valid_lifecycle {
         return Err(AttemptStoreError::Database);
     }
     Ok(AttemptRecord {
@@ -603,48 +623,6 @@ fn decode_raw(raw: RawAttempt) -> Result<AttemptRecord, AttemptStoreError> {
         created_at_ms: raw.created_at_ms,
         updated_at_ms: raw.updated_at_ms,
     })
-}
-
-fn canonical_report_json(report: &AgentReport) -> Result<String, AttemptStoreError> {
-    let mut object = Map::new();
-    object.insert("schemaVersion".to_owned(), json!(report.schema_version()));
-    object.insert("attemptId".to_owned(), json!(report.attempt_id()));
-    object.insert("backend".to_owned(), json!(report.backend()));
-    object.insert(
-        "agentSessionRef".to_owned(),
-        json!(report.agent_session_ref()),
-    );
-    object.insert("outcome".to_owned(), json!(outcome_text(report.outcome())));
-    object.insert(
-        "validation".to_owned(),
-        json!({"status": validation_text(report.validation_status())}),
-    );
-    if let Some(commit_ref) = report.commit_ref() {
-        object.insert("commitRef".to_owned(), json!(commit_ref));
-    }
-    if let Some(pull_request_ref) = report.pull_request_ref() {
-        object.insert("pullRequestRef".to_owned(), json!(pull_request_ref));
-    }
-    object.insert("summary".to_owned(), json!(report.summary()));
-    serde_json::to_string(&Value::Object(object)).map_err(|_| AttemptStoreError::Database)
-}
-
-const fn outcome_text(outcome: AgentOutcome) -> &'static str {
-    match outcome {
-        AgentOutcome::Continue => "continue",
-        AgentOutcome::Review => "review",
-        AgentOutcome::Blocked => "blocked",
-        AgentOutcome::Done => "done",
-        AgentOutcome::Failed => "failed",
-    }
-}
-
-const fn validation_text(status: ValidationStatus) -> &'static str {
-    match status {
-        ValidationStatus::NotRun => "not_run",
-        ValidationStatus::Passed => "passed",
-        ValidationStatus::Failed => "failed",
-    }
 }
 
 fn configure_connection(connection: &mut Connection) -> Result<(), AttemptStoreError> {
@@ -805,7 +783,35 @@ fn validate_directory_metadata(metadata: &fs::Metadata) -> Result<(), AttemptSto
     Ok(())
 }
 
-fn ensure_database_file(path: &Path) -> Result<(), AttemptStoreError> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DatabaseIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    owner: u32,
+}
+
+impl DatabaseIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                owner: metadata.uid(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = metadata;
+            Self {}
+        }
+    }
+}
+
+fn ensure_database_file(path: &Path) -> Result<DatabaseIdentity, AttemptStoreError> {
     match fs::symlink_metadata(path) {
         Ok(_) => validate_database_file(path),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -824,7 +830,7 @@ fn ensure_database_file(path: &Path) -> Result<(), AttemptStoreError> {
     }
 }
 
-fn validate_database_file(path: &Path) -> Result<(), AttemptStoreError> {
+fn validate_database_file(path: &Path) -> Result<DatabaseIdentity, AttemptStoreError> {
     let metadata = fs::symlink_metadata(path).map_err(|_| AttemptStoreError::UnsafePath)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(AttemptStoreError::UnsafePath);
@@ -840,18 +846,55 @@ fn validate_database_file(path: &Path) -> Result<(), AttemptStoreError> {
             return Err(AttemptStoreError::UnsafePath);
         }
     }
+    Ok(DatabaseIdentity::from_metadata(&metadata))
+}
+
+fn validate_sidecars(
+    database_path: &Path,
+    database_identity: DatabaseIdentity,
+) -> Result<(), AttemptStoreError> {
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = sidecar_path(database_path, suffix);
+        match fs::symlink_metadata(sidecar) {
+            Ok(metadata) => validate_sidecar_metadata(&metadata, database_identity)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(AttemptStoreError::UnsafePath),
+        }
+    }
     Ok(())
+}
+
+fn validate_sidecar_metadata(
+    metadata: &fs::Metadata,
+    database_identity: DatabaseIdentity,
+) -> Result<(), AttemptStoreError> {
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(AttemptStoreError::UnsafePath);
+    }
+    #[cfg(unix)]
+    {
+        let mode = metadata.permissions().mode();
+        if metadata.uid() != database_identity.owner
+            || metadata.nlink() != 1
+            || mode & 0o777 != 0o600
+            || mode & 0o7000 != 0
+        {
+            return Err(AttemptStoreError::UnsafePath);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = database_identity;
+    Ok(())
+}
+
+fn sidecar_path(database_path: &Path, suffix: &str) -> PathBuf {
+    let mut sidecar = database_path.as_os_str().to_os_string();
+    sidecar.push(suffix);
+    PathBuf::from(sidecar)
 }
 
 fn validate_attempt_id(value: &str) -> Result<(), AttemptStoreError> {
     validate_opaque_ref(value)
-}
-
-fn validate_optional_ref(value: Option<&str>) -> Result<(), AttemptStoreError> {
-    if let Some(value) = value {
-        validate_opaque_ref(value)?;
-    }
-    Ok(())
 }
 
 fn validate_opaque_ref(value: &str) -> Result<(), AttemptStoreError> {
@@ -914,6 +957,7 @@ fn revision_to_sql(value: u64) -> Result<i64, AttemptStoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     const ISSUE_ID: &str = "01234567-89ab-cdef-0123-456789abcdef";
     const ATTEMPT_ID: &str = "attempt-1";
@@ -934,14 +978,7 @@ mod tests {
                 .mark_started(ATTEMPT_ID, "workspace-1", "agent-1", 200)
                 .expect("start");
             let record = store
-                .record_observation(
-                    ATTEMPT_ID,
-                    AttemptState::Observed,
-                    Some("workspace-1"),
-                    Some("agent-1"),
-                    1,
-                    300,
-                )
+                .record_observation(ATTEMPT_ID, AttemptState::Observed, 1, 300)
                 .expect("observation");
             assert_eq!(record.state(), AttemptState::Observed);
         }
@@ -963,7 +1000,7 @@ mod tests {
             .create(ATTEMPT_ID, ISSUE_ID, AttemptBackend::HerdrCodex, 100)
             .expect("create");
         assert_eq!(
-            store.record_observation(ATTEMPT_ID, AttemptState::Observed, None, None, 1, 110),
+            store.record_observation(ATTEMPT_ID, AttemptState::Observed, 1, 110),
             Err(AttemptStoreError::InvalidTransition)
         );
         assert_eq!(
@@ -984,54 +1021,31 @@ mod tests {
             Err(AttemptStoreError::DuplicateConflict)
         );
         let first = store
-            .record_observation(
-                ATTEMPT_ID,
-                AttemptState::Observed,
-                Some("workspace-1"),
-                Some("agent-1"),
-                2,
-                130,
-            )
+            .record_observation(ATTEMPT_ID, AttemptState::Observed, 2, 130)
             .expect("first observation");
         assert_eq!(
-            store.record_observation(
-                ATTEMPT_ID,
-                AttemptState::Observed,
-                Some("workspace-1"),
-                Some("agent-1"),
-                1,
-                140,
-            ),
+            store.record_observation(ATTEMPT_ID, AttemptState::Observed, 1, 140,),
             Err(AttemptStoreError::StaleRevision)
         );
         let duplicate = store
-            .record_observation(
-                ATTEMPT_ID,
-                AttemptState::Observed,
-                Some("workspace-1"),
-                Some("agent-1"),
-                2,
-                140,
-            )
+            .record_observation(ATTEMPT_ID, AttemptState::Observed, 2, 140)
             .expect("exact duplicate");
         assert_eq!(duplicate, first);
         assert_eq!(
-            store.record_observation(
-                ATTEMPT_ID,
-                AttemptState::Blocked,
-                Some("workspace-1"),
-                Some("agent-1"),
-                2,
-                140,
-            ),
+            store.record_observation(ATTEMPT_ID, AttemptState::Blocked, 2, 140,),
             Err(AttemptStoreError::DuplicateConflict)
         );
+        let later = store
+            .record_observation(ATTEMPT_ID, AttemptState::Blocked, 3, 150)
+            .expect("higher revision");
+        assert_eq!(later.workspace_ref(), Some("workspace-1"));
+        assert_eq!(later.agent_ref(), Some("agent-1"));
         assert_eq!(
-            store.record_observation(ATTEMPT_ID, AttemptState::Failed, None, None, 1, 90),
+            store.record_observation(ATTEMPT_ID, AttemptState::Failed, 1, 90),
             Err(AttemptStoreError::StaleTimestamp)
         );
         assert_eq!(
-            store.mark_started(ATTEMPT_ID, "workspace-1", "agent-1", 140),
+            store.mark_started(ATTEMPT_ID, "workspace-1", "agent-1", 160),
             Err(AttemptStoreError::InvalidTransition)
         );
     }
@@ -1043,10 +1057,14 @@ mod tests {
         store
             .create(ATTEMPT_ID, ISSUE_ID, AttemptBackend::HerdrCursorAgent, 100)
             .expect("create");
+        let report = report_json(ATTEMPT_ID, "herdr+cursor-agent", "agent-1");
+        assert_eq!(
+            store.record_report(ATTEMPT_ID, &report, 105),
+            Err(AttemptStoreError::ReportBindingMismatch)
+        );
         store
             .mark_started(ATTEMPT_ID, "workspace-1", "agent-1", 110)
             .expect("start");
-        let report = report_json(ATTEMPT_ID, "herdr+cursor-agent");
         let record = store
             .record_report(ATTEMPT_ID, &report, 120)
             .expect("report");
@@ -1056,18 +1074,23 @@ mod tests {
             store.record_report("attempt-2", &report, 130),
             Err(AttemptStoreError::NotFound)
         );
-        let wrong_backend = report_json(ATTEMPT_ID, "herdr+codex");
+        let wrong_backend = report_json(ATTEMPT_ID, "herdr+codex", "agent-1");
         assert_eq!(
             store.record_report(ATTEMPT_ID, &wrong_backend, 130),
             Err(AttemptStoreError::BackendMismatch)
         );
-        let wrong_binding = report_json("attempt-2", "herdr+cursor-agent");
+        let wrong_binding = report_json("attempt-2", "herdr+cursor-agent", "agent-1");
         assert_eq!(
             store.record_report(ATTEMPT_ID, &wrong_binding, 130),
             Err(AttemptStoreError::ReportBindingMismatch)
         );
+        let wrong_session = report_json(ATTEMPT_ID, "herdr+cursor-agent", "agent-2");
         assert_eq!(
-            store.record_observation(ATTEMPT_ID, AttemptState::Observed, None, None, 1, 130),
+            store.record_report(ATTEMPT_ID, &wrong_session, 130),
+            Err(AttemptStoreError::ReportBindingMismatch)
+        );
+        assert_eq!(
+            store.record_observation(ATTEMPT_ID, AttemptState::Observed, 1, 130),
             Err(AttemptStoreError::InvalidTransition)
         );
     }
@@ -1086,7 +1109,7 @@ mod tests {
             .mark_started("attempt-2", "workspace-2", "agent-2", 3)
             .expect("start two");
         store
-            .record_observation("attempt-2", AttemptState::Failed, None, None, 1, 4)
+            .record_observation("attempt-2", AttemptState::Failed, 1, 4)
             .expect("fail two");
         let records = store.list_nonterminal().expect("list");
         assert_eq!(records.len(), 1);
@@ -1106,6 +1129,42 @@ mod tests {
             & 0o777;
         assert_eq!(mode, 0o600);
         drop(store);
+        let identity = validate_database_file(&database.path).expect("database identity");
+        let store = AttemptStore::open(&database.path).expect("reopen store");
+        drop(store);
+        assert_eq!(
+            validate_database_file(&database.path).expect("database identity"),
+            identity
+        );
+
+        let wal = sidecar_path(&database.path, "-wal");
+        fs::write(&wal, b"synthetic").expect("wal sidecar");
+        fs::set_permissions(&wal, fs::Permissions::from_mode(0o644)).expect("unsafe wal mode");
+        assert_eq!(
+            AttemptStore::open(&database.path).err(),
+            Some(AttemptStoreError::UnsafePath)
+        );
+        fs::remove_file(&wal).expect("remove wal sidecar");
+
+        let wal_target = database.root.join("wal-target");
+        fs::write(&wal_target, b"synthetic").expect("wal target");
+        fs::set_permissions(&wal_target, fs::Permissions::from_mode(0o600))
+            .expect("wal target mode");
+        std::os::unix::fs::symlink(&wal_target, &wal).expect("wal symlink");
+        assert_eq!(
+            AttemptStore::open(&database.path).err(),
+            Some(AttemptStoreError::UnsafePath)
+        );
+        fs::remove_file(&wal).expect("remove wal symlink");
+
+        fs::write(&wal, b"synthetic").expect("wal sidecar");
+        fs::set_permissions(&wal, fs::Permissions::from_mode(0o600)).expect("wal sidecar mode");
+        let wal_hardlink = database.root.join("wal-hardlink");
+        fs::hard_link(&wal, &wal_hardlink).expect("wal hardlink");
+        assert_eq!(
+            AttemptStore::open(&database.path).err(),
+            Some(AttemptStoreError::UnsafePath)
+        );
 
         let unsafe_path = database.root.join("unsafe.db");
         fs::write(&unsafe_path, b"synthetic").expect("unsafe file");
@@ -1144,6 +1203,112 @@ mod tests {
     }
 
     #[test]
+    fn decoded_rows_require_the_complete_lifecycle_matrix() {
+        assert_corrupt_row(
+            |_| {},
+            |connection| {
+                connection
+                    .execute("UPDATE attempts SET workspace_ref = 'workspace-1'", [])
+                    .expect("corrupt created refs");
+            },
+        );
+        assert_corrupt_row(
+            |store| {
+                store
+                    .mark_started(ATTEMPT_ID, "workspace-1", "agent-1", 2)
+                    .expect("start");
+            },
+            |connection| {
+                connection
+                    .execute("UPDATE attempts SET agent_ref = NULL", [])
+                    .expect("corrupt running refs");
+            },
+        );
+        assert_corrupt_row(
+            |store| {
+                store
+                    .mark_started(ATTEMPT_ID, "workspace-1", "agent-1", 2)
+                    .expect("start");
+                store
+                    .record_observation(ATTEMPT_ID, AttemptState::Observed, 1, 3)
+                    .expect("observe");
+            },
+            |connection| {
+                connection
+                    .execute("UPDATE attempts SET workspace_ref = NULL", [])
+                    .expect("corrupt observed refs");
+            },
+        );
+        assert_corrupt_row(
+            |store| {
+                store
+                    .mark_started(ATTEMPT_ID, "workspace-1", "agent-1", 2)
+                    .expect("start");
+                store
+                    .record_observation(ATTEMPT_ID, AttemptState::Observed, 1, 3)
+                    .expect("observe");
+            },
+            |connection| {
+                connection
+                    .execute("UPDATE attempts SET observation_revision = 0", [])
+                    .expect("corrupt observed revision");
+            },
+        );
+        let report = report_json(ATTEMPT_ID, "herdr+codex", "agent-1");
+        assert_corrupt_row(
+            |store| {
+                store
+                    .mark_started(ATTEMPT_ID, "workspace-1", "agent-1", 2)
+                    .expect("start");
+            },
+            |connection| {
+                connection
+                    .execute(
+                        "UPDATE attempts SET lifecycle = 'observed', observation_revision = 1, report_json = ?1",
+                        params![report],
+                    )
+                    .expect("corrupt observed report");
+            },
+        );
+        let report = report_json(ATTEMPT_ID, "herdr+codex", "agent-1");
+        assert_corrupt_row(
+            |store| {
+                store
+                    .mark_started(ATTEMPT_ID, "workspace-1", "agent-1", 2)
+                    .expect("start");
+                store.record_report(ATTEMPT_ID, &report, 3).expect("report");
+            },
+            |connection| {
+                connection
+                    .execute("UPDATE attempts SET agent_ref = NULL", [])
+                    .expect("corrupt report-ready refs");
+            },
+        );
+        let report = report_json(ATTEMPT_ID, "herdr+codex", "agent-1");
+        assert_corrupt_row(
+            |store| {
+                store
+                    .mark_started(ATTEMPT_ID, "workspace-1", "agent-1", 2)
+                    .expect("start");
+                store.record_report(ATTEMPT_ID, &report, 3).expect("report");
+            },
+            |connection| {
+                connection
+                    .execute("UPDATE attempts SET report_json = NULL", [])
+                    .expect("corrupt report-ready report");
+            },
+        );
+        assert_corrupt_row(
+            |_| {},
+            |connection| {
+                connection
+                    .execute("UPDATE attempts SET updated_at_ms = 0", [])
+                    .expect("corrupt timestamps");
+            },
+        );
+    }
+
+    #[test]
     fn identifiers_paths_and_debug_do_not_retain_plaintext_sentinel() {
         let database = TestDatabase::new();
         let mut store = AttemptStore::open(&database.path).expect("open store");
@@ -1159,17 +1324,11 @@ mod tests {
             .mark_started(ATTEMPT_ID, "workspace-1", "agent-1", 2)
             .expect("start");
         let record = store
-            .record_observation(
-                ATTEMPT_ID,
-                AttemptState::Observed,
-                Some("workspace-1"),
-                Some("agent-1"),
-                1,
-                3,
-            )
+            .record_observation(ATTEMPT_ID, AttemptState::Observed, 1, 3)
             .expect("observation");
         let debug = format!("{store:?} {record:?}");
         assert!(!debug.contains(SENTINEL));
+        assert_eq!(debug.matches("schema_version").count(), 1);
         drop(store);
         for suffix in ["", "-wal", "-shm"] {
             let path = PathBuf::from(format!("{}{}", database.path.display(), suffix));
@@ -1179,17 +1338,40 @@ mod tests {
         }
     }
 
-    fn report_json(attempt_id: &str, backend: &str) -> String {
+    fn report_json(attempt_id: &str, backend: &str, agent_session_ref: &str) -> String {
         json!({
             "schemaVersion": 1,
             "attemptId": attempt_id,
             "backend": backend,
-            "agentSessionRef": "session-1",
+            "agentSessionRef": agent_session_ref,
             "outcome": "continue",
             "validation": {"status": "not_run"},
             "summary": "synthetic observation"
         })
         .to_string()
+    }
+
+    fn assert_corrupt_row<Setup, Corrupt>(setup: Setup, corrupt: Corrupt)
+    where
+        Setup: FnOnce(&mut AttemptStore),
+        Corrupt: FnOnce(&Connection),
+    {
+        let database = TestDatabase::new();
+        {
+            let mut store = AttemptStore::open(&database.path).expect("open store");
+            store
+                .create(ATTEMPT_ID, ISSUE_ID, AttemptBackend::HerdrCodex, 1)
+                .expect("create");
+            setup(&mut store);
+        }
+        let connection = Connection::open(&database.path).expect("raw database");
+        corrupt(&connection);
+        drop(connection);
+        let store = AttemptStore::open(&database.path).expect("reopen store");
+        assert_eq!(
+            store.get(ATTEMPT_ID).err(),
+            Some(AttemptStoreError::Database)
+        );
     }
 
     struct TestDatabase {

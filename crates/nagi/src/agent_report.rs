@@ -11,7 +11,7 @@
 
 use std::fmt;
 
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// The only normalized agent report schema version currently accepted.
 pub const SCHEMA_VERSION: u8 = 1;
@@ -56,7 +56,7 @@ impl fmt::Display for AgentReportError {
 impl std::error::Error for AgentReportError {}
 
 /// The observed result of one agent attempt.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentOutcome {
     /// The attempt may continue.
@@ -72,7 +72,7 @@ pub enum AgentOutcome {
 }
 
 /// The bounded validation observation carried by a report.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ValidationStatus {
     /// No validation was run by the reporting backend.
@@ -104,7 +104,7 @@ pub struct AgentReport {
     summary: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WireAgentReport {
     schema_version: u8,
@@ -113,14 +113,22 @@ struct WireAgentReport {
     agent_session_ref: String,
     outcome: AgentOutcome,
     validation: WireValidation,
-    #[serde(default, deserialize_with = "deserialize_optional_string")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_string",
+        skip_serializing_if = "Option::is_none"
+    )]
     commit_ref: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_string")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_string",
+        skip_serializing_if = "Option::is_none"
+    )]
     pull_request_ref: Option<String>,
     summary: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WireValidation {
     status: ValidationStatus,
@@ -191,6 +199,24 @@ impl AgentReport {
     /// Returns the bounded local-sensitive summary.
     pub fn summary(&self) -> &str {
         &self.summary
+    }
+
+    /// Serializes this validated report into the one stable normalized shape.
+    pub fn canonical_json(&self) -> Result<String, AgentReportError> {
+        serde_json::to_string(&WireAgentReport {
+            schema_version: self.schema_version,
+            attempt_id: self.attempt_id.clone(),
+            backend: self.backend.clone(),
+            agent_session_ref: self.agent_session_ref.clone(),
+            outcome: self.outcome,
+            validation: WireValidation {
+                status: self.validation,
+            },
+            commit_ref: self.commit_ref.clone(),
+            pull_request_ref: self.pull_request_ref.clone(),
+            summary: self.summary.clone(),
+        })
+        .map_err(|_| AgentReportError::Malformed)
     }
 
     fn from_wire(wire: WireAgentReport) -> Result<Self, AgentReportError> {
@@ -411,6 +437,16 @@ mod tests {
             AgentReport::parse_json(&null_value.to_string()),
             Err(AgentReportError::Malformed)
         ));
+    }
+
+    #[test]
+    fn canonical_json_round_trips_the_normalized_wire_shape() {
+        let report = AgentReport::parse_json(FIXTURE).expect("normalized report");
+        let canonical = report.canonical_json().expect("canonical report");
+        assert_eq!(
+            AgentReport::parse_json(&canonical).expect("canonical parses"),
+            report
+        );
     }
 
     #[test]
