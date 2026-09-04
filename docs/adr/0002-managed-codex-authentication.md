@@ -1,6 +1,6 @@
 # ADR-0002: Delegate Codex Authentication Through an Isolated Managed Home
 
-- Status: Accepted for Phase 0
+- Status: Accepted implementation; conditional/dormant under ADR-0003
 - Scope: Managed Codex CLI authentication
 
 ## Context
@@ -15,6 +15,15 @@ The pinned tool is Codex CLI `0.151.0`, declared in `contracts/versions.toml`
 and `mise.toml`, with platform archive and executable digests recorded in
 `contracts/codex-cli-provenance.json`. A different version, path, native file,
 or digest is not an acceptable substitute.
+
+## Relationship to ADR-0003
+
+[ADR-0003](0003-herdr-agent-runtime-boundary.md) supersedes the former
+assumption that this authentication boundary is a mandatory Phase 0 gate. The
+implementation remains available but conditional and dormant; it is a Phase 0
+gate only if the `herdr+codex` contract proves it necessary. Any removal or
+change requires a separate corrective ADR/PR. The implementation details below
+remain the contract if the boundary is activated.
 
 ## Decision
 
