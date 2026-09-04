@@ -91,6 +91,14 @@ The spike covers:
   attempt IDs, duplicate and out-of-order events, and unknown states.
   Installation is explicit and reversible; no agent configuration is silently
   installed or rewritten.
+- The transport-free `nagi::herdr_recovery` reconciler implements this narrow
+  gate with a bounded schema-1 snapshot baseline and hook observation stream.
+  A snapshot binds the exact source and attempt and resets the generation;
+  reconnects and sequence gaps require a fresh snapshot, while exact
+  duplicates are idempotent and conflicting or out-of-order events fail
+  closed. Session lifecycle and stable report references are retained only as
+  observations; `idle`, `blocked`, and `done` never produce a Linear
+  completion decision.
 - The managed Codex authentication boundary in
   [ADR-0002](adr/0002-managed-codex-authentication.md), only if the selected
   `herdr+codex` path proves it is needed. Until then, P0-11 remains dormant.
