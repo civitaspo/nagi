@@ -107,6 +107,10 @@
               "fixture-provenance",
               "version-pins",
               "boundary",
+              "cli-workspace",
+              "socket-snapshot",
+              "socket-subscription",
+              "restart-resnapshot",
               "redaction",
               "preflight"
             ]

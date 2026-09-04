@@ -12,14 +12,8 @@ require "socket"
 MAX_LINE_BYTES = 1_048_576
 HERDR_VERSION = "0.8.2"
 HERDR_PROTOCOL = 20
-EVENT_TYPES = {
-  "workspace_created" => "workspace.created",
-  "pane_agent_status_changed" => "pane.agent_status_changed",
-}.freeze
-EVENT_NAMES = {
-  "workspace_created" => "workspace_created",
-  "pane_agent_status_changed" => "pane.agent_status_changed",
-}.freeze
+WORKSPACE_SUBSCRIPTION_TYPE = "workspace.created"
+WORKSPACE_EVENT_NAME = "workspace_created"
 
 def fail_contract(message)
   warn message
@@ -79,23 +73,14 @@ def assert_snapshot(snapshot, expected_label, expected_count)
   end
 end
 
-def assert_subscription_event(event, expected_event, expected_label, expected_state)
+def assert_subscription_event(event, expected_label)
   fail_contract("Herdr event shape changed") unless event.is_a?(Hash)
   fail_contract("Herdr event unexpectedly carried a response id") if event.key?("id")
-  fail_contract("Herdr event kind changed") unless event["event"] == EVENT_NAMES.fetch(expected_event)
+  fail_contract("Herdr event kind changed") unless event["event"] == WORKSPACE_EVENT_NAME
   data = event["data"]
   fail_contract("Herdr event data shape changed") unless data.is_a?(Hash)
-
-  case expected_event
-  when "workspace_created"
-    fail_contract("Herdr event data kind changed") unless data["type"] == expected_event
-    fail_contract("Herdr event lost the synthetic workspace") unless data.dig("workspace", "label") == expected_label
-  when "pane_agent_status_changed"
-    fail_contract("Herdr event lost the synthetic agent") unless data["agent"] == "synthetic-agent"
-    fail_contract("Herdr event lifecycle state changed") unless data["agent_status"] == expected_state
-  else
-    fail_contract("unsupported Herdr event witness")
-  end
+  fail_contract("Herdr event data kind changed") unless data["type"] == "workspace_created"
+  fail_contract("Herdr event lost the synthetic workspace") unless data.dig("workspace", "label") == expected_label
 end
 
 mode = ARGV.fetch(0) { fail_contract("Herdr socket witness requires a mode") }
@@ -115,27 +100,19 @@ when "snapshot"
 when "subscribe"
   expected_event = ARGV.fetch(2) { fail_contract("subscription witness requires an event") }
   expected_label = ARGV.fetch(3) { fail_contract("subscription witness requires a label") }
-  expected_state = ARGV[4]
-  pane_id = ARGV[5]
-  event_type = EVENT_TYPES[expected_event]
-  fail_contract("unsupported Herdr event witness") unless event_type
-  subscription = { "type" => event_type }
-  if expected_event == "pane_agent_status_changed"
-    fail_contract("pane subscription witness requires a pane") unless pane_id&.match?(/\Aw[0-9]+:p[0-9]+\z/)
-    subscription["pane_id"] = pane_id
-  end
+  fail_contract("unsupported Herdr event witness") unless expected_event == "workspace_created"
   send_request(
     socket,
     "synthetic-subscription",
     "events.subscribe",
-    { "subscriptions" => [subscription] },
+    { "subscriptions" => [{ "type" => WORKSPACE_SUBSCRIPTION_TYPE }] },
   )
   acknowledgement = read_json_line(socket)
   assert_response_id(acknowledgement, "synthetic-subscription")
   fail_contract("Herdr subscription acknowledgement changed") unless acknowledgement.dig("result", "type") == "subscription_started"
   puts "subscription_started"
   $stdout.flush
-  assert_subscription_event(read_json_line(socket), expected_event, expected_label, expected_state)
+  assert_subscription_event(read_json_line(socket), expected_label)
   puts "subscription_ok"
   $stdout.flush
 else

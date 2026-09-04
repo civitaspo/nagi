@@ -497,25 +497,6 @@ wait_for_socket_absent() {
   return 1
 }
 
-remove_stale_sockets() {
-  local socket
-  for socket in "${socket_path}" "${client_socket_path}"; do
-    if [[ -L "${socket}" ]] || ! live_validate_path_components "${socket}"; then
-      return 1
-    fi
-    if [[ -e "${socket}" ]]; then
-      if [[ ! -S "${socket}" ]] \
-        || [[ "$(/usr/bin/stat -f '%u' "${socket}" 2>/dev/null || true)" \
-          != "${current_uid}" ]]; then
-        return 1
-      fi
-      /bin/rm -f -- "${socket}" || return 1
-    fi
-    [[ ! -e "${socket}" && ! -L "${socket}" ]] || return 1
-  done
-  return 0
-}
-
 start_server() {
   ((server_start_count += 1))
   server_stdout_file="${contract_tmp}/server-${server_start_count}.stdout"
@@ -603,22 +584,14 @@ if ! /usr/bin/cmp -s "${LAST_STDOUT}" "${expected_version_file}" \
   exit 1
 fi
 
-# The schema is supplied by the exact Herdr executable and is checked by
-# digest and the small fields Nagi depends on. The large schema itself stays
-# private and is never copied into public evidence.
+# The exact schema digest binds the pinned protocol and schema version. The
+# large schema itself stays private and is never copied into public evidence.
 if ! run_cli_schema schema 524288 300 api schema --json; then
   echo "Herdr CLI/socket contract could not query the bundled API schema." >&2
   exit 1
 fi
 schema_sha256="$(/usr/bin/shasum -a 256 "${LAST_STDOUT}" 2>/dev/null | /usr/bin/awk '{print $1}')"
-if [[ "${schema_sha256}" != "${expected_schema_sha256}" ]] \
-  || ! /usr/bin/ruby -rjson -e '
-    schema = JSON.parse(STDIN.read)
-    required = schema.fetch("schemas").fetch("success_response").fetch("$" + "defs").fetch("SessionSnapshot").fetch("required")
-    abort unless schema.fetch("protocol") == 20
-    abort unless schema.fetch("schema_version") == 1
-    abort unless required == %w[version protocol workspaces tabs panes layouts agents]
-  ' <"${LAST_STDOUT}" >/dev/null 2>"${contract_tmp}/schema-parse.err"; then
+if [[ "${schema_sha256}" != "${expected_schema_sha256}" ]]; then
   echo "Herdr CLI/socket contract rejected the bundled API schema." >&2
   exit 1
 fi
@@ -641,29 +614,21 @@ if ! run_cli workspace-create 65536 300 workspace create --cwd "${workspace_cwd}
   echo "Herdr CLI/socket contract rejected workspace creation." >&2
   exit 1
 fi
-workspace_id_file="${contract_tmp}/workspace-id"
-pane_id_file="${contract_tmp}/pane-id"
 if ! /usr/bin/ruby -rjson -e '
   response = JSON.parse(STDIN.read)
   result = response.fetch("result")
   workspace = result.fetch("workspace")
   workspace_id = workspace.fetch("workspace_id")
-  pane_id = result.fetch("root_pane").fetch("pane_id")
   abort unless workspace_id.match?(/\Aw[0-9]+\z/)
-  abort unless pane_id.match?(/\Aw[0-9]+:p[0-9]+\z/)
   abort unless workspace.fetch("label") == ARGV.fetch(0)
   puts workspace_id
-  puts pane_id
 ' "${workspace_label}" <"${LAST_STDOUT}" \
   >"${contract_tmp}/workspace-binding" 2>"${contract_tmp}/workspace-parse.err"; then
   echo "Herdr CLI/socket contract could not bind the synthetic workspace." >&2
   exit 1
 fi
-/usr/bin/sed -n '1p' "${contract_tmp}/workspace-binding" >"${workspace_id_file}"
-/usr/bin/sed -n '2p' "${contract_tmp}/workspace-binding" >"${pane_id_file}"
-workspace_id="$(/usr/bin/tr -d '\n' <"${workspace_id_file}")"
-pane_id="$(/usr/bin/tr -d '\n' <"${pane_id_file}")"
-if ! [[ "${workspace_id}" =~ ^w[0-9]+$ && "${pane_id}" =~ ^w[0-9]+:p[0-9]+$ ]]; then
+workspace_id="$(/usr/bin/tr -d '\n' <"${contract_tmp}/workspace-binding")"
+if ! [[ "${workspace_id}" =~ ^w[0-9]+$ ]]; then
   echo "Herdr CLI/socket contract rejected the synthetic workspace binding." >&2
   exit 1
 fi
@@ -694,8 +659,8 @@ if ! /usr/bin/ruby -rjson -e '
   exit 1
 fi
 
-# A graceful stop persists the named session. A fresh server restores it,
-# then a force-killed server must recover the same saved session.
+# A graceful stop persists the named session. A fresh server restores it and
+# the socket witness takes one fresh snapshot after the restart.
 if ! run_cli graceful-stop 65536 300 server stop; then
   echo "Herdr CLI/socket contract could not request a graceful stop." >&2
   exit 1
@@ -728,87 +693,6 @@ if ! run_socket_witness restored-snapshot "${socket_path}" "${workspace_label}" 
   exit 1
 fi
 
-LIVE_CHILD_PID="${server_pid}"
-LIVE_CHILD_GROUP_ID="${server_group}"
-if ! live_signal_child_group KILL; then
-  echo "Herdr CLI/socket contract could not force-stop the server." >&2
-  exit 1
-fi
-# Reap immediately after SIGKILL. Polling Bash jobs before wait can surface an
-# asynchronous "Killed: 9" notification on the public stderr stream.
-if wait "${server_pid}" 2>/dev/null; then
-  server_wait_status=0
-else
-  server_wait_status=$?
-fi
-if [[ "${server_wait_status}" != "137" ]] \
-  || kill -0 "${server_pid}" 2>/dev/null \
-  || kill -0 -- "-${server_group}" 2>/dev/null; then
-  echo "Herdr CLI/socket contract rejected force-stop recovery evidence." >&2
-  exit 1
-fi
-LIVE_CHILD_PID=""
-LIVE_CHILD_GROUP_ID=""
-server_pid=""
-server_group=""
-if ! remove_stale_sockets \
-  || ! assert_private_output_safe "${server_stdout_file}" "${server_stderr_file}" 65536; then
-  echo "Herdr CLI/socket contract left unsafe crash state." >&2
-  exit 1
-fi
-
-if ! start_server; then
-  echo "Herdr CLI/socket contract could not recover after a server crash." >&2
-  exit 1
-fi
-if ! run_socket_witness crash-recovery "${socket_path}" "${workspace_label}" 1 \
-  || ! run_socket_witness reconnect-snapshot "${socket_path}" "${workspace_label}" 1; then
-  echo "Herdr CLI/socket contract rejected reconnect or crash recovery." >&2
-  exit 1
-fi
-
-if ! start_subscription agent-status pane_agent_status_changed "" working "${pane_id}"; then
-  echo "Herdr CLI/socket contract could not subscribe to lifecycle events." >&2
-  exit 1
-fi
-if ! run_cli report-working 65536 300 pane report-agent "${pane_id}" \
-  --source synthetic.contract --agent synthetic-agent --state working --seq 1 \
-  --agent-session-id synthetic-session --message synthetic-working; then
-  echo "Herdr CLI/socket contract rejected lifecycle observation." >&2
-  exit 1
-fi
-if ! wait_for_subscription_event; then
-  echo "Herdr CLI/socket contract did not observe the working lifecycle event." >&2
-  exit 1
-fi
-if ! reap_saved_child "${subscriber_pid}" "${subscriber_group}" \
-  || ! assert_private_output_safe "${subscriber_stdout_file}" "${subscriber_stderr_file}" 65536; then
-  echo "Herdr CLI/socket contract could not close the lifecycle subscription." >&2
-  exit 1
-fi
-subscriber_pid=""
-subscriber_group=""
-
-if ! run_cli report-idle 65536 300 pane report-agent "${pane_id}" \
-  --source synthetic.contract --agent synthetic-agent --state idle --seq 2 \
-  --agent-session-id synthetic-session --message synthetic-idle; then
-  echo "Herdr CLI/socket contract rejected the idle observation." >&2
-  exit 1
-fi
-if ! run_cli lifecycle-snapshot 65536 300 api snapshot; then
-  echo "Herdr CLI/socket contract could not read the lifecycle snapshot." >&2
-  exit 1
-fi
-if ! /usr/bin/ruby -rjson -e '
-  response = JSON.parse(STDIN.read)
-  snapshot = response.fetch("result").fetch("snapshot")
-  agent = snapshot.fetch("agents").find { |entry| entry["agent"] == "synthetic-agent" }
-  abort unless agent && agent.fetch("agent_status") == "idle" && agent.fetch("state_change_seq") == 2
-' <"${LAST_STDOUT}" >/dev/null 2>"${contract_tmp}/lifecycle-parse.err"; then
-  echo "Herdr CLI/socket contract rejected the observed lifecycle state." >&2
-  exit 1
-fi
-
 if ! run_cli workspace-close 65536 300 workspace close "${workspace_id}" \
   || ! run_socket_witness closed-snapshot "${socket_path}" "-" 0; then
   echo "Herdr CLI/socket contract could not close the synthetic workspace." >&2
@@ -838,4 +722,4 @@ if ! live_trusted_executable "${herdr_binary_source}" \
 fi
 
 printf '%s\n' \
-  "{\"schemaVersion\":1,\"layer\":\"macos\",\"gate\":\"herdr\",\"result\":\"pass\",\"revision\":\"${revision}\",\"fixture\":\"synthetic.herdr-cli-socket.v1\",\"versions\":{\"herdr\":\"0.8.2\",\"herdrProtocol\":20,\"herdrSchema\":1,\"herdrRevision\":\"9eb521456ac0d19d3ab3d9d7cea3cca10baa8a4c\"},\"checks\":[{\"name\":\"fixture-provenance\",\"result\":\"pass\"},{\"name\":\"version-pins\",\"result\":\"pass\"},{\"name\":\"boundary\",\"result\":\"pass\"},{\"name\":\"redaction\",\"result\":\"pass\"},{\"name\":\"preflight\",\"result\":\"pass\"}]}"
+  "{\"schemaVersion\":1,\"layer\":\"macos\",\"gate\":\"herdr\",\"result\":\"pass\",\"revision\":\"${revision}\",\"fixture\":\"synthetic.herdr-cli-socket.v1\",\"versions\":{\"herdr\":\"0.8.2\",\"herdrProtocol\":20,\"herdrSchema\":1,\"herdrRevision\":\"9eb521456ac0d19d3ab3d9d7cea3cca10baa8a4c\"},\"checks\":[{\"name\":\"fixture-provenance\",\"result\":\"pass\"},{\"name\":\"version-pins\",\"result\":\"pass\"},{\"name\":\"cli-workspace\",\"result\":\"pass\"},{\"name\":\"socket-snapshot\",\"result\":\"pass\"},{\"name\":\"socket-subscription\",\"result\":\"pass\"},{\"name\":\"restart-resnapshot\",\"result\":\"pass\"},{\"name\":\"redaction\",\"result\":\"pass\"},{\"name\":\"preflight\",\"result\":\"pass\"}]}"

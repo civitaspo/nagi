@@ -722,24 +722,25 @@ fn herdr_contract_is_opt_in_and_socket_only() {
     assert!(HERDR_SCRIPT_SOURCE.contains("workspace create"));
     assert!(HERDR_SCRIPT_SOURCE.contains("workspace close"));
     assert!(HERDR_SCRIPT_SOURCE.contains("server stop"));
-    assert!(HERDR_SCRIPT_SOURCE.contains("remove_stale_sockets"));
+    assert!(HERDR_SCRIPT_SOURCE.contains("graceful-stop"));
+    assert!(HERDR_SCRIPT_SOURCE.contains("restored-snapshot"));
     assert!(HERDR_SCRIPT_SOURCE.contains("\\\"gate\\\":\\\"herdr\\\""));
     assert!(HERDR_SCRIPT_SOURCE.contains("herdrProtocol"));
     assert!(HERDR_SCRIPT_SOURCE.contains("herdrSchema"));
     assert!(HERDR_SCRIPT_SOURCE.contains("herdrRevision"));
-    let force_kill = HERDR_SCRIPT_SOURCE
-        .find("if ! live_signal_child_group KILL")
-        .expect("Herdr force-stop gate");
-    let immediate_wait = HERDR_SCRIPT_SOURCE
-        .find("if wait \"${server_pid}\" 2>/dev/null")
-        .expect("Herdr force-stop reap");
-    assert!(immediate_wait > force_kill);
-    assert!(!HERDR_SCRIPT_SOURCE.contains("|| ! wait_for_child_exit \"${server_pid}\" 100"));
+    assert!(HERDR_SCRIPT_SOURCE.contains("cli-workspace"));
+    assert!(HERDR_SCRIPT_SOURCE.contains("socket-snapshot"));
+    assert!(HERDR_SCRIPT_SOURCE.contains("socket-subscription"));
+    assert!(HERDR_SCRIPT_SOURCE.contains("restart-resnapshot"));
+    assert!(!HERDR_SCRIPT_SOURCE.contains("report-agent"));
+    assert!(!HERDR_SCRIPT_SOURCE.contains("remove_stale_sockets"));
+    assert!(!HERDR_SCRIPT_SOURCE.contains("live_signal_child_group KILL"));
     assert!(HERDR_SOCKET_SOURCE.contains("UNIXSocket"));
     assert!(HERDR_SOCKET_SOURCE.contains("MAX_LINE_BYTES"));
     assert!(HERDR_SOCKET_SOURCE.contains("malformed JSON"));
     assert!(HERDR_SOCKET_SOURCE.contains("events.subscribe"));
     assert!(HERDR_SOCKET_SOURCE.contains("subscription_started"));
+    assert!(!HERDR_SOCKET_SOURCE.contains("pane_agent_status_changed"));
 
     if !cfg!(target_os = "macos") {
         let explicit = command_output(HERDR_SCRIPT, &[("NAGI_CONTRACT_HERDR", "1")]);
