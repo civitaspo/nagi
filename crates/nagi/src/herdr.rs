@@ -446,6 +446,7 @@ pub struct WorkspaceHandle {
     workspace_id: String,
     tab_id: String,
     pane_id: String,
+    runtime: HerdrRuntime,
 }
 
 impl WorkspaceHandle {
@@ -483,6 +484,7 @@ pub struct AgentHandle {
     workspace_id: String,
     pane_id: String,
     kind: HerdrAgentKind,
+    runtime: HerdrRuntime,
 }
 
 impl AgentHandle {
@@ -661,6 +663,17 @@ impl<C, S> HerdrAgentRunner<C, S> {
         if agent.kind != self.kind {
             return Err(HerdrError::InvalidInput);
         }
+        if agent.runtime != self.runtime {
+            return Err(HerdrError::InvalidInput);
+        }
+        Ok(())
+    }
+
+    fn validate_workspace(&self, workspace: &WorkspaceHandle) -> Result<(), HerdrError> {
+        validate_workspace_handle(workspace)?;
+        if workspace.runtime != self.runtime {
+            return Err(HerdrError::InvalidInput);
+        }
         Ok(())
     }
 }
@@ -705,6 +718,7 @@ where
             workspace_id,
             tab_id,
             pane_id,
+            runtime: self.runtime.clone(),
         })
     }
 
@@ -713,7 +727,7 @@ where
         workspace: &WorkspaceHandle,
         name: &str,
     ) -> Result<AgentHandle, HerdrError> {
-        validate_workspace_handle(workspace)?;
+        self.validate_workspace(workspace)?;
         validate_agent_name(name)?;
         let response: AgentStartedResult = self.run_cli([
             "agent",
@@ -745,6 +759,7 @@ where
             workspace_id: response_workspace_id,
             pane_id,
             kind: self.kind,
+            runtime: self.runtime.clone(),
         })
     }
 
@@ -816,7 +831,7 @@ where
     }
 
     fn stop(&mut self, workspace: &WorkspaceHandle) -> Result<(), HerdrError> {
-        validate_workspace_handle(workspace)?;
+        self.validate_workspace(workspace)?;
         let workspace_id = validated_workspace_id(workspace.workspace_id())?;
         let response: OkResult = self.run_cli(["workspace", "close", &workspace_id])?;
         expect_result_type(&response.result_type, "ok")?;
@@ -1924,6 +1939,14 @@ mod tests {
         cli_responses: impl IntoIterator<Item = Result<Vec<u8>, TransportError>>,
         socket_response: Result<Vec<u8>, TransportError>,
     ) -> HerdrAgentRunner<FakeCli, FakeSocket> {
+        runner_for_runtime(cli_responses, socket_response, runtime())
+    }
+
+    fn runner_for_runtime(
+        cli_responses: impl IntoIterator<Item = Result<Vec<u8>, TransportError>>,
+        socket_response: Result<Vec<u8>, TransportError>,
+        runtime: HerdrRuntime,
+    ) -> HerdrAgentRunner<FakeCli, FakeSocket> {
         HerdrAgentRunner::new(
             FakeCli::new(cli_responses),
             FakeSocket {
@@ -1931,8 +1954,12 @@ mod tests {
                 path: None,
                 request: None,
             },
-            runtime(),
+            runtime,
         )
+    }
+
+    fn other_runtime() -> HerdrRuntime {
+        HerdrRuntime::new("other", "/synthetic/other-home").expect("valid other runtime")
     }
 
     fn cursor_runner(
@@ -2068,6 +2095,40 @@ mod tests {
             .map(|args| args.into_iter().map(String::from).collect())
             .collect::<Vec<Vec<String>>>()
         );
+    }
+
+    #[test]
+    fn same_kind_handles_are_rejected_across_runtimes_before_effects() {
+        let mut source = runner(
+            [
+                FakeCli::response(workspace_response()),
+                FakeCli::response(agent_response("agent_started")),
+            ],
+            Err(TransportError::Unavailable),
+        );
+        let workspace = source
+            .workspace_create(Path::new("/synthetic/workspace"), "synthetic")
+            .expect("workspace response");
+        let agent = source
+            .agent_start(&workspace, AGENT_NAME)
+            .expect("agent response");
+
+        let mut target = runner_for_runtime([], Err(TransportError::Unavailable), other_runtime());
+        assert_eq!(
+            target.agent_start(&workspace, AGENT_NAME),
+            Err(HerdrError::InvalidInput)
+        );
+        assert_eq!(
+            target.prompt(&agent, "inspect the bounded fixture"),
+            Err(HerdrError::InvalidInput)
+        );
+        assert_eq!(target.observe(&agent), Err(HerdrError::InvalidInput));
+        assert_eq!(target.interrupt(&agent), Err(HerdrError::InvalidInput));
+        assert_eq!(target.resume(&agent), Err(HerdrError::InvalidInput));
+        assert_eq!(target.stop(&workspace), Err(HerdrError::InvalidInput));
+        assert!(target.cli.requests.is_empty());
+        assert!(target.socket.path.is_none());
+        assert!(target.socket.request.is_none());
     }
 
     #[test]
@@ -2244,6 +2305,7 @@ mod tests {
             workspace_id: WORKSPACE_ID.to_owned(),
             pane_id: PANE_ID.to_owned(),
             kind: HerdrAgentKind::Codex,
+            runtime: runtime(),
         });
         assert_eq!(result, Err(HerdrError::UnsupportedOperation));
         assert!(runner.cli.requests.is_empty());
