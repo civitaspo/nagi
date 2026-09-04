@@ -13,7 +13,7 @@ use crate::linear::credentials::CredentialError;
 #[cfg(target_os = "macos")]
 use crate::linear::credentials::{CredentialManager, bounded_client_id};
 #[cfg(target_os = "macos")]
-use crate::linear::read::{self, ReadContractConfig};
+use crate::linear::read::{self, LinearIssueBinding};
 #[cfg(target_os = "macos")]
 use serde::Serialize;
 #[cfg(all(target_os = "macos", feature = "macos-keychain-contract"))]
@@ -353,7 +353,7 @@ fn run_read_contract() -> Result<(), CliError> {
 }
 
 #[cfg(target_os = "macos")]
-fn read_contract_configuration() -> Result<(String, u16, ReadContractConfig), CliError> {
+fn read_contract_configuration() -> Result<(String, u16, LinearIssueBinding), CliError> {
     let client_id = std::env::var(CLIENT_ID_ENV).map_err(|_| CliError::Configuration)?;
     let client_id = bounded_client_id(&client_id).map_err(|_| CliError::Configuration)?;
     let workspace_id = std::env::var(WORKSPACE_ID_ENV).map_err(|_| CliError::Configuration)?;
@@ -364,7 +364,7 @@ fn read_contract_configuration() -> Result<(String, u16, ReadContractConfig), Cl
     if std::env::var(ADMIN_CONSENT_ENV).ok().as_deref() != Some("1") {
         return Err(CliError::Configuration);
     }
-    let config = ReadContractConfig::new(workspace_id, team_id, setup_issue_id)
+    let config = LinearIssueBinding::new(workspace_id, team_id, setup_issue_id)
         .map_err(|_| CliError::Configuration)?;
     Ok((client_id, callback_port, config))
 }

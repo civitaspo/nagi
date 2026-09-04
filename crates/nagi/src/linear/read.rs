@@ -117,58 +117,15 @@ const READ_QUERY: &str = r#"query NagiLinearReadContract($teamId: String!, $issu
   }
 }"#;
 
-/// Fixed local bindings for the one synthetic setup graph used by the live
-/// contract. Values are intentionally not exposed through accessors or debug
-/// output; the verifier compares them only in memory.
-#[derive(Clone, Eq, PartialEq)]
-pub(crate) struct ReadContractConfig {
-    workspace_id: String,
-    team_id: String,
-    setup_issue_id: String,
-}
-
-impl ReadContractConfig {
-    /// Creates a read-contract binding from deployment-local canonical model
-    /// UUIDs. Linear also accepts shorthand issue identifiers (for example,
-    /// `LIN-123`) in `issue(id:)`, but this contract deliberately refuses them:
-    /// the returned canonical UUID must equal the exact operator-supplied
-    /// value, and no shorthand-to-UUID normalization is performed.
-    pub(crate) fn new(
-        workspace_id: impl Into<String>,
-        team_id: impl Into<String>,
-        setup_issue_id: impl Into<String>,
-    ) -> Result<Self, ReadContractError> {
-        let workspace_id = bounded_id(workspace_id.into())?;
-        let team_id = bounded_id(team_id.into())?;
-        let setup_issue_id = bounded_id(setup_issue_id.into())?;
-        Ok(Self {
-            workspace_id,
-            team_id,
-            setup_issue_id,
-        })
-    }
-}
-
-impl fmt::Debug for ReadContractConfig {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ReadContractConfig")
-            .field("workspace_id", &"[redacted]")
-            .field("team_id", &"[redacted]")
-            .field("setup_issue_id", &"[redacted]")
-            .finish()
-    }
-}
-
 /// Exact operator-supplied bindings for one Linear issue read.
 #[derive(Clone, Eq, PartialEq)]
-pub struct IssueInputConfig {
+pub struct LinearIssueBinding {
     workspace_id: String,
     team_id: String,
     issue_id: String,
 }
 
-impl IssueInputConfig {
+impl LinearIssueBinding {
     /// Creates a binding from canonical lowercase UUIDs. Shorthand issue
     /// identifiers are deliberately rejected and never normalized.
     pub fn new(
@@ -184,10 +141,10 @@ impl IssueInputConfig {
     }
 }
 
-impl fmt::Debug for IssueInputConfig {
+impl fmt::Debug for LinearIssueBinding {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("IssueInputConfig")
+            .debug_struct("LinearIssueBinding")
             .field("workspace_id", &"[redacted]")
             .field("team_id", &"[redacted]")
             .field("issue_id", &"[redacted]")
@@ -201,10 +158,10 @@ impl fmt::Debug for IssueInputConfig {
 /// strings are cleared on drop, and the debug representation is redacted.
 #[derive(Clone, Eq, PartialEq)]
 pub struct IssueInput {
-    id: String,
-    identifier: String,
-    title: String,
-    description: Option<String>,
+    id: Zeroizing<String>,
+    identifier: Zeroizing<String>,
+    title: Zeroizing<String>,
+    description: Option<Zeroizing<String>>,
 }
 
 impl IssueInput {
@@ -225,7 +182,9 @@ impl IssueInput {
 
     /// Returns the optional bounded issue description.
     pub fn description(&self) -> Option<&str> {
-        self.description.as_deref()
+        self.description
+            .as_ref()
+            .map(|description| description.as_str())
     }
 
     fn from_record(
@@ -234,25 +193,19 @@ impl IssueInput {
         title: &str,
         description: Option<&str>,
     ) -> Result<Self, ReadContractError> {
+        let id = bounded_issue_id(id)?;
+        let identifier = bounded_issue_text(identifier, MAX_ISSUE_IDENTIFIER_BYTES)?;
+        let title = bounded_issue_text(title, MAX_ISSUE_TITLE_BYTES)?;
+        let description = description
+            .map(|value| bounded_issue_description(value, MAX_ISSUE_DESCRIPTION_BYTES))
+            .transpose()?
+            .flatten();
         Ok(Self {
-            id: bounded_id(id.to_owned())?,
-            identifier: bounded_issue_text(identifier, MAX_ISSUE_IDENTIFIER_BYTES)?,
-            title: bounded_issue_text(title, MAX_ISSUE_TITLE_BYTES)?,
-            description: description
-                .map(|value| bounded_issue_description(value, MAX_ISSUE_DESCRIPTION_BYTES))
-                .transpose()?,
+            id,
+            identifier,
+            title,
+            description,
         })
-    }
-}
-
-impl Drop for IssueInput {
-    fn drop(&mut self) {
-        self.id.zeroize();
-        self.identifier.zeroize();
-        self.title.zeroize();
-        if let Some(description) = self.description.as_mut() {
-            description.zeroize();
-        }
     }
 }
 
@@ -317,32 +270,42 @@ fn bounded_id(value: String) -> Result<String, ReadContractError> {
     Ok(value)
 }
 
-fn bounded_issue_text(value: &str, maximum_bytes: usize) -> Result<String, ReadContractError> {
-    bounded_issue_text_with_controls(value, maximum_bytes, false)
+fn bounded_issue_id(value: &str) -> Result<Zeroizing<String>, ReadContractError> {
+    let value = Zeroizing::new(value.to_owned());
+    if !valid_canonical_uuid(&value) {
+        return Err(ReadContractError::ReadFieldsInvalid);
+    }
+    Ok(value)
+}
+
+fn bounded_issue_text(
+    value: &str,
+    maximum_bytes: usize,
+) -> Result<Zeroizing<String>, ReadContractError> {
+    if value.trim().is_empty()
+        || value.len() > maximum_bytes
+        || value.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(ReadContractError::ReadFieldsInvalid);
+    }
+    Ok(Zeroizing::new(value.to_owned()))
 }
 
 fn bounded_issue_description(
     value: &str,
     maximum_bytes: usize,
-) -> Result<String, ReadContractError> {
-    bounded_issue_text_with_controls(value, maximum_bytes, true)
-}
-
-fn bounded_issue_text_with_controls(
-    value: &str,
-    maximum_bytes: usize,
-    allow_markdown_controls: bool,
-) -> Result<String, ReadContractError> {
-    if value.trim().is_empty()
-        || value.len() > maximum_bytes
-        || value.bytes().any(|byte| {
-            byte.is_ascii_control()
-                && (!allow_markdown_controls || !matches!(byte, b'\n' | b'\r' | b'\t'))
-        })
+) -> Result<Option<Zeroizing<String>>, ReadContractError> {
+    if value.len() > maximum_bytes
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_control() && !matches!(byte, b'\n' | b'\r' | b'\t'))
     {
         return Err(ReadContractError::ReadFieldsInvalid);
     }
-    Ok(value.to_owned())
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Zeroizing::new(value.to_owned())))
 }
 
 fn valid_canonical_uuid(value: &str) -> bool {
@@ -396,14 +359,14 @@ impl GraphqlRequest {
 
     fn issue(
         team_id: &str,
-        setup_issue_id: &str,
+        issue_id: &str,
         after: Option<&str>,
     ) -> Result<Self, ReadContractError> {
         let body = serde_json::to_vec(&serde_json::json!({
             "query": READ_QUERY,
             "variables": {
                 "teamId": team_id,
-                "issueId": setup_issue_id,
+                "issueId": issue_id,
                 "commentFirst": COMMENT_PAGE_SIZE,
                 "commentAfter": after,
             },
@@ -780,11 +743,14 @@ struct IssueInputData {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IssueInputRecord {
-    id: String,
-    identifier: String,
-    title: String,
-    #[serde(deserialize_with = "required_nullable")]
-    description: Option<String>,
+    #[serde(deserialize_with = "deserialize_zeroizing_string")]
+    id: Zeroizing<String>,
+    #[serde(deserialize_with = "deserialize_zeroizing_string")]
+    identifier: Zeroizing<String>,
+    #[serde(deserialize_with = "deserialize_zeroizing_string")]
+    title: Zeroizing<String>,
+    #[serde(deserialize_with = "required_zeroizing_nullable")]
+    description: Option<Zeroizing<String>>,
     #[serde(deserialize_with = "required_nullable")]
     team: Option<Team>,
 }
@@ -851,6 +817,22 @@ where
     Option::<T>::deserialize(deserializer)
 }
 
+fn deserialize_zeroizing_string<'de, D>(deserializer: D) -> Result<Zeroizing<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Zeroizing::new)
+}
+
+fn required_zeroizing_nullable<'de, D>(
+    deserializer: D,
+) -> Result<Option<Zeroizing<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(|value| value.map(Zeroizing::new))
+}
+
 /// Content is consumed into a presence bit at deserialization time. This keeps
 /// the verified outcome from retaining an issue description or comment body.
 #[derive(Clone, Copy, Debug)]
@@ -894,7 +876,7 @@ fn decode<T: for<'de> Deserialize<'de>>(response: ReadResponse) -> Result<T, Rea
 fn verify_issue_input(
     transport: &mut dyn ReadTransport,
     access_token: &str,
-    config: &IssueInputConfig,
+    config: &LinearIssueBinding,
 ) -> Result<VerifiedReadOutcome<IssueInput>, ReadContractError> {
     if access_token.is_empty()
         || access_token.len() > MAX_ACCESS_TOKEN_BYTES
@@ -945,7 +927,7 @@ fn verify_issue_input(
         || viewer_organization.id != config.workspace_id
         || team.id != config.team_id
         || team_organization.id != config.workspace_id
-        || issue.id != config.issue_id
+        || issue.id.as_str() != config.issue_id.as_str()
         || issue_team.id != config.team_id
         || issue_organization.id != config.workspace_id
     {
@@ -953,10 +935,13 @@ fn verify_issue_input(
     }
 
     let input = IssueInput::from_record(
-        &issue.id,
-        &issue.identifier,
-        &issue.title,
-        issue.description.as_deref(),
+        issue.id.as_str(),
+        issue.identifier.as_str(),
+        issue.title.as_str(),
+        issue
+            .description
+            .as_ref()
+            .map(|description| description.as_str()),
     )?;
     Ok(VerifiedReadOutcome::with_value(
         Zeroizing::new(scope.viewer.id.clone()),
@@ -967,7 +952,7 @@ fn verify_issue_input(
 fn verify_read(
     transport: &mut dyn ReadTransport,
     access_token: &str,
-    config: &ReadContractConfig,
+    config: &LinearIssueBinding,
 ) -> Result<VerifiedReadOutcome, ReadContractError> {
     if access_token.is_empty()
         || access_token.len() > MAX_ACCESS_TOKEN_BYTES
@@ -979,11 +964,8 @@ fn verify_read(
     let mut app_actor_id = None;
     let mut seen_cursors = Vec::new();
     let mut seen_comment_ids = Vec::new();
-    let first_request = GraphqlRequest::issue(
-        config.team_id.as_str(),
-        config.setup_issue_id.as_str(),
-        None,
-    )?;
+    let first_request =
+        GraphqlRequest::issue(config.team_id.as_str(), config.issue_id.as_str(), None)?;
     let first_response = transport.execute(access_token, &first_request)?;
     let first_scope: ScopeData = decode(first_response)?;
     let first_page = validate_scope(
@@ -1002,7 +984,7 @@ fn verify_read(
 
     let second_request = GraphqlRequest::issue(
         config.team_id.as_str(),
-        config.setup_issue_id.as_str(),
+        config.issue_id.as_str(),
         Some(after.as_str()),
     )?;
     let second_response = transport.execute(access_token, &second_request)?;
@@ -1025,7 +1007,7 @@ fn verify_read(
 
 fn validate_scope(
     scope: &ScopeData,
-    config: &ReadContractConfig,
+    config: &LinearIssueBinding,
     app_actor_id: &mut Option<Zeroizing<String>>,
     seen_cursors: &mut Vec<String>,
     seen_comment_ids: &mut Vec<String>,
@@ -1079,7 +1061,7 @@ fn validate_scope(
         .organization
         .as_ref()
         .ok_or(ReadContractError::RelationshipMismatch)?;
-    if issue.id != config.setup_issue_id
+    if issue.id != config.issue_id
         || issue_team.id != config.team_id
         || issue_organization.id != config.workspace_id
     {
@@ -1212,7 +1194,7 @@ fn valid_timestamp(value: &str) -> bool {
 #[cfg(target_os = "macos")]
 pub(crate) fn run_live(
     manager: &mut CredentialManager,
-    config: &ReadContractConfig,
+    config: &LinearIssueBinding,
 ) -> Result<(), ReadContractError> {
     let mut transport = HttpsReadTransport::new()?;
     manager.with_verified_read(|access_token| verify_read(&mut transport, access_token, config))
@@ -1226,7 +1208,7 @@ pub(crate) fn run_live(
 #[cfg(target_os = "macos")]
 pub fn fetch_issue_input(
     manager: &mut CredentialManager,
-    config: &IssueInputConfig,
+    config: &LinearIssueBinding,
 ) -> Result<IssueInput, ReadContractError> {
     let mut transport = HttpsReadTransport::new()?;
     manager
@@ -1270,12 +1252,8 @@ mod tests {
         }
     }
 
-    fn config() -> ReadContractConfig {
-        ReadContractConfig::new(WORKSPACE, TEAM, ISSUE).expect("config")
-    }
-
-    fn issue_input_config() -> IssueInputConfig {
-        IssueInputConfig::new(WORKSPACE, TEAM, ISSUE).expect("issue input config")
+    fn config() -> LinearIssueBinding {
+        LinearIssueBinding::new(WORKSPACE, TEAM, ISSUE).expect("config")
     }
 
     fn response(body: impl AsRef<[u8]>) -> ReadResponse {
@@ -1404,18 +1382,11 @@ mod tests {
         assert!(!debug.contains(WORKSPACE));
         assert!(!debug.contains(TEAM));
         assert!(!debug.contains(ISSUE));
-        assert!(ReadContractConfig::new("", TEAM, ISSUE).is_err());
-        assert!(ReadContractConfig::new("synthetic\nworkspace", TEAM, ISSUE).is_err());
-        assert!(ReadContractConfig::new("LIN-123", TEAM, ISSUE).is_err());
-        assert!(ReadContractConfig::new(WORKSPACE, "ENG-7", ISSUE).is_err());
-        assert!(ReadContractConfig::new(WORKSPACE, TEAM, "LIN-123").is_err());
-
-        let issue_config = issue_input_config();
-        let debug = format!("{issue_config:?}");
-        assert!(!debug.contains(WORKSPACE));
-        assert!(!debug.contains(TEAM));
-        assert!(!debug.contains(ISSUE));
-        assert!(IssueInputConfig::new("LIN-123", TEAM, ISSUE).is_err());
+        assert!(LinearIssueBinding::new("", TEAM, ISSUE).is_err());
+        assert!(LinearIssueBinding::new("synthetic\nworkspace", TEAM, ISSUE).is_err());
+        assert!(LinearIssueBinding::new("LIN-123", TEAM, ISSUE).is_err());
+        assert!(LinearIssueBinding::new(WORKSPACE, "ENG-7", ISSUE).is_err());
+        assert!(LinearIssueBinding::new(WORKSPACE, TEAM, "LIN-123").is_err());
     }
 
     #[test]
@@ -2081,8 +2052,7 @@ mod tests {
     #[test]
     fn issue_input_uses_one_exact_query_and_redacts_returned_fields() {
         let mut transport = FakeTransport::new([response(issue_input_response())]);
-        let outcome =
-            verify_issue_input(&mut transport, ACCESS, &issue_input_config()).expect("issue input");
+        let outcome = verify_issue_input(&mut transport, ACCESS, &config()).expect("issue input");
         let (_, input) = outcome.into_parts();
         assert_eq!(input.id(), ISSUE);
         assert_eq!(input.identifier(), "ENG-123");
@@ -2090,6 +2060,7 @@ mod tests {
         assert_eq!(input.description(), Some("synthetic description"));
         assert!(std::mem::needs_drop::<IssueInput>());
         assert!(std::mem::needs_drop::<IssueInputRecord>());
+        assert!(std::mem::needs_drop::<Zeroizing<String>>());
 
         let request: serde_json::Value =
             serde_json::from_slice(&transport.requests[0]).expect("request JSON");
@@ -2122,10 +2093,24 @@ mod tests {
         let mut transport = FakeTransport::new([response(
             serde_json::to_vec(&null_description).expect("response JSON"),
         )]);
-        let (_, input) = verify_issue_input(&mut transport, ACCESS, &issue_input_config())
+        let (_, input) = verify_issue_input(&mut transport, ACCESS, &config())
             .expect("null description")
             .into_parts();
         assert_eq!(input.description(), None);
+
+        for whitespace in ["", " \n\t\r "] {
+            let mut blank_description: serde_json::Value =
+                serde_json::from_slice(&issue_input_response()).expect("response JSON");
+            blank_description["data"]["issue"]["description"] =
+                serde_json::Value::String(whitespace.to_owned());
+            let mut transport = FakeTransport::new([response(
+                serde_json::to_vec(&blank_description).expect("response JSON"),
+            )]);
+            let (_, input) = verify_issue_input(&mut transport, ACCESS, &config())
+                .expect("blank description")
+                .into_parts();
+            assert_eq!(input.description(), None);
+        }
 
         let mut multiline: serde_json::Value =
             serde_json::from_slice(&issue_input_response()).expect("response JSON");
@@ -2134,7 +2119,7 @@ mod tests {
         let mut transport = FakeTransport::new([response(
             serde_json::to_vec(&multiline).expect("response JSON"),
         )]);
-        let (_, input) = verify_issue_input(&mut transport, ACCESS, &issue_input_config())
+        let (_, input) = verify_issue_input(&mut transport, ACCESS, &config())
             .expect("multiline description")
             .into_parts();
         assert_eq!(
@@ -2159,7 +2144,7 @@ mod tests {
                 serde_json::to_vec(&invalid).expect("response JSON"),
             )]);
             assert_eq!(
-                verify_issue_input(&mut transport, ACCESS, &issue_input_config()),
+                verify_issue_input(&mut transport, ACCESS, &config()),
                 Err(ReadContractError::ReadFieldsInvalid)
             );
         }
@@ -2171,7 +2156,18 @@ mod tests {
             serde_json::to_vec(&unknown_field).expect("response JSON"),
         )]);
         assert_eq!(
-            verify_issue_input(&mut transport, ACCESS, &issue_input_config()),
+            verify_issue_input(&mut transport, ACCESS, &config()),
+            Err(ReadContractError::GraphqlResponse)
+        );
+
+        let mut malformed_text: serde_json::Value =
+            serde_json::from_slice(&issue_input_response()).expect("response JSON");
+        malformed_text["data"]["issue"]["description"] = serde_json::json!(42);
+        let mut transport = FakeTransport::new([response(
+            serde_json::to_vec(&malformed_text).expect("response JSON"),
+        )]);
+        assert_eq!(
+            verify_issue_input(&mut transport, ACCESS, &config()),
             Err(ReadContractError::GraphqlResponse)
         );
     }
@@ -2212,7 +2208,7 @@ mod tests {
                 serde_json::to_vec(&invalid).expect("response JSON"),
             )]);
             assert_eq!(
-                verify_issue_input(&mut transport, ACCESS, &issue_input_config()),
+                verify_issue_input(&mut transport, ACCESS, &config()),
                 Err(expected)
             );
         }
@@ -2240,7 +2236,7 @@ mod tests {
             }
             let mut transport = FakeTransport::new([response]);
             assert_eq!(
-                verify_issue_input(&mut transport, ACCESS, &issue_input_config()),
+                verify_issue_input(&mut transport, ACCESS, &config()),
                 Err(expected)
             );
         }
@@ -2250,7 +2246,7 @@ mod tests {
                 .expect("response");
         let mut transport = FakeTransport::new([invalid_content_type]);
         assert_eq!(
-            verify_issue_input(&mut transport, ACCESS, &issue_input_config()),
+            verify_issue_input(&mut transport, ACCESS, &config()),
             Err(ReadContractError::ContentType)
         );
         assert!(matches!(
