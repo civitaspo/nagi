@@ -21,7 +21,6 @@ const MAX_BACKEND_BYTES: usize = 64;
 const MAX_SESSION_REF_BYTES: usize = 128;
 const MAX_SUMMARY_BYTES: usize = 4_096;
 const MAX_SUMMARY_CHARS: usize = 1_024;
-const MAX_PULL_REQUEST_REF_BYTES: usize = 32;
 const MAX_REPORT_BYTES: usize = 16 * 1024;
 
 /// Coarse failures from the normalized report boundary.
@@ -84,19 +83,6 @@ pub enum ValidationStatus {
     Failed,
 }
 
-/// Validation metadata in a normalized report.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AgentValidation {
-    status: ValidationStatus,
-}
-
-impl AgentValidation {
-    /// Returns the observed validation status.
-    pub fn status(&self) -> ValidationStatus {
-        self.status
-    }
-}
-
 /// A normalized agent report accepted after strict parsing.
 ///
 /// Trusted backend adapters must sanitize before constructing a report. The
@@ -112,7 +98,7 @@ pub struct AgentReport {
     backend: String,
     agent_session_ref: String,
     outcome: AgentOutcome,
-    validation: AgentValidation,
+    validation: ValidationStatus,
     commit_ref: Option<String>,
     pull_request_ref: Option<String>,
     summary: String,
@@ -126,7 +112,7 @@ struct WireAgentReport {
     backend: String,
     agent_session_ref: String,
     outcome: AgentOutcome,
-    validation: WireAgentValidation,
+    validation: WireValidation,
     #[serde(default, deserialize_with = "deserialize_optional_string")]
     commit_ref: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_string")]
@@ -136,7 +122,7 @@ struct WireAgentReport {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct WireAgentValidation {
+struct WireValidation {
     status: ValidationStatus,
 }
 
@@ -187,8 +173,8 @@ impl AgentReport {
         self.outcome
     }
 
-    /// Returns the observed validation metadata.
-    pub fn validation(&self) -> AgentValidation {
+    /// Returns the observed validation status.
+    pub fn validation_status(&self) -> ValidationStatus {
         self.validation
     }
 
@@ -208,9 +194,6 @@ impl AgentReport {
     }
 
     fn from_wire(wire: WireAgentReport) -> Result<Self, AgentReportError> {
-        if wire.schema_version != SCHEMA_VERSION {
-            return Err(AgentReportError::UnsupportedSchemaVersion);
-        }
         validate_values(
             wire.schema_version,
             &wire.attempt_id,
@@ -226,9 +209,7 @@ impl AgentReport {
             backend: wire.backend,
             agent_session_ref: wire.agent_session_ref,
             outcome: wire.outcome,
-            validation: AgentValidation {
-                status: wire.validation.status,
-            },
+            validation: wire.validation.status,
             commit_ref: wire.commit_ref,
             pull_request_ref: wire.pull_request_ref,
             summary: wire.summary,
@@ -322,11 +303,7 @@ fn validate_pull_request_ref(value: &str) -> Result<(), AgentReportError> {
     let Some(number) = value.strip_prefix("pr-") else {
         return Err(AgentReportError::InvalidField);
     };
-    if value.len() > MAX_PULL_REQUEST_REF_BYTES
-        || number.is_empty()
-        || number.len() > 10
-        || !number.bytes().all(|byte| byte.is_ascii_digit())
-    {
+    if number.is_empty() || number.len() > 10 || !number.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(AgentReportError::InvalidField);
     }
     Ok(())

@@ -84,7 +84,8 @@ silently installs hooks or rewrites agent configuration.
 ## Normalized agent report
 
 Backends return a normalized, redacted report to Nagi. The strict version-1
-shape is defined by [`tests/agent-report/v1.schema.json`](../../tests/agent-report/v1.schema.json):
+shape is defined by the bounded `nagi::agent_report` parser and its checked
+synthetic fixture and parser tests:
 
 ```json
 {

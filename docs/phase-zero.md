@@ -97,8 +97,8 @@ provisioned out of band; the spike itself does not create or modify it.
 ## Normalized agent report
 
 See the strict normalized, redacted report contract in
-[ADR-0003](adr/0003-herdr-agent-runtime-boundary.md) and its checked
-[version-1 schema](../tests/agent-report/v1.schema.json). It requires the
+[ADR-0003](adr/0003-herdr-agent-runtime-boundary.md), implemented by the
+bounded Rust parser and checked synthetic fixture/tests. It requires the
 versioned attempt/backend/session identity, one closed outcome, bounded
 validation metadata, optional sanitized commit/PR references, and a bounded
 summary. Trusted adapters sanitize before construction/submission; parser
