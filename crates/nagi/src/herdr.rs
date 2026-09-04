@@ -2169,7 +2169,7 @@ mod tests {
     impl PrivateRuntime {
         fn new() -> Self {
             static NEXT_RUNTIME: AtomicUsize = AtomicUsize::new(0);
-            let root = PathBuf::from("/private/tmp").join(format!(
+            let root = std::env::temp_dir().join(format!(
                 ".h-{}-{}",
                 std::process::id(),
                 NEXT_RUNTIME.fetch_add(1, Ordering::Relaxed)
