@@ -28,6 +28,7 @@ pub(crate) enum CaptureError {
 pub(crate) struct CapturedProcess {
     pub(crate) status: ExitStatus,
     pub(crate) stdout: Zeroizing<Vec<u8>>,
+    #[cfg(target_os = "macos")]
     pub(crate) stderr: Zeroizing<Vec<u8>>,
 }
 
@@ -145,9 +146,12 @@ pub(crate) fn run_bounded_capture(
             return Err(error);
         }
         let status = status.ok_or(CaptureError::Failed)?;
+        #[cfg(not(target_os = "macos"))]
+        drop(stderr);
         Ok(CapturedProcess {
             status,
             stdout,
+            #[cfg(target_os = "macos")]
             stderr,
         })
     }
