@@ -25,18 +25,7 @@ pub const SCHEMA_VERSION: u32 = 1;
 const BUSY_TIMEOUT_MS: i64 = 5_000;
 const MAX_REF_BYTES: usize = 128;
 const UUID_BYTES: usize = 36;
-const CREATE_TABLE: &str = "CREATE TABLE attempts (\
-    attempt_id TEXT NOT NULL PRIMARY KEY,\
-    issue_id TEXT NOT NULL,\
-    backend TEXT NOT NULL,\
-    lifecycle TEXT NOT NULL,\
-    workspace_ref TEXT,\
-    agent_ref TEXT,\
-    observation_revision INTEGER NOT NULL,\
-    report_json TEXT,\
-    created_at_ms INTEGER NOT NULL,\
-    updated_at_ms INTEGER NOT NULL\
-) WITHOUT ROWID";
+const CREATE_TABLE: &str = "CREATE TABLE attempts (attempt_id TEXT NOT NULL PRIMARY KEY, issue_id TEXT NOT NULL, backend TEXT NOT NULL, lifecycle TEXT NOT NULL, workspace_ref TEXT, agent_ref TEXT, observation_revision INTEGER NOT NULL, report_json TEXT, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL) WITHOUT ROWID";
 const SELECT_COLUMNS: &str = "attempt_id, issue_id, backend, lifecycle, workspace_ref, agent_ref, observation_revision, report_json, created_at_ms, updated_at_ms";
 
 /// Coarse failures from the durable attempt boundary.
@@ -656,16 +645,11 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), AttemptStoreErro
     let user_version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(|_| AttemptStoreError::Database)?;
-    let table_type: Option<String> = connection
-        .query_row(
-            "SELECT type FROM sqlite_master WHERE name = 'attempts'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
+    let object_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| row.get(0))
         .map_err(|_| AttemptStoreError::Database)?;
-    match (user_version, table_type.as_deref()) {
-        (0, None) => {
+    match (user_version, object_count) {
+        (0, 0) => {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|_| AttemptStoreError::Database)?;
@@ -678,14 +662,44 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), AttemptStoreErro
                 .commit()
                 .map_err(|_| AttemptStoreError::Database)?;
         }
-        (version, Some("table")) if version == SCHEMA_VERSION as i64 => {}
+        (version, 1) if version == SCHEMA_VERSION as i64 => {}
         _ => return Err(AttemptStoreError::SchemaMismatch),
     }
+    validate_schema_objects(connection)?;
     validate_schema_shape(connection)?;
     let validated_version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(|_| AttemptStoreError::Database)?;
     if validated_version != SCHEMA_VERSION as i64 {
+        return Err(AttemptStoreError::SchemaMismatch);
+    }
+    Ok(())
+}
+
+fn validate_schema_objects(connection: &Connection) -> Result<(), AttemptStoreError> {
+    let mut statement = connection
+        .prepare("SELECT type, name, tbl_name, sql FROM sqlite_schema")
+        .map_err(|_| AttemptStoreError::Database)?;
+    let mut rows = statement
+        .query([])
+        .map_err(|_| AttemptStoreError::Database)?;
+    let mut object_count = 0;
+    while let Some(row) = rows.next().map_err(|_| AttemptStoreError::Database)? {
+        let object_type: String = row.get(0).map_err(|_| AttemptStoreError::Database)?;
+        let name: String = row.get(1).map_err(|_| AttemptStoreError::Database)?;
+        let table_name: String = row.get(2).map_err(|_| AttemptStoreError::Database)?;
+        let sql: Option<String> = row.get(3).map_err(|_| AttemptStoreError::Database)?;
+        if object_count != 0
+            || object_type != "table"
+            || name != "attempts"
+            || table_name != "attempts"
+            || sql.as_deref() != Some(CREATE_TABLE)
+        {
+            return Err(AttemptStoreError::SchemaMismatch);
+        }
+        object_count += 1;
+    }
+    if object_count != 1 {
         return Err(AttemptStoreError::SchemaMismatch);
     }
     Ok(())
@@ -1200,6 +1214,29 @@ mod tests {
             AttemptStore::open(&database.path).err(),
             Some(AttemptStoreError::SchemaMismatch)
         );
+    }
+
+    #[test]
+    fn unexpected_user_schema_objects_fail_closed() {
+        for extra_schema in [
+            "CREATE TABLE extra (value TEXT)",
+            "CREATE TRIGGER attempt_trigger AFTER INSERT ON attempts BEGIN SELECT 1; END",
+        ] {
+            let database = TestDatabase::new();
+            {
+                let store = AttemptStore::open(&database.path).expect("open store");
+                drop(store);
+            }
+            let connection = Connection::open(&database.path).expect("raw database");
+            connection
+                .execute_batch(extra_schema)
+                .expect("extra schema object");
+            drop(connection);
+            assert_eq!(
+                AttemptStore::open(&database.path).err(),
+                Some(AttemptStoreError::SchemaMismatch)
+            );
+        }
     }
 
     #[test]
