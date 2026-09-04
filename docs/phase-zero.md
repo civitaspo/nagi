@@ -81,6 +81,12 @@ The spike covers:
   reported version is self-attested; immutable artifact provenance and a
   verified private executable copy remain a later signed runtime-manifest
   gate.
+- The `herdr+cursor-agent` adapter reuses the same Herdr CLI/socket boundary,
+  requests `--kind cursor`, and accepts only the canonical argv `["agent"]`;
+  Herdr owns the PTY and vendor launch. Cursor authentication remains
+  operator-managed and out-of-band, with no desktop app, direct Cursor
+  process/protocol/TUI, PAT/API-key/user fallback, or automatic config/hook
+  installation.
 - Narrow hooks that report session start, restore, and exit; semantic lifecycle
   state when supported; stable session references; and a candidate,
   machine-readable result report, including a hook-validated report when
