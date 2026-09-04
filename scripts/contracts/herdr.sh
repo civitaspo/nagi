@@ -730,11 +730,12 @@ fi
 
 LIVE_CHILD_PID="${server_pid}"
 LIVE_CHILD_GROUP_ID="${server_group}"
-if ! live_signal_child_group KILL \
-  || ! wait_for_child_exit "${server_pid}" 100; then
+if ! live_signal_child_group KILL; then
   echo "Herdr CLI/socket contract could not force-stop the server." >&2
   exit 1
 fi
+# Reap immediately after SIGKILL. Polling Bash jobs before wait can surface an
+# asynchronous "Killed: 9" notification on the public stderr stream.
 if wait "${server_pid}" 2>/dev/null; then
   server_wait_status=0
 else

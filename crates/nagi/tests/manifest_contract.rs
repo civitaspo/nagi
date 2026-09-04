@@ -727,6 +727,14 @@ fn herdr_contract_is_opt_in_and_socket_only() {
     assert!(HERDR_SCRIPT_SOURCE.contains("herdrProtocol"));
     assert!(HERDR_SCRIPT_SOURCE.contains("herdrSchema"));
     assert!(HERDR_SCRIPT_SOURCE.contains("herdrRevision"));
+    let force_kill = HERDR_SCRIPT_SOURCE
+        .find("if ! live_signal_child_group KILL")
+        .expect("Herdr force-stop gate");
+    let immediate_wait = HERDR_SCRIPT_SOURCE
+        .find("if wait \"${server_pid}\" 2>/dev/null")
+        .expect("Herdr force-stop reap");
+    assert!(immediate_wait > force_kill);
+    assert!(!HERDR_SCRIPT_SOURCE.contains("|| ! wait_for_child_exit \"${server_pid}\" 100"));
     assert!(HERDR_SOCKET_SOURCE.contains("UNIXSocket"));
     assert!(HERDR_SOCKET_SOURCE.contains("MAX_LINE_BYTES"));
     assert!(HERDR_SOCKET_SOURCE.contains("malformed JSON"));
