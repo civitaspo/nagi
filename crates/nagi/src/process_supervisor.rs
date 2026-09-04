@@ -96,7 +96,7 @@ pub(crate) fn run_bounded_capture(
                 }
             }
 
-            if stdout_reader.is_done() && stderr_reader.is_done() {
+            if status.is_some() && stdout_reader.is_done() && stderr_reader.is_done() {
                 break;
             }
             if Instant::now() >= deadline {
@@ -194,7 +194,6 @@ const READ_BUFFER_BYTES: usize = 8 * 1024;
 struct NonblockingReader<R> {
     reader: Option<R>,
     output: Zeroizing<Vec<u8>>,
-    done: bool,
 }
 
 #[cfg(unix)]
@@ -207,7 +206,6 @@ where
         Ok(Self {
             reader: Some(reader),
             output: Zeroizing::new(Vec::with_capacity(output_limit.min(READ_BUFFER_BYTES))),
-            done: false,
         })
     }
 
@@ -216,7 +214,7 @@ where
     }
 
     fn is_done(&self) -> bool {
-        self.done
+        self.reader.is_none()
     }
 
     fn read_available(
@@ -236,7 +234,6 @@ where
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
                     Err(_) => {
                         self.reader.take();
-                        self.done = true;
                         return Err(CaptureError::Failed);
                     }
                 },
@@ -244,12 +241,10 @@ where
             };
             if count == 0 {
                 self.reader.take();
-                self.done = true;
                 return Ok(());
             }
             if self.output.len().saturating_add(count) > output_limit {
                 self.reader.take();
-                self.done = true;
                 return Err(CaptureError::OutputTooLarge);
             }
             self.output.extend_from_slice(&buffer[..count]);
@@ -533,6 +528,53 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         };
         assert_eq!(marker, "-1:-1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closed_pipes_do_not_skip_supervision_or_leave_child_alive() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock")
+            .as_nanos();
+        let pid_path = std::env::temp_dir().join(format!(
+            "nagi-process-supervisor-{}-{nonce}-closed-pipes-pid",
+            std::process::id()
+        ));
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                r#"printf '%s\n' "$$" > "$1"; exec 1>&- 2>&-; exec sleep 5"#,
+                "closed-pipes",
+                pid_path.to_str().expect("PID path must be valid UTF-8"),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let started = Instant::now();
+        let captured = run_bounded_capture(command, Duration::from_millis(150), 1024);
+        let pid = std::fs::read_to_string(&pid_path)
+            .expect("supervised child PID file")
+            .trim()
+            .parse::<libc::pid_t>()
+            .expect("supervised child PID");
+        let _ = std::fs::remove_file(&pid_path);
+
+        assert!(pid > 0);
+        assert!(matches!(captured, Err(CaptureError::TimedOut)));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        for target in [pid, -pid] {
+            let result = unsafe { libc::kill(target, 0) };
+            let error = std::io::Error::last_os_error();
+            assert_eq!(result, -1, "process target {target} is still alive");
+            assert_eq!(
+                error.raw_os_error(),
+                Some(libc::ESRCH),
+                "process target {target} returned an unexpected probe error"
+            );
+        }
     }
 
     #[cfg(unix)]
