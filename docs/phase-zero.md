@@ -101,8 +101,13 @@ See the strict normalized, redacted report contract in
 [version-1 schema](../tests/agent-report/v1.schema.json). It requires the
 versioned attempt/backend/session identity, one closed outcome, bounded
 validation metadata, optional sanitized commit/PR references, and a bounded
-summary. An agent `done` outcome never completes Linear; Nagi validates the
-report and owns acceptance and the final completion decision.
+summary. Trusted adapters sanitize before construction/submission; parser
+shape/bound and known unsafe-marker checks are defense in depth, not proof of
+arbitrary redaction. Accepted report content is local-sensitive and must
+never be copied into public evidence; raw terminal output, prompts, provider
+payloads, tokens, and private machine paths must never be persisted there. An
+agent `done` outcome never completes Linear; Nagi validates the report and
+owns acceptance and the final completion decision.
 
 ## Go/no-go gates
 
@@ -116,7 +121,7 @@ negative cases pass.
 | Linear read contract | Live reads use exact supplied IDs for the synthetic setup issue with bounded pagination and redacted evidence; enumeration and domain-data writes remain forbidden. | No-go for Linear integration. |
 | Temporal contract | The required workflow operations replay and recover after interruption or process termination without losing durable state or crossing database boundaries. Replay compatibility is checked by a sanitized synthetic `History` corpus produced by the pinned sidecar, intentionally committed/public as a repository fixture, and replayed server-free by default tests; raw captures remain private. Its manifest records `"deploymentVersioning": "not_exercised"`; the witness includes exact two-run Continue-As-New linkage and explicit no-routing coverage for Worker Deployment Versioning. | No-go for workflow implementation. |
 | Herdr CLI/socket contract | The selected Herdr revision, API protocol/schema, external CLI, and Unix socket transport satisfy bounded workspace/session orchestration, snapshots, subscriptions, and graceful restart/resnapshot behavior. Agent interruption/resume, crash recovery, and reconnect event reconciliation remain in the later Agent observation and recovery gate. | No-go for agent execution. |
-| Normalized agent report | Backends emit only the strict version-1, bounded, redacted report defined in ADR-0003; Nagi validates it before any later result handling, and `done` remains observational. | No-go for result handling. |
+| Normalized agent report | Trusted adapters sanitize the strict version-1 report defined in ADR-0003; Nagi validates its closed shape and bounds before later result handling, while accepted content remains local-sensitive and `done` remains observational. Raw output, prompts, provider payloads, tokens, and private paths never enter public evidence. | No-go for result handling. |
 | Agent observation and recovery | Screen-manifest observations, hooks, interrupt/resume, reconnect, duplicate/out-of-order events, TTLs, and unknown states reconcile durably; `idle`, `done`, and `blocked` never directly imply Linear `Done`. | No-go for controller progression. |
 | Managed Codex authentication | Only if the `herdr+codex` contract proves it necessary, the dormant P0-11 boundary passes its existing narrow gate. Otherwise it is not a Phase 0 gate and any change/removal is a separate corrective ADR/PR. | Keep the path blocked; do not add PAT, user-actor, or silent fallback. |
 | Operator surface | `nagi watch` can show Nagi state and Herdr observations, interrupt safely, and reconnect without relying on a desktop sidebar. | No-go for operator workflow. |

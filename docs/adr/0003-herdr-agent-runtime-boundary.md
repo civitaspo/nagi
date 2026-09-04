@@ -104,12 +104,16 @@ shape is defined by [`tests/agent-report/v1.schema.json`](../../tests/agent-repo
 
 `outcome` is one of `continue`, `review`, `blocked`, `done`, or `failed`.
 `commitRef` and `pullRequestRef` are optional and are omitted when absent.
-Reports are bounded and redacted. They contain no raw terminal output,
-prompts, provider payloads, tokens, or private machine paths. The exact JSON
-Schema, field bounds, source validation, and negative cases are enforced by
-the `nagi::agent_report` parser and its server-free contract tests. The parser
-accepts only full lowercase commit hashes and numeric `pr-N` references, and
-`done` remains an observation that never authorizes Linear completion.
+Trusted backend adapters sanitize reports before construction or submission.
+The `nagi::agent_report` parser enforces the exact JSON shape, bounds, and
+known control/protocol/path/credential markers as defense in depth; those
+finite checks cannot prove that arbitrary opaque tokens or private paths were
+removed. Accepted report content remains local-sensitive and must never be
+copied into public evidence. Raw terminal output, prompts, provider payloads,
+tokens, and private machine paths must never be persisted in that evidence.
+The parser accepts only full lowercase commit hashes and numeric `pr-N`
+references, and `done` remains an observation that never authorizes Linear
+completion.
 
 ## Phase 0 sequencing and related decisions
 

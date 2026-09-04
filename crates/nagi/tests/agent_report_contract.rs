@@ -1,12 +1,19 @@
 //! Server-free checks for the normalized agent report contract.
 
-use std::collections::BTreeSet;
-
 use nagi::agent_report::{AgentOutcome, AgentReport, SCHEMA_VERSION, ValidationStatus};
 use serde_json::{Map, Value, json};
 
 const REPORT_SCHEMA: &str = include_str!("../../../tests/agent-report/v1.schema.json");
 const REPORT_FIXTURE: &str = include_str!("../../../tests/fixtures/agent-report.v1.json");
+const REQUIRED_FIELDS: &[&str] = &[
+    "schemaVersion",
+    "attemptId",
+    "backend",
+    "agentSessionRef",
+    "outcome",
+    "validation",
+    "summary",
+];
 
 fn object<'a>(label: &str, value: &'a Value) -> &'a Map<String, Value> {
     value
@@ -14,51 +21,24 @@ fn object<'a>(label: &str, value: &'a Value) -> &'a Map<String, Value> {
         .unwrap_or_else(|| panic!("{label} must be an object"))
 }
 
-fn exact_keys(value: &Map<String, Value>, expected: &[&str]) -> bool {
-    let actual = value.keys().cloned().collect::<BTreeSet<_>>();
-    let expected = expected
-        .iter()
-        .map(|key| (*key).to_owned())
-        .collect::<BTreeSet<_>>();
-    actual == expected
-}
-
 #[test]
-fn schema_is_versioned_closed_and_matches_the_report_shape() {
+fn schema_and_fixture_stay_bound_to_the_parser() {
     let schema: Value = serde_json::from_str(REPORT_SCHEMA).expect("report schema JSON");
     let schema = object("report schema", &schema);
     assert_eq!(schema.get("type"), Some(&json!("object")));
     assert_eq!(schema.get("additionalProperties"), Some(&json!(false)));
-    assert_eq!(
-        schema.get("required"),
-        Some(&json!([
-            "schemaVersion",
-            "attemptId",
-            "backend",
-            "agentSessionRef",
-            "outcome",
-            "validation",
-            "summary"
-        ]))
-    );
+    let required = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .expect("report schema required fields");
+    assert_eq!(required.len(), REQUIRED_FIELDS.len());
+    for field in REQUIRED_FIELDS {
+        assert!(required.iter().any(|value| value.as_str() == Some(*field)));
+    }
     let properties = object(
         "report schema properties",
         schema.get("properties").unwrap(),
     );
-    assert!(exact_keys(
-        properties,
-        &[
-            "schemaVersion",
-            "attemptId",
-            "backend",
-            "agentSessionRef",
-            "outcome",
-            "validation",
-            "commitRef",
-            "pullRequestRef",
-            "summary"
-        ]
-    ));
     assert_eq!(
         object("schemaVersion", properties.get("schemaVersion").unwrap()).get("const"),
         Some(&json!(SCHEMA_VERSION))
@@ -78,34 +58,35 @@ fn schema_is_versioned_closed_and_matches_the_report_shape() {
         .get("status"),
         Some(&json!({"enum": ["not_run", "passed", "failed"]}))
     );
-}
+    assert!(properties.contains_key("commitRef"));
+    assert!(properties.contains_key("pullRequestRef"));
 
-#[test]
-fn synthetic_fixture_is_strictly_accepted_and_redacted() {
+    let fixture: Value = serde_json::from_str(REPORT_FIXTURE).expect("fixture value");
+    let fixture_object = object("report fixture", &fixture);
+    for field in REQUIRED_FIELDS {
+        assert!(
+            fixture_object.contains_key(*field),
+            "fixture missing {field}"
+        );
+    }
     let report = AgentReport::parse_json(REPORT_FIXTURE).expect("synthetic report fixture");
     assert_eq!(report.schema_version(), SCHEMA_VERSION);
+    assert_eq!(report.attempt_id(), "attempt-synthetic-001");
     assert_eq!(report.backend(), "herdr+codex");
+    assert_eq!(report.agent_session_ref(), "session-synthetic-001");
     assert_eq!(report.outcome(), AgentOutcome::Done);
     assert_eq!(report.validation().status(), ValidationStatus::Passed);
     assert_eq!(
-        serde_json::to_value(&report).expect("report value"),
-        serde_json::from_str::<Value>(REPORT_FIXTURE).expect("fixture value")
+        report.commit_ref(),
+        Some("0123456789abcdef0123456789abcdef01234567")
     );
-    let value = serde_json::to_value(report).expect("report value");
-    assert!(exact_keys(
-        object("report", &value),
-        &[
-            "schemaVersion",
-            "attemptId",
-            "backend",
-            "agentSessionRef",
-            "outcome",
-            "validation",
-            "commitRef",
-            "pullRequestRef",
-            "summary"
-        ]
-    ));
+    assert_eq!(report.pull_request_ref(), Some("pr-42"));
+    assert_eq!(
+        report.summary(),
+        "Synthetic report is ready for controller validation."
+    );
+    // The fixture is sanitized test input; these checks do not prove that a
+    // finite parser denylist can redact arbitrary adapter content.
     assert!(!REPORT_FIXTURE.contains("terminalOutput"));
     assert!(!REPORT_FIXTURE.contains("prompt"));
     assert!(!REPORT_FIXTURE.contains("token"));

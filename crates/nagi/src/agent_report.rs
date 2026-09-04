@@ -2,13 +2,16 @@
 //!
 //! A report is an observation returned by an agent backend.  Parsing a report
 //! does not accept an attempt, update Linear, or make an `outcome: "done"`
-//! observation authoritative.  The boundary accepts only the small versioned
-//! shape below and rejects raw terminal output, prompts, provider payloads,
-//! credentials, and machine-private paths.
+//! observation authoritative. Trusted backend adapters sanitize before
+//! constructing/submitting reports. The parser enforces the strict versioned
+//! shape and bounds and rejects explicit raw fields, controls, protocol
+//! markers, and known path/credential markers as defense in depth; it cannot
+//! prove arbitrary token or private-path redaction. Accepted report content is
+//! local-sensitive and must never be copied into public evidence.
 
 use std::fmt;
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer};
 
 /// The only normalized agent report schema version currently accepted.
 pub const SCHEMA_VERSION: u8 = 1;
@@ -33,7 +36,7 @@ pub enum AgentReportError {
     UnsupportedSchemaVersion,
     /// A required field or reference had the wrong type or format.
     InvalidField,
-    /// A bounded field contained content disallowed at this boundary.
+    /// A bounded field contained a known disallowed content marker.
     ForbiddenContent,
 }
 
@@ -54,7 +57,7 @@ impl fmt::Display for AgentReportError {
 impl std::error::Error for AgentReportError {}
 
 /// The observed result of one agent attempt.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentOutcome {
     /// The attempt may continue.
@@ -70,7 +73,7 @@ pub enum AgentOutcome {
 }
 
 /// The bounded validation observation carried by a report.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ValidationStatus {
     /// No validation was run by the reporting backend.
@@ -82,7 +85,7 @@ pub enum ValidationStatus {
 }
 
 /// Validation metadata in a normalized report.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AgentValidation {
     status: ValidationStatus,
 }
@@ -94,14 +97,15 @@ impl AgentValidation {
     }
 }
 
-/// A validated normalized agent report.
+/// A normalized agent report accepted after strict parsing.
 ///
-/// Instances can only be constructed through [`AgentReport::parse_json`] or
-/// serde deserialization, both of which apply the same strict checks.  The
-/// type contains observations only; it has no completion or Linear mutation
-/// operation.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+/// Trusted backend adapters must sanitize before constructing a report. The
+/// parser checks shape, bounds, and known unsafe markers as defense in depth;
+/// acceptance is not proof that arbitrary opaque tokens or private paths were
+/// removed. Report contents remain local-sensitive and must never be copied
+/// into public evidence. The type contains observations only; it has no
+/// completion or Linear mutation operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentReport {
     schema_version: u8,
     attempt_id: String,
@@ -109,9 +113,7 @@ pub struct AgentReport {
     agent_session_ref: String,
     outcome: AgentOutcome,
     validation: AgentValidation,
-    #[serde(skip_serializing_if = "Option::is_none")]
     commit_ref: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pull_request_ref: Option<String>,
     summary: String,
 }
@@ -146,8 +148,11 @@ where
 }
 
 impl AgentReport {
-    /// Parses one JSON report and applies the complete version, shape, bound,
-    /// and privacy contract.
+    /// Parses one JSON report through the bounded construction path.
+    ///
+    /// The input must already have been sanitized by its trusted backend
+    /// adapter. This parser adds strict shape/bound checks and known-marker
+    /// defense in depth, but cannot prove arbitrary content redaction.
     pub fn parse_json(input: &str) -> Result<Self, AgentReportError> {
         if input.len() > MAX_REPORT_BYTES {
             return Err(AgentReportError::Malformed);
@@ -155,20 +160,6 @@ impl AgentReport {
         let wire: WireAgentReport =
             serde_json::from_str(input).map_err(|_| AgentReportError::Malformed)?;
         Self::from_wire(wire)
-    }
-
-    /// Re-checks the report's invariant without exposing report contents in an
-    /// error value.
-    pub fn validate(&self) -> Result<(), AgentReportError> {
-        validate_values(
-            self.schema_version,
-            &self.attempt_id,
-            &self.backend,
-            &self.agent_session_ref,
-            self.commit_ref.as_deref(),
-            self.pull_request_ref.as_deref(),
-            &self.summary,
-        )
     }
 
     /// Returns the schema version.
@@ -201,17 +192,17 @@ impl AgentReport {
         self.validation
     }
 
-    /// Returns the optional sanitized full commit reference.
+    /// Returns the optional bounded full commit reference.
     pub fn commit_ref(&self) -> Option<&str> {
         self.commit_ref.as_deref()
     }
 
-    /// Returns the optional sanitized pull-request reference.
+    /// Returns the optional bounded pull-request reference.
     pub fn pull_request_ref(&self) -> Option<&str> {
         self.pull_request_ref.as_deref()
     }
 
-    /// Returns the bounded sanitized summary.
+    /// Returns the bounded local-sensitive summary.
     pub fn summary(&self) -> &str {
         &self.summary
     }
@@ -242,16 +233,6 @@ impl AgentReport {
             pull_request_ref: wire.pull_request_ref,
             summary: wire.summary,
         })
-    }
-}
-
-impl<'de> Deserialize<'de> for AgentReport {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = WireAgentReport::deserialize(deserializer)?;
-        Self::from_wire(wire).map_err(|error| serde::de::Error::custom(error.to_string()))
     }
 }
 
@@ -390,15 +371,10 @@ fn validate_summary(value: &str) -> Result<(), AgentReportError> {
         "github_pat_",
         "xoxb-",
         "xoxp-",
-        "access_token",
-        "refresh_token",
-        "client_secret",
         "api_key",
         "password",
         "secret",
         "token",
-        "secret=",
-        "token=",
         "-----begin",
     ];
     if FORBIDDEN_MARKERS
@@ -421,23 +397,6 @@ mod tests {
     }
 
     #[test]
-    fn fixture_is_valid_and_round_trips_without_optional_nulls() {
-        let report = AgentReport::parse_json(FIXTURE).expect("valid normalized report");
-        assert_eq!(report.schema_version(), SCHEMA_VERSION);
-        assert_eq!(report.outcome(), AgentOutcome::Done);
-        assert_eq!(report.validation().status(), ValidationStatus::Passed);
-        report.validate().expect("validated report remains valid");
-        let encoded = serde_json::to_value(report).expect("serialize normalized report");
-        assert_eq!(encoded, fixture_value());
-        assert!(
-            !encoded
-                .as_object()
-                .expect("report object")
-                .contains_key("acceptance")
-        );
-    }
-
-    #[test]
     fn every_outcome_is_an_observation() {
         for outcome in [
             AgentOutcome::Continue,
@@ -447,7 +406,13 @@ mod tests {
             AgentOutcome::Failed,
         ] {
             let mut value = fixture_value();
-            value["outcome"] = serde_json::to_value(outcome).expect("outcome JSON");
+            value["outcome"] = serde_json::json!(match outcome {
+                AgentOutcome::Continue => "continue",
+                AgentOutcome::Review => "review",
+                AgentOutcome::Blocked => "blocked",
+                AgentOutcome::Done => "done",
+                AgentOutcome::Failed => "failed",
+            });
             let report = AgentReport::parse_json(&value.to_string()).expect("valid outcome");
             assert_eq!(report.outcome(), outcome);
         }
@@ -462,19 +427,6 @@ mod tests {
         let report = AgentReport::parse_json(&value.to_string()).expect("omitted refs");
         assert_eq!(report.commit_ref(), None);
         assert_eq!(report.pull_request_ref(), None);
-        let encoded = serde_json::to_value(report).expect("serialize omitted refs");
-        assert!(
-            !encoded
-                .as_object()
-                .expect("report object")
-                .contains_key("commitRef")
-        );
-        assert!(
-            !encoded
-                .as_object()
-                .expect("report object")
-                .contains_key("pullRequestRef")
-        );
 
         let mut null_value = fixture_value();
         null_value["commitRef"] = serde_json::Value::Null;
@@ -516,7 +468,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unbounded_or_private_content() {
+    fn rejects_explicit_known_unsafe_content_as_defense_in_depth() {
+        // These checks reject known unsafe markers; adapter sanitization is
+        // still required because this finite list cannot prove redaction.
         let mut too_long_attempt = fixture_value();
         too_long_attempt["attemptId"] = serde_json::json!("a".repeat(MAX_ATTEMPT_ID_BYTES + 1));
         assert!(matches!(
