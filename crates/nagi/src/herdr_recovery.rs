@@ -920,7 +920,7 @@ impl Reconciler {
         }
 
         self.validate_ordering(event)?;
-        self.apply_event(event)?;
+        self.apply_event(event);
         self.history.push_back(event.clone());
         if self.history.len() > MAX_HISTORY {
             self.history.pop_front();
@@ -962,7 +962,7 @@ impl Reconciler {
         }
     }
 
-    fn apply_event(&mut self, event: &HookObservation) -> Result<(), ReconcileError> {
+    fn apply_event(&mut self, event: &HookObservation) {
         match &event.event {
             HookEvent::SessionStarted { session_ref }
             | HookEvent::SessionRestored { session_ref } => {
@@ -981,7 +981,6 @@ impl Reconciler {
                 self.phase = ReconcilerPhase::Exited;
             }
         }
-        Ok(())
     }
 
     fn invalidate(&mut self, reason: NeedSnapshotReason) {
