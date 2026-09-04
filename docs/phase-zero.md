@@ -51,6 +51,15 @@ The spike covers:
   report session identity; lifecycle state is derived from screen-manifest
   detection. `idle`, `done`, and `blocked` are observations and must never
   directly become Linear `Done`.
+- The focused `herdr+codex` runner maps workspace creation to `workspace
+  create`, starts Codex with `agent start <name> --kind codex --pane <pane>`,
+  submits prompts with `agent prompt`, interrupts with `agent send-keys
+  <name> ctrl+c`, and observes through a bounded `session.snapshot` request.
+  Reports are accepted only through the strict `nagi::agent_report` parser.
+  Herdr 0.8.2 has no direct agent-resume command, so the runner returns a
+  typed unsupported/deferred result; session restore remains part of the
+  later observation and recovery gate. Stopping delegates to Herdr's
+  workspace close operation and never kills a vendor process directly.
 - Narrow hooks that report session start, restore, and exit; semantic lifecycle
   state when supported; stable session references; and a candidate,
   machine-readable result report, including a hook-validated report when
