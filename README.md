@@ -52,10 +52,16 @@ or report metadata. Herdr lifecycle is observational; no command changes
 Linear state or installs hooks/configuration.
 
 `work list` is keyset-paginated and prints only bounded local attempt metadata.
-Work commands serialize through an owner-only adjacent database lock. If a
-workspace, agent, or prompt effect is ambiguous, `work status` never retries
-it when a snapshot is absent; use the explicit `work resolve` confirmation
-before the next newly authorized effect.
+For `work list` and `work resolve`, the recovery configuration may contain only
+the `attempt_db` locator; other known full-runtime fields are ignored, while
+unknown names still fail closed.
+Work commands serialize through a nonblocking lock on the owner-only state
+directory containing the validated SQLite database; no adjacent lock file is
+created. This coordinates Nagi processes using the same validated database
+identity, while a same-UID path replacement after validation remains a
+documented residual risk. If a workspace, agent, or prompt effect is
+ambiguous, `work status` never retries it when a snapshot is absent; use the
+explicit `work resolve` confirmation before the next newly authorized effect.
 
 ## Project documentation
 

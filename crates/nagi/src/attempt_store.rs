@@ -6,16 +6,22 @@
 //! bounded values accepted here.
 //!
 //! Opening binds the database's checked Unix device/inode across the open and
-//! validates existing WAL/SHM sidecars as owner-only regular files. This is a
-//! bounded defense within rusqlite, not a race-free path proof: a same-UID
-//! actor can still replace a parent or final path after those checks.
+//! validates existing WAL/SHM sidecars as owner-only regular files. SQLite WAL
+//! uses file locks that conflict with a held database `flock` on macOS, so the
+//! store holds a nonblocking `flock` on the validated owner-only state-directory
+//! descriptor instead; no adjacent lock file is created. This serializes
+//! cooperating Nagi processes using the same validated state directory and DB
+//! identity. It is not a race-free path proof: a same-UID actor can still
+//! replace a parent or final path after those checks.
 
 use crate::agent_report::AgentReport;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params};
 use std::fmt;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::path::{Component, Path, PathBuf};
 
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
@@ -40,6 +46,8 @@ pub enum AttemptStoreError {
     UnsafePath,
     /// SQLite returned an internal or I/O failure.
     Database,
+    /// Another Nagi process holds the state-directory lock.
+    Busy,
     /// The database schema was absent, unknown, malformed, or newer.
     SchemaMismatch,
     /// The requested attempt does not exist.
@@ -68,6 +76,7 @@ impl fmt::Display for AttemptStoreError {
             Self::InvalidInput => "attempt store input is invalid",
             Self::UnsafePath => "attempt store path is unsafe",
             Self::Database => "attempt store database operation failed",
+            Self::Busy => "attempt store database is busy",
             Self::SchemaMismatch => "attempt store schema is unsupported",
             Self::NotFound => "attempt was not found",
             Self::DuplicateAttemptMismatch => "attempt already exists with different binding",
@@ -280,6 +289,11 @@ impl fmt::Debug for AttemptRecord {
 /// An explicitly selected durable SQLite attempt database.
 pub struct AttemptStore {
     connection: Connection,
+    path: PathBuf,
+    identity: DatabaseIdentity,
+    state_directory: PathBuf,
+    state_identity: DatabaseIdentity,
+    lock_file: File,
 }
 
 impl fmt::Debug for AttemptStore {
@@ -299,6 +313,15 @@ impl AttemptStore {
         validate_database_path(&path)?;
         let identity = ensure_database_file(&path)?;
         validate_sidecars(&path, identity)?;
+        let state_directory = path
+            .parent()
+            .ok_or(AttemptStoreError::UnsafePath)?
+            .to_owned();
+        let state_identity = ensure_state_directory(&state_directory)?;
+        let lock_file = open_state_directory_lock_file(&state_directory, state_identity)?;
+        acquire_state_directory_lock(&lock_file)?;
+        validate_open_state_directory_identity(&lock_file, &state_directory, state_identity)?;
+        validate_sidecars(&path, identity)?;
         let mut connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE)
             .map_err(|_| AttemptStoreError::Database)?;
         if validate_database_file(&path)? != identity {
@@ -311,7 +334,28 @@ impl AttemptStore {
             return Err(AttemptStoreError::UnsafePath);
         }
         validate_sidecars(&path, identity)?;
-        Ok(Self { connection })
+        let store = Self {
+            connection,
+            path,
+            identity,
+            state_directory,
+            state_identity,
+            lock_file,
+        };
+        store.validate_identity()?;
+        Ok(store)
+    }
+
+    fn validate_identity(&self) -> Result<(), AttemptStoreError> {
+        if validate_database_file(&self.path)? != self.identity {
+            return Err(AttemptStoreError::UnsafePath);
+        }
+        validate_open_state_directory_identity(
+            &self.lock_file,
+            &self.state_directory,
+            self.state_identity,
+        )?;
+        validate_sidecars(&self.path, self.identity)
     }
 
     /// Creates one attempt, or returns the existing identical binding
@@ -323,6 +367,7 @@ impl AttemptStore {
         backend: AttemptBackend,
         now_ms: i64,
     ) -> Result<AttemptRecord, AttemptStoreError> {
+        self.validate_identity()?;
         validate_attempt_id(attempt_id)?;
         validate_issue_id(issue_id)?;
         validate_timestamp(now_ms)?;
@@ -360,6 +405,7 @@ impl AttemptStore {
         attempt_id: &str,
         now_ms: i64,
     ) -> Result<AttemptRecord, AttemptStoreError> {
+        self.validate_identity()?;
         self.transition_idempotent(
             attempt_id,
             AttemptState::Created,
@@ -376,6 +422,7 @@ impl AttemptStore {
         workspace_ref: &str,
         now_ms: i64,
     ) -> Result<AttemptRecord, AttemptStoreError> {
+        self.validate_identity()?;
         validate_attempt_id(attempt_id)?;
         validate_opaque_ref(workspace_ref)?;
         validate_timestamp(now_ms)?;
@@ -419,6 +466,7 @@ impl AttemptStore {
         attempt_id: &str,
         now_ms: i64,
     ) -> Result<AttemptRecord, AttemptStoreError> {
+        self.validate_identity()?;
         self.transition_idempotent(
             attempt_id,
             AttemptState::WorkspaceReady,
@@ -435,6 +483,7 @@ impl AttemptStore {
         agent_ref: &str,
         now_ms: i64,
     ) -> Result<AttemptRecord, AttemptStoreError> {
+        self.validate_identity()?;
         validate_attempt_id(attempt_id)?;
         validate_opaque_ref(workspace_ref)?;
         validate_opaque_ref(agent_ref)?;
@@ -482,6 +531,7 @@ impl AttemptStore {
         attempt_id: &str,
         now_ms: i64,
     ) -> Result<AttemptRecord, AttemptStoreError> {
+        self.validate_identity()?;
         self.transition_idempotent(
             attempt_id,
             AttemptState::AgentReady,
@@ -496,6 +546,7 @@ impl AttemptStore {
         attempt_id: &str,
         now_ms: i64,
     ) -> Result<AttemptRecord, AttemptStoreError> {
+        self.validate_identity()?;
         self.transition_idempotent(
             attempt_id,
             AttemptState::PromptPending,
@@ -513,6 +564,7 @@ impl AttemptStore {
         resolution: AttemptResolution,
         now_ms: i64,
     ) -> Result<AttemptRecord, AttemptStoreError> {
+        self.validate_identity()?;
         validate_attempt_id(attempt_id)?;
         validate_timestamp(now_ms)?;
         let transaction = self
@@ -557,6 +609,7 @@ impl AttemptStore {
         attempt_id: &str,
         now_ms: i64,
     ) -> Result<(AttemptRecord, bool), AttemptStoreError> {
+        self.validate_identity()?;
         validate_attempt_id(attempt_id)?;
         validate_timestamp(now_ms)?;
         let transaction = self
@@ -604,6 +657,7 @@ impl AttemptStore {
         revision: u64,
         now_ms: i64,
     ) -> Result<AttemptRecord, AttemptStoreError> {
+        self.validate_identity()?;
         validate_attempt_id(attempt_id)?;
         let revision = revision_to_sql(revision)?;
         validate_timestamp(now_ms)?;
@@ -665,6 +719,7 @@ impl AttemptStore {
         revision: u64,
         now_ms: i64,
     ) -> Result<AttemptRecord, AttemptStoreError> {
+        self.validate_identity()?;
         validate_attempt_id(attempt_id)?;
         let revision = revision_to_sql(revision)?;
         validate_timestamp(now_ms)?;
@@ -707,6 +762,7 @@ impl AttemptStore {
         report_json: &str,
         now_ms: i64,
     ) -> Result<AttemptRecord, AttemptStoreError> {
+        self.validate_identity()?;
         validate_attempt_id(attempt_id)?;
         validate_timestamp(now_ms)?;
         let report =
@@ -765,18 +821,20 @@ impl AttemptStore {
 
     /// Loads one attempt, validating all persisted fields before returning it.
     pub fn get(&self, attempt_id: &str) -> Result<Option<AttemptRecord>, AttemptStoreError> {
+        self.validate_identity()?;
         validate_attempt_id(attempt_id)?;
         load_record(&self.connection, attempt_id)
     }
 
     /// Returns one bounded keyset page of nonterminal attempts. The optional
-    /// cursor is the last visible attempt ID from the preceding page and must
-    /// still identify a visible, valid row.
+    /// cursor is the last attempt ID returned by the preceding page and must
+    /// still identify a retained, valid row, even if it has since failed.
     pub fn list_nonterminal_page(
         &self,
         after_attempt_id: Option<&str>,
         limit: usize,
     ) -> Result<AttemptPage, AttemptStoreError> {
+        self.validate_identity()?;
         if limit == 0 {
             return Err(AttemptStoreError::InvalidInput);
         }
@@ -790,9 +848,6 @@ impl AttemptStore {
                 validate_attempt_id(attempt_id)?;
                 let record = load_record(&self.connection, attempt_id)?
                     .ok_or(AttemptStoreError::InvalidInput)?;
-                if record.state() == AttemptState::Failed {
-                    return Err(AttemptStoreError::InvalidInput);
-                }
                 Some((record.created_at_ms(), attempt_id.to_owned()))
             }
         };
@@ -832,6 +887,7 @@ impl AttemptStore {
         target: AttemptState,
         now_ms: i64,
     ) -> Result<AttemptRecord, AttemptStoreError> {
+        self.validate_identity()?;
         validate_attempt_id(attempt_id)?;
         validate_timestamp(now_ms)?;
         let transaction = self
@@ -1112,7 +1168,25 @@ fn validate_database_path(path: &Path) -> Result<(), AttemptStoreError> {
         return Err(AttemptStoreError::UnsafePath);
     }
     let parent = path.parent().ok_or(AttemptStoreError::UnsafePath)?;
-    validate_parent_directory(parent)
+    validate_parent_directory(parent)?;
+    validate_state_directory(parent)
+}
+
+fn validate_state_directory(path: &Path) -> Result<(), AttemptStoreError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| AttemptStoreError::UnsafePath)?;
+    #[cfg(unix)]
+    {
+        let mode = metadata.permissions().mode();
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || mode & 0o777 != 0o700
+            || mode & 0o7000 != 0
+        {
+            return Err(AttemptStoreError::UnsafePath);
+        }
+    }
+    Ok(())
 }
 
 fn validate_parent_directory(path: &Path) -> Result<(), AttemptStoreError> {
@@ -1216,6 +1290,73 @@ fn validate_database_file(path: &Path) -> Result<DatabaseIdentity, AttemptStoreE
         }
     }
     Ok(DatabaseIdentity::from_metadata(&metadata))
+}
+
+fn ensure_state_directory(path: &Path) -> Result<DatabaseIdentity, AttemptStoreError> {
+    validate_state_directory(path)?;
+    let metadata = fs::symlink_metadata(path).map_err(|_| AttemptStoreError::UnsafePath)?;
+    Ok(DatabaseIdentity::from_metadata(&metadata))
+}
+
+fn open_state_directory_lock_file(
+    path: &Path,
+    expected: DatabaseIdentity,
+) -> Result<File, AttemptStoreError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let file = options
+        .open(path)
+        .map_err(|_| AttemptStoreError::UnsafePath)?;
+    validate_open_state_directory_identity(&file, path, expected)?;
+    Ok(file)
+}
+
+fn acquire_state_directory_lock(file: &File) -> Result<(), AttemptStoreError> {
+    #[cfg(unix)]
+    {
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result != 0 {
+            let code = std::io::Error::last_os_error().raw_os_error();
+            if code == Some(libc::EWOULDBLOCK) || code == Some(libc::EAGAIN) {
+                return Err(AttemptStoreError::Busy);
+            }
+            return Err(AttemptStoreError::Database);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = file;
+    Ok(())
+}
+
+fn validate_open_state_directory_identity(
+    file: &File,
+    path: &Path,
+    expected: DatabaseIdentity,
+) -> Result<(), AttemptStoreError> {
+    let file_metadata = file.metadata().map_err(|_| AttemptStoreError::UnsafePath)?;
+    let path_metadata = fs::symlink_metadata(path).map_err(|_| AttemptStoreError::UnsafePath)?;
+    let path_identity = DatabaseIdentity::from_metadata(&path_metadata);
+    if path_identity != expected
+        || !path_metadata.is_dir()
+        || path_metadata.file_type().is_symlink()
+        || !file_metadata.is_dir()
+    {
+        return Err(AttemptStoreError::UnsafePath);
+    }
+    #[cfg(unix)]
+    {
+        if file_metadata.dev() != expected.device
+            || file_metadata.ino() != expected.inode
+            || file_metadata.uid() != expected.owner
+            || file_metadata.permissions().mode() & 0o777 != 0o700
+            || file_metadata.permissions().mode() & 0o7000 != 0
+        {
+            return Err(AttemptStoreError::UnsafePath);
+        }
+    }
+    Ok(())
 }
 
 fn validate_sidecars(
@@ -1584,9 +1725,14 @@ mod tests {
         let first = store.list_nonterminal_page(None, 64).expect("first page");
         assert_eq!(first.records().len(), 64);
         assert!(first.has_more());
-        let cursor = first.records().last().expect("last first row").attempt_id();
+        let cursor = first
+            .records()
+            .last()
+            .expect("last first row")
+            .attempt_id()
+            .to_owned();
         let second = store
-            .list_nonterminal_page(Some(cursor), 64)
+            .list_nonterminal_page(Some(&cursor), 64)
             .expect("second page");
         assert_eq!(second.records().len(), 2);
         assert!(!second.has_more());
@@ -1606,17 +1752,20 @@ mod tests {
             Some(AttemptStoreError::InvalidInput)
         );
 
-        let failed_id = "attempt-failed";
+        mark_started_for_test(&mut store, &cursor, "workspace-failed", "agent-failed", 2);
         store
-            .create(failed_id, ISSUE_ID, AttemptBackend::HerdrCodex, 2)
-            .expect("create failed");
-        mark_started_for_test(&mut store, failed_id, "workspace-failed", "agent-failed", 2);
-        store
-            .record_observation(failed_id, AttemptState::Failed, 1, 3)
+            .record_observation(&cursor, AttemptState::Failed, 1, 3)
             .expect("fail attempt");
+        let after_failed = store
+            .list_nonterminal_page(Some(&cursor), 64)
+            .expect("failed cursor remains a keyset anchor");
         assert_eq!(
-            store.list_nonterminal_page(Some(failed_id), 64).err(),
-            Some(AttemptStoreError::InvalidInput)
+            after_failed
+                .records()
+                .iter()
+                .map(AttemptRecord::attempt_id)
+                .collect::<Vec<_>>(),
+            vec!["attempt-064", "attempt-065"]
         );
     }
 
@@ -1705,6 +1854,53 @@ mod tests {
         std::os::unix::fs::symlink(&target, &symlink).expect("symlink");
         assert_eq!(
             AttemptStore::open(&symlink).err(),
+            Some(AttemptStoreError::UnsafePath)
+        );
+
+        let database_hardlink = database.root.join("database-hardlink.db");
+        fs::hard_link(&database.path, &database_hardlink).expect("database hardlink");
+        assert_eq!(
+            AttemptStore::open(&database.path).err(),
+            Some(AttemptStoreError::UnsafePath)
+        );
+        fs::remove_file(&database_hardlink).expect("remove database hardlink");
+
+        fs::set_permissions(&database.root, fs::Permissions::from_mode(0o750))
+            .expect("unsafe state directory mode");
+        assert_eq!(
+            AttemptStore::open(&database.path).err(),
+            Some(AttemptStoreError::UnsafePath)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_directory_lock_contends_and_releases_on_drop() {
+        let database = TestDatabase::new();
+        let first = AttemptStore::open(&database.path).expect("first store");
+        let path = database.path.clone();
+        let second = std::thread::spawn(move || AttemptStore::open(&path).err())
+            .join()
+            .expect("second store");
+        assert_eq!(second, Some(AttemptStoreError::Busy));
+        drop(first);
+        AttemptStore::open(&database.path).expect("lock released after drop");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_store_rejects_database_path_replacement_before_use() {
+        let database = TestDatabase::new();
+        let store = AttemptStore::open(&database.path).expect("store");
+        let replacement = database.root.join("replacement.db");
+        fs::copy(&database.path, &replacement).expect("copy database");
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600))
+            .expect("replacement mode");
+        let displaced = database.root.join("displaced.db");
+        fs::rename(&database.path, &displaced).expect("displace database");
+        fs::rename(&replacement, &database.path).expect("replace database path");
+        assert_eq!(
+            store.get(ATTEMPT_ID).err(),
             Some(AttemptStoreError::UnsafePath)
         );
     }

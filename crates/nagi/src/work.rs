@@ -19,15 +19,13 @@ use crate::linear::ReadContractError;
 use crate::linear::credentials::CredentialManager;
 use crate::linear::read::{self, IssueInput, LinearIssueBinding};
 use getrandom::fill as fill_random;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::IgnoredAny};
 use sha2::{Digest, Sha256};
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Read;
 #[cfg(unix)]
-use std::os::fd::AsRawFd;
-#[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -63,7 +61,7 @@ pub enum WorkError {
     ReportFile,
     /// Secure attempt-ID generation or the system clock failed.
     LocalRuntime,
-    /// Another controller command currently owns the attempt database lock.
+    /// Another controller command currently owns the attempt state lock.
     Busy,
 }
 
@@ -88,7 +86,11 @@ impl std::error::Error for WorkError {}
 
 impl From<AttemptStoreError> for WorkError {
     fn from(error: AttemptStoreError) -> Self {
-        Self::Attempt(error)
+        if error == AttemptStoreError::Busy {
+            Self::Busy
+        } else {
+            Self::Attempt(error)
+        }
     }
 }
 
@@ -137,7 +139,11 @@ impl WorkConfig {
     /// operator-only discovery and resolution, which must remain available
     /// when runtime or repository setup is unavailable.
     fn load_attempt_db(path: impl AsRef<Path>) -> Result<PathBuf, WorkError> {
-        let raw = Self::read_file(path)?;
+        let path = path.as_ref();
+        let bytes =
+            read_private_file(path, MAX_CONFIG_BYTES).map_err(|_| WorkError::Configuration)?;
+        let raw: RecoveryConfigFile =
+            serde_json::from_slice(&bytes).map_err(|_| WorkError::Configuration)?;
         validate_explicit_path(&raw.attempt_db)?;
         Ok(raw.attempt_db)
     }
@@ -254,72 +260,40 @@ struct WorkConfigFile {
     codex_home: PathBuf,
 }
 
-/// An owner-only advisory lock held for the complete controller operation.
-/// Closing the descriptor releases it after a crash; no lease or retry policy
-/// is layered on top of the OS lock.
-struct AttemptCommandLock {
-    _file: File,
-}
-
-impl AttemptCommandLock {
-    fn acquire(database_path: &Path) -> Result<Self, WorkError> {
-        validate_explicit_path(database_path)?;
-        let mut lock_path = database_path.as_os_str().to_os_string();
-        lock_path.push(".lock");
-        let lock_path = PathBuf::from(lock_path);
-        validate_explicit_path(&lock_path)?;
-        let parent = lock_path.parent().ok_or(WorkError::Configuration)?;
-        validate_no_symlink_components(parent)?;
-
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true);
-        #[cfg(unix)]
-        options
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .mode(0o600);
-        let file = options
-            .open(&lock_path)
-            .map_err(|_| WorkError::LocalRuntime)?;
-        validate_lock_file(&file, &lock_path)?;
-
-        #[cfg(unix)]
-        {
-            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-            if result != 0 {
-                let code = std::io::Error::last_os_error().raw_os_error();
-                if code == Some(libc::EWOULDBLOCK) || code == Some(libc::EAGAIN) {
-                    return Err(WorkError::Busy);
-                }
-                return Err(WorkError::LocalRuntime);
-            }
-            validate_lock_file(&file, &lock_path)?;
-        }
-        Ok(Self { _file: file })
-    }
-}
-
-fn validate_lock_file(file: &File, path: &Path) -> Result<(), WorkError> {
-    let metadata = file.metadata().map_err(|_| WorkError::LocalRuntime)?;
-    if !metadata.is_file() {
-        return Err(WorkError::LocalRuntime);
-    }
-    #[cfg(unix)]
-    {
-        let path_metadata = fs::symlink_metadata(path).map_err(|_| WorkError::LocalRuntime)?;
-        if path_metadata.file_type().is_symlink()
-            || !path_metadata.is_file()
-            || metadata.dev() != path_metadata.dev()
-            || metadata.ino() != path_metadata.ino()
-            || metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.nlink() != 1
-            || metadata.permissions().mode() != 0o100600
-        {
-            return Err(WorkError::LocalRuntime);
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
+/// The recovery-only configuration view. It requires the database locator but
+/// deliberately ignores every other known full-config value, so discovery and
+/// operator resolution do not depend on unavailable runtime paths or types.
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryConfigFile {
+    attempt_db: PathBuf,
+    #[serde(default)]
+    client_id: Option<IgnoredAny>,
+    #[serde(default)]
+    callback_port: Option<IgnoredAny>,
+    #[serde(default)]
+    workspace_id: Option<IgnoredAny>,
+    #[serde(default)]
+    team_id: Option<IgnoredAny>,
+    #[serde(default)]
+    issue_id: Option<IgnoredAny>,
+    #[serde(default)]
+    repository: Option<IgnoredAny>,
+    #[serde(default)]
+    herdr_executable: Option<IgnoredAny>,
+    #[serde(default)]
+    herdr_home: Option<IgnoredAny>,
+    #[serde(default)]
+    herdr_tmpdir: Option<IgnoredAny>,
+    #[serde(default)]
+    herdr_config: Option<IgnoredAny>,
+    #[serde(default)]
+    herdr_session: Option<IgnoredAny>,
+    #[serde(default)]
+    codex_executable_dir: Option<IgnoredAny>,
+    #[serde(default)]
+    codex_home: Option<IgnoredAny>,
 }
 
 /// The redacted machine-readable status emitted by `work start/status` and
@@ -584,7 +558,6 @@ pub fn collect_with<B: AgentBackend>(
 /// Runs the production `work start` sequence.
 pub fn run_start(config_path: &Path) -> Result<WorkStatus, WorkError> {
     let config = WorkConfig::load(config_path)?;
-    let _lock = AttemptCommandLock::acquire(&config.attempt_db)?;
     let mut store = AttemptStore::open(&config.attempt_db)?;
     let mut manager =
         CredentialManager::production_read(config.client_id.clone(), config.callback_port)
@@ -598,7 +571,6 @@ pub fn run_start(config_path: &Path) -> Result<WorkStatus, WorkError> {
 /// Runs the production `work status` sequence.
 pub fn run_status(config_path: &Path, attempt_id: &str) -> Result<WorkStatus, WorkError> {
     let config = WorkConfig::load(config_path)?;
-    let _lock = AttemptCommandLock::acquire(&config.attempt_db)?;
     validate_attempt_id(attempt_id)?;
     let mut store = AttemptStore::open(&config.attempt_db)?;
     let current = store
@@ -648,13 +620,13 @@ pub fn run_status(config_path: &Path, attempt_id: &str) -> Result<WorkStatus, Wo
 }
 
 /// Lists one bounded nonterminal page without contacting Linear, Herdr, or a
-/// provider. The optional cursor is the last visible attempt ID.
+/// provider. The optional cursor is the last attempt ID returned by the
+/// preceding page; it remains valid if that retained attempt later fails.
 pub fn run_list(
     config_path: &Path,
     after_attempt_id: Option<&str>,
 ) -> Result<WorkListPage, WorkError> {
     let attempt_db = WorkConfig::load_attempt_db(config_path)?;
-    let _lock = AttemptCommandLock::acquire(&attempt_db)?;
     let store = AttemptStore::open(&attempt_db)?;
     let page = store.list_nonterminal_page(after_attempt_id, MAX_LIST_PAGE)?;
     Ok(WorkListPage::from_attempt_page(page))
@@ -667,7 +639,6 @@ pub fn run_resolve(
     resolution: AttemptResolution,
 ) -> Result<WorkStatus, WorkError> {
     let attempt_db = WorkConfig::load_attempt_db(config_path)?;
-    let _lock = AttemptCommandLock::acquire(&attempt_db)?;
     validate_attempt_id(attempt_id)?;
     let mut store = AttemptStore::open(&attempt_db)?;
     let record = store.resolve(attempt_id, resolution, now_ms()?)?;
@@ -677,7 +648,6 @@ pub fn run_resolve(
 /// Runs the production `work interrupt` sequence.
 pub fn run_interrupt(config_path: &Path, attempt_id: &str) -> Result<WorkStatus, WorkError> {
     let config = WorkConfig::load(config_path)?;
-    let _lock = AttemptCommandLock::acquire(&config.attempt_db)?;
     validate_attempt_id(attempt_id)?;
     let mut store = AttemptStore::open(&config.attempt_db)?;
     let mut backend = production_backend(&config)?;
@@ -692,7 +662,6 @@ pub fn run_collect(
     report_path: &Path,
 ) -> Result<WorkCollectResult, WorkError> {
     let config = WorkConfig::load(config_path)?;
-    let _lock = AttemptCommandLock::acquire(&config.attempt_db)?;
     validate_attempt_id(attempt_id)?;
     let mut store = AttemptStore::open(&config.attempt_db)?;
     let mut backend = production_backend(&config)?;
@@ -1105,6 +1074,8 @@ mod tests {
     use crate::agent_report::AgentReport;
     use crate::herdr::{AgentHandle, AgentObservation, AgentStatus, HerdrRuntime, WorkspaceHandle};
     use serde_json::json;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -1384,6 +1355,18 @@ mod tests {
     fn list_and_resolve_load_only_the_database_locator() {
         let database = TestDatabase::new();
         let config_path = database.root.join("config.json");
+        fs::write(
+            &config_path,
+            json!({"attempt_db": database.path}).to_string(),
+        )
+        .expect("minimal config");
+        #[cfg(unix)]
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).expect("config mode");
+        assert_eq!(
+            WorkConfig::load_attempt_db(&config_path).expect("minimal database locator"),
+            database.path
+        );
+
         let value = json!({
             "client_id": "client",
             "callback_port": 43871,
@@ -1404,6 +1387,30 @@ mod tests {
         #[cfg(unix)]
         fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).expect("config mode");
         assert_eq!(
+            WorkConfig::load_attempt_db(&config_path).expect("full config locator"),
+            database.path
+        );
+
+        let value = json!({
+            "attempt_db": database.path,
+            "unknown": true
+        });
+        fs::write(&config_path, value.to_string()).expect("unknown config");
+        #[cfg(unix)]
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).expect("config mode");
+        assert!(WorkConfig::load_attempt_db(&config_path).is_err());
+
+        let value = json!({
+            "attempt_db": database.path,
+            "client_id": {"not": "a string"},
+            "callback_port": "not a port",
+            "repository": ["not", "a", "path"],
+            "herdr_session": 42
+        });
+        fs::write(&config_path, value.to_string()).expect("ignored runtime config");
+        #[cfg(unix)]
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).expect("config mode");
+        assert_eq!(
             WorkConfig::load_attempt_db(&config_path).expect("database locator"),
             database.path
         );
@@ -1411,62 +1418,6 @@ mod tests {
             WorkConfig::load(&config_path),
             Err(WorkError::Configuration)
         ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn command_lock_blocks_a_second_controller_at_each_effect_boundary() {
-        let database = TestDatabase::new();
-        for boundary in ["workspace", "agent"] {
-            let first = AttemptCommandLock::acquire(&database.path).expect("first lock");
-            let path = database.path.clone();
-            let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let entered_by_second = Arc::clone(&entered);
-            let second = std::thread::spawn(move || {
-                if AttemptCommandLock::acquire(&path).is_ok() {
-                    entered_by_second.store(true, Ordering::Relaxed);
-                }
-            });
-            second.join().expect("second controller");
-            assert!(
-                !entered.load(Ordering::Relaxed),
-                "{boundary} effect entered"
-            );
-            drop(first);
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn command_lock_rejects_unsafe_lock_files() {
-        let database = TestDatabase::new();
-        let lock_path = PathBuf::from(format!("{}.lock", database.path.display()));
-        let lock_target = database.root.join("lock-target");
-        fs::write(&lock_target, b"lock").expect("lock target");
-        fs::set_permissions(&lock_target, fs::Permissions::from_mode(0o600))
-            .expect("lock target mode");
-        std::os::unix::fs::symlink(&lock_target, &lock_path).expect("lock symlink");
-        assert_eq!(
-            AttemptCommandLock::acquire(&database.path).err(),
-            Some(WorkError::LocalRuntime)
-        );
-        fs::remove_file(&lock_path).expect("remove lock symlink");
-
-        let lock = AttemptCommandLock::acquire(&database.path).expect("lock");
-        drop(lock);
-        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o644))
-            .expect("unsafe lock mode");
-        assert_eq!(
-            AttemptCommandLock::acquire(&database.path).err(),
-            Some(WorkError::LocalRuntime)
-        );
-        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600)).expect("lock mode");
-        let hardlink = database.root.join("lock-hardlink");
-        fs::hard_link(&lock_path, &hardlink).expect("lock hardlink");
-        assert_eq!(
-            AttemptCommandLock::acquire(&database.path).err(),
-            Some(WorkError::LocalRuntime)
-        );
     }
 
     #[test]
