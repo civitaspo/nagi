@@ -29,7 +29,39 @@ dependencies; they are not bundled helpers, and Nagi does not reimplement
 vendor TUIs or protocols. Codex App Server is an optional future high-fidelity
 backend, not a Phase 0 gate.
 
-The repository is in its initial setup phase. The implementation will be added through focused pull requests.
+## Single-issue work
+
+On macOS, the first usable work slice accepts one owner-only JSON configuration
+and one exact Linear issue UUID:
+
+```text
+nagi work start --config CONFIG
+nagi work status --config CONFIG --attempt ATTEMPT
+nagi work list --config CONFIG [--after ATTEMPT]
+nagi work resolve --config CONFIG --attempt ATTEMPT --confirm-absent
+nagi work resolve --config CONFIG --attempt ATTEMPT --confirm-delivered
+nagi work interrupt --config CONFIG --attempt ATTEMPT
+nagi work collect --config CONFIG --attempt ATTEMPT --report REPORT
+```
+
+The configuration supplies all local paths explicitly, including the canonical
+Git worktree, Herdr private runtime, attempt database, verified Codex CLI
+directory, and managed `CODEX_HOME`. Nagi reads one issue in memory, delegates
+workspace and vendor process ownership to Herdr, and prints only bounded status
+or report metadata. Herdr lifecycle is observational; no command changes
+Linear state or installs hooks/configuration.
+
+`work list` is keyset-paginated and prints only bounded local attempt metadata.
+For `work list` and `work resolve`, the recovery configuration may contain only
+the `attempt_db` locator; other known full-runtime fields are ignored, while
+unknown names still fail closed.
+Work commands serialize through a nonblocking lock on the owner-only state
+directory containing the validated SQLite database; no adjacent lock file is
+created. This coordinates Nagi processes using the same validated database
+identity, while a same-UID path replacement after validation remains a
+documented residual risk. If a workspace, agent, or prompt effect is
+ambiguous, `work status` never retries it when a snapshot is absent; use the
+explicit `work resolve` confirmation before the next newly authorized effect.
 
 ## Project documentation
 

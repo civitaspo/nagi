@@ -6,16 +6,22 @@
 //! bounded values accepted here.
 //!
 //! Opening binds the database's checked Unix device/inode across the open and
-//! validates existing WAL/SHM sidecars as owner-only regular files. This is a
-//! bounded defense within rusqlite, not a race-free path proof: a same-UID
-//! actor can still replace a parent or final path after those checks.
+//! validates existing WAL/SHM sidecars as owner-only regular files. SQLite WAL
+//! uses file locks that conflict with a held database `flock` on macOS, so the
+//! store holds a nonblocking `flock` on the validated owner-only state-directory
+//! descriptor instead; no adjacent lock file is created. This serializes
+//! cooperating Nagi processes using the same validated state directory and DB
+//! identity. It is not a race-free path proof: a same-UID actor can still
+//! replace a parent or final path after those checks.
 
 use crate::agent_report::AgentReport;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params};
 use std::fmt;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::path::{Component, Path, PathBuf};
 
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
@@ -40,6 +46,8 @@ pub enum AttemptStoreError {
     UnsafePath,
     /// SQLite returned an internal or I/O failure.
     Database,
+    /// Another Nagi process holds the state-directory lock.
+    Busy,
     /// The database schema was absent, unknown, malformed, or newer.
     SchemaMismatch,
     /// The requested attempt does not exist.
@@ -68,6 +76,7 @@ impl fmt::Display for AttemptStoreError {
             Self::InvalidInput => "attempt store input is invalid",
             Self::UnsafePath => "attempt store path is unsafe",
             Self::Database => "attempt store database operation failed",
+            Self::Busy => "attempt store database is busy",
             Self::SchemaMismatch => "attempt store schema is unsupported",
             Self::NotFound => "attempt was not found",
             Self::DuplicateAttemptMismatch => "attempt already exists with different binding",
@@ -117,6 +126,20 @@ impl AttemptBackend {
 pub enum AttemptState {
     /// The attempt has been durably created but not started.
     Created,
+    /// Workspace creation is durably pending; no create effect may be
+    /// repeated until an exact snapshot or explicit operator resolution
+    /// authorizes a new effect.
+    WorkspacePending,
+    /// Workspace creation completed and the workspace reference is bound.
+    WorkspaceReady,
+    /// Agent creation is durably pending; no start effect may be repeated
+    /// until an exact snapshot or explicit operator resolution authorizes a
+    /// new effect.
+    AgentPending,
+    /// Agent creation completed and both runtime references are bound.
+    AgentReady,
+    /// Prompt delivery is durably pending and therefore ambiguous.
+    PromptPending,
     /// The selected backend has been started.
     Running,
     /// A lifecycle observation has been recorded.
@@ -127,6 +150,17 @@ pub enum AttemptState {
     Blocked,
     /// The backend observed a failed attempt.
     Failed,
+    /// An interrupt intent was durably recorded and awaits reconciliation.
+    InterruptPending,
+}
+
+/// An explicit operator decision for an ambiguous external effect.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttemptResolution {
+    /// The pending create or prompt effect was not delivered.
+    ConfirmAbsent,
+    /// The pending prompt effect was delivered.
+    ConfirmDelivered,
 }
 
 impl AttemptState {
@@ -134,22 +168,34 @@ impl AttemptState {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Created => "created",
+            Self::WorkspacePending => "workspace_pending",
+            Self::WorkspaceReady => "workspace_ready",
+            Self::AgentPending => "agent_pending",
+            Self::AgentReady => "agent_ready",
+            Self::PromptPending => "prompt_pending",
             Self::Running => "running",
             Self::Observed => "observed",
             Self::ReportReady => "report_ready",
             Self::Blocked => "blocked",
             Self::Failed => "failed",
+            Self::InterruptPending => "interrupt_pending",
         }
     }
 
     fn parse(value: &str) -> Result<Self, AttemptStoreError> {
         match value {
             "created" => Ok(Self::Created),
+            "workspace_pending" => Ok(Self::WorkspacePending),
+            "workspace_ready" => Ok(Self::WorkspaceReady),
+            "agent_pending" => Ok(Self::AgentPending),
+            "agent_ready" => Ok(Self::AgentReady),
+            "prompt_pending" => Ok(Self::PromptPending),
             "running" => Ok(Self::Running),
             "observed" => Ok(Self::Observed),
             "report_ready" => Ok(Self::ReportReady),
             "blocked" => Ok(Self::Blocked),
             "failed" => Ok(Self::Failed),
+            "interrupt_pending" => Ok(Self::InterruptPending),
             _ => Err(AttemptStoreError::Database),
         }
     }
@@ -242,7 +288,12 @@ impl fmt::Debug for AttemptRecord {
 
 /// An explicitly selected durable SQLite attempt database.
 pub struct AttemptStore {
-    connection: Connection,
+    connection: Option<Connection>,
+    path: PathBuf,
+    identity: DatabaseIdentity,
+    state_directory: PathBuf,
+    state_identity: DatabaseIdentity,
+    lock_file: File,
 }
 
 impl fmt::Debug for AttemptStore {
@@ -255,12 +306,37 @@ impl fmt::Debug for AttemptStore {
     }
 }
 
+impl Drop for AttemptStore {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            let _ = connection.close();
+        }
+        #[cfg(unix)]
+        {
+            // Close SQLite before releasing the state-directory flock. macOS
+            // can otherwise retain SQLite's directory-related lock state.
+            unsafe {
+                libc::flock(self.lock_file.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+    }
+}
+
 impl AttemptStore {
     /// Opens or initializes an owner-only database at the explicit path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, AttemptStoreError> {
         let path = path.as_ref().to_owned();
         validate_database_path(&path)?;
         let identity = ensure_database_file(&path)?;
+        validate_sidecars(&path, identity)?;
+        let state_directory = path
+            .parent()
+            .ok_or(AttemptStoreError::UnsafePath)?
+            .to_owned();
+        let state_identity = ensure_state_directory(&state_directory)?;
+        let lock_file = open_state_directory_lock_file(&state_directory, state_identity)?;
+        acquire_state_directory_lock(&lock_file)?;
+        validate_open_state_directory_identity(&lock_file, &state_directory, state_identity)?;
         validate_sidecars(&path, identity)?;
         let mut connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE)
             .map_err(|_| AttemptStoreError::Database)?;
@@ -274,7 +350,36 @@ impl AttemptStore {
             return Err(AttemptStoreError::UnsafePath);
         }
         validate_sidecars(&path, identity)?;
-        Ok(Self { connection })
+        let store = Self {
+            connection: Some(connection),
+            path,
+            identity,
+            state_directory,
+            state_identity,
+            lock_file,
+        };
+        store.validate_identity()?;
+        Ok(store)
+    }
+
+    fn connection_ref(&self) -> Result<&Connection, AttemptStoreError> {
+        self.connection.as_ref().ok_or(AttemptStoreError::Database)
+    }
+
+    fn connection_mut(&mut self) -> Result<&mut Connection, AttemptStoreError> {
+        self.connection.as_mut().ok_or(AttemptStoreError::Database)
+    }
+
+    fn validate_identity(&self) -> Result<(), AttemptStoreError> {
+        if validate_database_file(&self.path)? != self.identity {
+            return Err(AttemptStoreError::UnsafePath);
+        }
+        validate_open_state_directory_identity(
+            &self.lock_file,
+            &self.state_directory,
+            self.state_identity,
+        )?;
+        validate_sidecars(&self.path, self.identity)
     }
 
     /// Creates one attempt, or returns the existing identical binding
@@ -286,11 +391,12 @@ impl AttemptStore {
         backend: AttemptBackend,
         now_ms: i64,
     ) -> Result<AttemptRecord, AttemptStoreError> {
+        self.validate_identity()?;
         validate_attempt_id(attempt_id)?;
         validate_issue_id(issue_id)?;
         validate_timestamp(now_ms)?;
         let transaction = self
-            .connection
+            .connection_mut()?
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| AttemptStoreError::Database)?;
         if let Some(existing) = load_record(&transaction, attempt_id)? {
@@ -315,27 +421,104 @@ impl AttemptStore {
         Ok(record)
     }
 
-    /// Marks a created attempt running while atomically binding its required
-    /// workspace and agent references. Repeating the same binding is
-    /// idempotent; a changed binding or later lifecycle state is rejected.
-    pub fn mark_started(
+    /// Persists the workspace-create intent before the external effect. A
+    /// repeated intent is idempotent; reconciliation must decide whether the
+    /// effect can safely be issued.
+    pub fn mark_workspace_pending(
+        &mut self,
+        attempt_id: &str,
+        now_ms: i64,
+    ) -> Result<AttemptRecord, AttemptStoreError> {
+        self.validate_identity()?;
+        self.transition_idempotent(
+            attempt_id,
+            AttemptState::Created,
+            AttemptState::WorkspacePending,
+            now_ms,
+        )
+    }
+
+    /// Binds the workspace produced by one create effect before any agent
+    /// effect is issued. Repeating the exact binding is idempotent.
+    pub fn mark_workspace_ready(
+        &mut self,
+        attempt_id: &str,
+        workspace_ref: &str,
+        now_ms: i64,
+    ) -> Result<AttemptRecord, AttemptStoreError> {
+        self.validate_identity()?;
+        validate_attempt_id(attempt_id)?;
+        validate_opaque_ref(workspace_ref)?;
+        validate_timestamp(now_ms)?;
+        let transaction = self
+            .connection_mut()?
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| AttemptStoreError::Database)?;
+        let current = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::NotFound)?;
+        validate_update_timestamp(&current, now_ms)?;
+        if current.state == AttemptState::WorkspaceReady {
+            if current.workspace_ref.as_deref() != Some(workspace_ref) {
+                return Err(AttemptStoreError::DuplicateConflict);
+            }
+            transaction
+                .commit()
+                .map_err(|_| AttemptStoreError::Database)?;
+            return Ok(current);
+        }
+        if !matches!(
+            current.state,
+            AttemptState::Created | AttemptState::WorkspacePending
+        ) {
+            return Err(AttemptStoreError::InvalidTransition);
+        }
+        transaction
+            .execute(
+                "UPDATE attempts SET lifecycle = 'workspace_ready', workspace_ref = ?1, updated_at_ms = ?2 WHERE attempt_id = ?3",
+                params![workspace_ref, now_ms, attempt_id],
+            )
+            .map_err(|_| AttemptStoreError::Database)?;
+        let record = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::Database)?;
+        transaction
+            .commit()
+            .map_err(|_| AttemptStoreError::Database)?;
+        Ok(record)
+    }
+
+    /// Persists the agent-start intent before the external effect.
+    pub fn mark_agent_pending(
+        &mut self,
+        attempt_id: &str,
+        now_ms: i64,
+    ) -> Result<AttemptRecord, AttemptStoreError> {
+        self.validate_identity()?;
+        self.transition_idempotent(
+            attempt_id,
+            AttemptState::WorkspaceReady,
+            AttemptState::AgentPending,
+            now_ms,
+        )
+    }
+
+    /// Binds an agent discovered or created during reconciliation.
+    pub fn mark_agent_ready(
         &mut self,
         attempt_id: &str,
         workspace_ref: &str,
         agent_ref: &str,
         now_ms: i64,
     ) -> Result<AttemptRecord, AttemptStoreError> {
+        self.validate_identity()?;
         validate_attempt_id(attempt_id)?;
         validate_opaque_ref(workspace_ref)?;
         validate_opaque_ref(agent_ref)?;
         validate_timestamp(now_ms)?;
         let transaction = self
-            .connection
+            .connection_mut()?
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| AttemptStoreError::Database)?;
         let current = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::NotFound)?;
         validate_update_timestamp(&current, now_ms)?;
-        if current.state == AttemptState::Running {
+        if current.state == AttemptState::AgentReady {
             if current.workspace_ref.as_deref() != Some(workspace_ref)
                 || current.agent_ref.as_deref() != Some(agent_ref)
             {
@@ -346,13 +529,16 @@ impl AttemptStore {
                 .map_err(|_| AttemptStoreError::Database)?;
             return Ok(current);
         }
-        if current.state != AttemptState::Created {
+        if current.state != AttemptState::AgentPending {
             return Err(AttemptStoreError::InvalidTransition);
+        }
+        if current.workspace_ref.as_deref() != Some(workspace_ref) {
+            return Err(AttemptStoreError::DuplicateConflict);
         }
         transaction
             .execute(
-                "UPDATE attempts SET lifecycle = 'running', workspace_ref = ?1, agent_ref = ?2, updated_at_ms = ?3 WHERE attempt_id = ?4",
-                params![workspace_ref, agent_ref, now_ms, attempt_id],
+                "UPDATE attempts SET lifecycle = 'agent_ready', agent_ref = ?1, updated_at_ms = ?2 WHERE attempt_id = ?3",
+                params![agent_ref, now_ms, attempt_id],
             )
             .map_err(|_| AttemptStoreError::Database)?;
         let record = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::Database)?;
@@ -360,6 +546,128 @@ impl AttemptStore {
             .commit()
             .map_err(|_| AttemptStoreError::Database)?;
         Ok(record)
+    }
+
+    /// Persists prompt intent. The prompt is not retained; a pending state is
+    /// deliberately ambiguous and is never retried automatically.
+    pub fn mark_prompt_pending(
+        &mut self,
+        attempt_id: &str,
+        now_ms: i64,
+    ) -> Result<AttemptRecord, AttemptStoreError> {
+        self.validate_identity()?;
+        self.transition_idempotent(
+            attempt_id,
+            AttemptState::AgentReady,
+            AttemptState::PromptPending,
+            now_ms,
+        )
+    }
+
+    /// Confirms the prompt effect after the adapter reports success.
+    pub fn confirm_prompt(
+        &mut self,
+        attempt_id: &str,
+        now_ms: i64,
+    ) -> Result<AttemptRecord, AttemptStoreError> {
+        self.validate_identity()?;
+        self.transition_idempotent(
+            attempt_id,
+            AttemptState::PromptPending,
+            AttemptState::Running,
+            now_ms,
+        )
+    }
+
+    /// Applies one explicit operator decision to a pending external effect.
+    /// This changes only durable controller state and performs no external
+    /// operation. Repeated or inapplicable decisions fail closed.
+    pub fn resolve(
+        &mut self,
+        attempt_id: &str,
+        resolution: AttemptResolution,
+        now_ms: i64,
+    ) -> Result<AttemptRecord, AttemptStoreError> {
+        self.validate_identity()?;
+        validate_attempt_id(attempt_id)?;
+        validate_timestamp(now_ms)?;
+        let transaction = self
+            .connection_mut()?
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| AttemptStoreError::Database)?;
+        let current = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::NotFound)?;
+        validate_update_timestamp(&current, now_ms)?;
+        let target = match (resolution, current.state) {
+            (AttemptResolution::ConfirmAbsent, AttemptState::WorkspacePending) => {
+                AttemptState::Created
+            }
+            (AttemptResolution::ConfirmAbsent, AttemptState::AgentPending) => {
+                AttemptState::WorkspaceReady
+            }
+            (AttemptResolution::ConfirmAbsent, AttemptState::PromptPending) => {
+                AttemptState::AgentReady
+            }
+            (AttemptResolution::ConfirmDelivered, AttemptState::PromptPending) => {
+                AttemptState::Running
+            }
+            _ => return Err(AttemptStoreError::InvalidTransition),
+        };
+        transaction
+            .execute(
+                "UPDATE attempts SET lifecycle = ?1, updated_at_ms = ?2 WHERE attempt_id = ?3",
+                params![target.as_str(), now_ms, attempt_id],
+            )
+            .map_err(|_| AttemptStoreError::Database)?;
+        let record = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::Database)?;
+        transaction
+            .commit()
+            .map_err(|_| AttemptStoreError::Database)?;
+        Ok(record)
+    }
+
+    /// Records an interrupt intent and reports whether this call changed the
+    /// durable state. The boolean gates the single corresponding external
+    /// effect, so a retry after an ambiguous failure cannot blindly repeat it.
+    pub fn begin_interrupt_pending(
+        &mut self,
+        attempt_id: &str,
+        now_ms: i64,
+    ) -> Result<(AttemptRecord, bool), AttemptStoreError> {
+        self.validate_identity()?;
+        validate_attempt_id(attempt_id)?;
+        validate_timestamp(now_ms)?;
+        let transaction = self
+            .connection_mut()?
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| AttemptStoreError::Database)?;
+        let current = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::NotFound)?;
+        validate_update_timestamp(&current, now_ms)?;
+        if current.state == AttemptState::InterruptPending {
+            transaction
+                .commit()
+                .map_err(|_| AttemptStoreError::Database)?;
+            return Ok((current, false));
+        }
+        if !matches!(
+            current.state,
+            AttemptState::Running
+                | AttemptState::Observed
+                | AttemptState::Blocked
+                | AttemptState::InterruptPending
+        ) {
+            return Err(AttemptStoreError::InvalidTransition);
+        }
+        transaction
+            .execute(
+                "UPDATE attempts SET lifecycle = 'interrupt_pending', updated_at_ms = ?1 WHERE attempt_id = ?2",
+                params![now_ms, attempt_id],
+            )
+            .map_err(|_| AttemptStoreError::Database)?;
+        let record = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::Database)?;
+        transaction
+            .commit()
+            .map_err(|_| AttemptStoreError::Database)?;
+        Ok((record, true))
     }
 
     /// Records one observation with a strictly increasing revision.
@@ -373,6 +681,7 @@ impl AttemptStore {
         revision: u64,
         now_ms: i64,
     ) -> Result<AttemptRecord, AttemptStoreError> {
+        self.validate_identity()?;
         validate_attempt_id(attempt_id)?;
         let revision = revision_to_sql(revision)?;
         validate_timestamp(now_ms)?;
@@ -383,7 +692,7 @@ impl AttemptStore {
             return Err(AttemptStoreError::InvalidTransition);
         }
         let transaction = self
-            .connection
+            .connection_mut()?
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| AttemptStoreError::Database)?;
         let current = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::NotFound)?;
@@ -402,9 +711,59 @@ impl AttemptStore {
         }
         if !matches!(
             current.state,
-            AttemptState::Running | AttemptState::Observed | AttemptState::Blocked
+            AttemptState::Running
+                | AttemptState::Observed
+                | AttemptState::Blocked
+                | AttemptState::InterruptPending
         ) {
             return Err(AttemptStoreError::InvalidTransition);
+        }
+        transaction
+            .execute(
+                "UPDATE attempts SET lifecycle = ?1, observation_revision = ?2, updated_at_ms = ?3 WHERE attempt_id = ?4",
+                params![state.as_str(), revision, now_ms, attempt_id],
+            )
+            .map_err(|_| AttemptStoreError::Database)?;
+        let record = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::Database)?;
+        transaction
+            .commit()
+            .map_err(|_| AttemptStoreError::Database)?;
+        Ok(record)
+    }
+
+    /// Resolves an interrupt intent from one fresh observation. An unchanged
+    /// revision is valid here because the interrupt itself is the durable
+    /// event; the stored revision remains unchanged rather than being
+    /// fabricated. Older revisions and differing same-revision states fail
+    /// closed.
+    pub fn reconcile_interrupt_observation(
+        &mut self,
+        attempt_id: &str,
+        state: AttemptState,
+        revision: u64,
+        now_ms: i64,
+    ) -> Result<AttemptRecord, AttemptStoreError> {
+        self.validate_identity()?;
+        validate_attempt_id(attempt_id)?;
+        let revision = revision_to_sql(revision)?;
+        validate_timestamp(now_ms)?;
+        if !matches!(
+            state,
+            AttemptState::Observed | AttemptState::Blocked | AttemptState::Failed
+        ) {
+            return Err(AttemptStoreError::InvalidTransition);
+        }
+        let transaction = self
+            .connection_mut()?
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| AttemptStoreError::Database)?;
+        let current = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::NotFound)?;
+        validate_update_timestamp(&current, now_ms)?;
+        if current.state != AttemptState::InterruptPending {
+            return Err(AttemptStoreError::InvalidTransition);
+        }
+        if revision < current.observation_revision as i64 {
+            return Err(AttemptStoreError::StaleRevision);
         }
         transaction
             .execute(
@@ -427,6 +786,7 @@ impl AttemptStore {
         report_json: &str,
         now_ms: i64,
     ) -> Result<AttemptRecord, AttemptStoreError> {
+        self.validate_identity()?;
         validate_attempt_id(attempt_id)?;
         validate_timestamp(now_ms)?;
         let report =
@@ -435,7 +795,7 @@ impl AttemptStore {
             .canonical_json()
             .map_err(|_| AttemptStoreError::InvalidReport)?;
         let transaction = self
-            .connection
+            .connection_mut()?
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| AttemptStoreError::Database)?;
         let current = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::NotFound)?;
@@ -463,7 +823,10 @@ impl AttemptStore {
         }
         if !matches!(
             current.state,
-            AttemptState::Running | AttemptState::Observed | AttemptState::Blocked
+            AttemptState::Running
+                | AttemptState::Observed
+                | AttemptState::Blocked
+                | AttemptState::InterruptPending
         ) {
             return Err(AttemptStoreError::InvalidTransition);
         }
@@ -482,20 +845,51 @@ impl AttemptStore {
 
     /// Loads one attempt, validating all persisted fields before returning it.
     pub fn get(&self, attempt_id: &str) -> Result<Option<AttemptRecord>, AttemptStoreError> {
+        self.validate_identity()?;
         validate_attempt_id(attempt_id)?;
-        load_record(&self.connection, attempt_id)
+        load_record(self.connection_ref()?, attempt_id)
     }
 
-    /// Returns all attempts that have not reached the terminal failed state.
-    pub fn list_nonterminal(&self) -> Result<Vec<AttemptRecord>, AttemptStoreError> {
+    /// Returns one bounded keyset page of nonterminal attempts. The optional
+    /// cursor is the last attempt ID returned by the preceding page and must
+    /// still identify a retained, valid row, even if it has since failed.
+    pub fn list_nonterminal_page(
+        &self,
+        after_attempt_id: Option<&str>,
+        limit: usize,
+    ) -> Result<AttemptPage, AttemptStoreError> {
+        self.validate_identity()?;
+        if limit == 0 {
+            return Err(AttemptStoreError::InvalidInput);
+        }
+        let query_limit = i64::try_from(limit)
+            .ok()
+            .and_then(|limit| limit.checked_add(1))
+            .ok_or(AttemptStoreError::InvalidInput)?;
+        let cursor = match after_attempt_id {
+            None => None,
+            Some(attempt_id) => {
+                validate_attempt_id(attempt_id)?;
+                let record = load_record(self.connection_ref()?, attempt_id)?
+                    .ok_or(AttemptStoreError::InvalidInput)?;
+                Some((record.created_at_ms(), attempt_id.to_owned()))
+            }
+        };
         let mut statement = self
-            .connection
+            .connection_ref()?
             .prepare(&format!(
-                "SELECT {SELECT_COLUMNS} FROM attempts WHERE lifecycle != 'failed' ORDER BY created_at_ms, attempt_id"
+                "SELECT {SELECT_COLUMNS} FROM attempts WHERE lifecycle != 'failed' AND (?1 IS NULL OR created_at_ms > ?2 OR (created_at_ms = ?2 AND attempt_id > ?3)) ORDER BY created_at_ms, attempt_id LIMIT ?4"
             ))
             .map_err(|_| AttemptStoreError::Database)?;
+        let cursor_created = cursor.as_ref().map(|cursor| cursor.0);
+        let cursor_id = cursor.as_ref().map(|cursor| cursor.1.as_str());
         let mut rows = statement
-            .query([])
+            .query(params![
+                cursor_created,
+                cursor_created,
+                cursor_id,
+                query_limit,
+            ])
             .map_err(|_| AttemptStoreError::Database)?;
         let mut records = Vec::new();
         while let Some(row) = rows.next().map_err(|_| AttemptStoreError::Database)? {
@@ -503,7 +897,62 @@ impl AttemptStore {
                 raw_from_row(row).map_err(|_| AttemptStoreError::Database)?,
             )?);
         }
-        Ok(records)
+        let has_more = records.len() > limit;
+        if has_more {
+            records.pop();
+        }
+        Ok(AttemptPage { records, has_more })
+    }
+
+    fn transition_idempotent(
+        &mut self,
+        attempt_id: &str,
+        source: AttemptState,
+        target: AttemptState,
+        now_ms: i64,
+    ) -> Result<AttemptRecord, AttemptStoreError> {
+        self.validate_identity()?;
+        validate_attempt_id(attempt_id)?;
+        validate_timestamp(now_ms)?;
+        let transaction = self
+            .connection_mut()?
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| AttemptStoreError::Database)?;
+        let current = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::NotFound)?;
+        validate_update_timestamp(&current, now_ms)?;
+        if current.state == target {
+            transaction
+                .commit()
+                .map_err(|_| AttemptStoreError::Database)?;
+            return Ok(current);
+        }
+        if current.state != source {
+            return Err(AttemptStoreError::InvalidTransition);
+        }
+        transition_without_refs(&transaction, attempt_id, target, now_ms)?;
+        let record = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::Database)?;
+        transaction
+            .commit()
+            .map_err(|_| AttemptStoreError::Database)?;
+        Ok(record)
+    }
+}
+
+/// One bounded page from the nonterminal attempt listing.
+pub struct AttemptPage {
+    records: Vec<AttemptRecord>,
+    has_more: bool,
+}
+
+impl AttemptPage {
+    /// Returns the records in deterministic keyset order.
+    pub fn records(&self) -> &[AttemptRecord] {
+        &self.records
+    }
+
+    /// Returns whether another page follows this one.
+    pub const fn has_more(&self) -> bool {
+        self.has_more
     }
 }
 
@@ -551,6 +1000,21 @@ fn load_record(
         .transpose()
 }
 
+fn transition_without_refs(
+    transaction: &rusqlite::Transaction<'_>,
+    attempt_id: &str,
+    state: AttemptState,
+    now_ms: i64,
+) -> Result<(), AttemptStoreError> {
+    transaction
+        .execute(
+            "UPDATE attempts SET lifecycle = ?1, updated_at_ms = ?2 WHERE attempt_id = ?3",
+            params![state.as_str(), now_ms, attempt_id],
+        )
+        .map_err(|_| AttemptStoreError::Database)?;
+    Ok(())
+}
+
 fn decode_raw(raw: RawAttempt) -> Result<AttemptRecord, AttemptStoreError> {
     validate_attempt_id(&raw.attempt_id).map_err(|_| AttemptStoreError::Database)?;
     validate_issue_id(&raw.issue_id).map_err(|_| AttemptStoreError::Database)?;
@@ -588,14 +1052,28 @@ fn decode_raw(raw: RawAttempt) -> Result<AttemptRecord, AttemptStoreError> {
         None => None,
     };
     let refs_present = raw.workspace_ref.is_some() && raw.agent_ref.is_some();
+    let workspace_only = raw.workspace_ref.is_some() && raw.agent_ref.is_none();
     let refs_absent = raw.workspace_ref.is_none() && raw.agent_ref.is_none();
     let valid_lifecycle = match state {
         AttemptState::Created => refs_absent && observation_revision == 0 && report_json.is_none(),
+        AttemptState::WorkspacePending => {
+            refs_absent && observation_revision == 0 && report_json.is_none()
+        }
+        AttemptState::WorkspaceReady => {
+            workspace_only && observation_revision == 0 && report_json.is_none()
+        }
+        AttemptState::AgentPending => {
+            workspace_only && observation_revision == 0 && report_json.is_none()
+        }
+        AttemptState::AgentReady | AttemptState::PromptPending => {
+            refs_present && observation_revision == 0 && report_json.is_none()
+        }
         AttemptState::Running => refs_present && observation_revision == 0 && report_json.is_none(),
         AttemptState::Observed | AttemptState::Blocked | AttemptState::Failed => {
             refs_present && observation_revision > 0 && report_json.is_none()
         }
         AttemptState::ReportReady => refs_present && report_json.is_some(),
+        AttemptState::InterruptPending => refs_present && report_json.is_none(),
     };
     if !valid_lifecycle {
         return Err(AttemptStoreError::Database);
@@ -714,7 +1192,25 @@ fn validate_database_path(path: &Path) -> Result<(), AttemptStoreError> {
         return Err(AttemptStoreError::UnsafePath);
     }
     let parent = path.parent().ok_or(AttemptStoreError::UnsafePath)?;
-    validate_parent_directory(parent)
+    validate_parent_directory(parent)?;
+    validate_state_directory(parent)
+}
+
+fn validate_state_directory(path: &Path) -> Result<(), AttemptStoreError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| AttemptStoreError::UnsafePath)?;
+    #[cfg(unix)]
+    {
+        let mode = metadata.permissions().mode();
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || mode & 0o777 != 0o700
+            || mode & 0o7000 != 0
+        {
+            return Err(AttemptStoreError::UnsafePath);
+        }
+    }
+    Ok(())
 }
 
 fn validate_parent_directory(path: &Path) -> Result<(), AttemptStoreError> {
@@ -818,6 +1314,73 @@ fn validate_database_file(path: &Path) -> Result<DatabaseIdentity, AttemptStoreE
         }
     }
     Ok(DatabaseIdentity::from_metadata(&metadata))
+}
+
+fn ensure_state_directory(path: &Path) -> Result<DatabaseIdentity, AttemptStoreError> {
+    validate_state_directory(path)?;
+    let metadata = fs::symlink_metadata(path).map_err(|_| AttemptStoreError::UnsafePath)?;
+    Ok(DatabaseIdentity::from_metadata(&metadata))
+}
+
+fn open_state_directory_lock_file(
+    path: &Path,
+    expected: DatabaseIdentity,
+) -> Result<File, AttemptStoreError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let file = options
+        .open(path)
+        .map_err(|_| AttemptStoreError::UnsafePath)?;
+    validate_open_state_directory_identity(&file, path, expected)?;
+    Ok(file)
+}
+
+fn acquire_state_directory_lock(file: &File) -> Result<(), AttemptStoreError> {
+    #[cfg(unix)]
+    {
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result != 0 {
+            let code = std::io::Error::last_os_error().raw_os_error();
+            if code == Some(libc::EWOULDBLOCK) || code == Some(libc::EAGAIN) {
+                return Err(AttemptStoreError::Busy);
+            }
+            return Err(AttemptStoreError::Database);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = file;
+    Ok(())
+}
+
+fn validate_open_state_directory_identity(
+    file: &File,
+    path: &Path,
+    expected: DatabaseIdentity,
+) -> Result<(), AttemptStoreError> {
+    let file_metadata = file.metadata().map_err(|_| AttemptStoreError::UnsafePath)?;
+    let path_metadata = fs::symlink_metadata(path).map_err(|_| AttemptStoreError::UnsafePath)?;
+    let path_identity = DatabaseIdentity::from_metadata(&path_metadata);
+    if path_identity != expected
+        || !path_metadata.is_dir()
+        || path_metadata.file_type().is_symlink()
+        || !file_metadata.is_dir()
+    {
+        return Err(AttemptStoreError::UnsafePath);
+    }
+    #[cfg(unix)]
+    {
+        if file_metadata.dev() != expected.device
+            || file_metadata.ino() != expected.inode
+            || file_metadata.uid() != expected.owner
+            || file_metadata.permissions().mode() & 0o777 != 0o700
+            || file_metadata.permissions().mode() & 0o7000 != 0
+        {
+            return Err(AttemptStoreError::UnsafePath);
+        }
+    }
+    Ok(())
 }
 
 fn validate_sidecars(
@@ -945,9 +1508,7 @@ mod tests {
                     .state(),
                 AttemptState::Created
             );
-            store
-                .mark_started(ATTEMPT_ID, "workspace-1", "agent-1", 200)
-                .expect("start");
+            mark_started_for_test(&mut store, ATTEMPT_ID, "workspace-1", "agent-1", 200);
             let record = store
                 .record_observation(ATTEMPT_ID, AttemptState::Observed, 1, 300)
                 .expect("observation");
@@ -975,22 +1536,35 @@ mod tests {
             Err(AttemptStoreError::InvalidTransition)
         );
         assert_eq!(
-            store.mark_started(ATTEMPT_ID, "", "agent-1", 120),
+            store.mark_workspace_ready(ATTEMPT_ID, "", 120),
             Err(AttemptStoreError::InvalidInput)
         );
+        store
+            .mark_workspace_pending(ATTEMPT_ID, 120)
+            .expect("workspace intent");
+        store
+            .mark_workspace_ready(ATTEMPT_ID, "workspace-1", 120)
+            .expect("workspace ready");
+        store
+            .mark_agent_pending(ATTEMPT_ID, 120)
+            .expect("agent intent");
         let started = store
-            .mark_started(ATTEMPT_ID, "workspace-1", "agent-1", 120)
-            .expect("start");
+            .mark_agent_ready(ATTEMPT_ID, "workspace-1", "agent-1", 120)
+            .expect("agent ready");
         assert_eq!(
             store
-                .mark_started(ATTEMPT_ID, "workspace-1", "agent-1", 120)
+                .mark_agent_ready(ATTEMPT_ID, "workspace-1", "agent-1", 120)
                 .expect("identical start retry"),
             started
         );
         assert_eq!(
-            store.mark_started(ATTEMPT_ID, "workspace-2", "agent-1", 121),
+            store.mark_agent_ready(ATTEMPT_ID, "workspace-2", "agent-1", 121),
             Err(AttemptStoreError::DuplicateConflict)
         );
+        store
+            .mark_prompt_pending(ATTEMPT_ID, 121)
+            .expect("prompt intent");
+        store.confirm_prompt(ATTEMPT_ID, 121).expect("prompt");
         let first = store
             .record_observation(ATTEMPT_ID, AttemptState::Observed, 2, 130)
             .expect("first observation");
@@ -1016,7 +1590,7 @@ mod tests {
             Err(AttemptStoreError::StaleTimestamp)
         );
         assert_eq!(
-            store.mark_started(ATTEMPT_ID, "workspace-1", "agent-1", 160),
+            store.mark_agent_ready(ATTEMPT_ID, "workspace-1", "agent-1", 160),
             Err(AttemptStoreError::InvalidTransition)
         );
     }
@@ -1033,9 +1607,7 @@ mod tests {
             store.record_report(ATTEMPT_ID, &report, 105),
             Err(AttemptStoreError::ReportBindingMismatch)
         );
-        store
-            .mark_started(ATTEMPT_ID, "workspace-1", "agent-1", 110)
-            .expect("start");
+        mark_started_for_test(&mut store, ATTEMPT_ID, "workspace-1", "agent-1", 110);
         let record = store
             .record_report(ATTEMPT_ID, &report, 120)
             .expect("report");
@@ -1076,15 +1648,170 @@ mod tests {
         store
             .create("attempt-2", ISSUE_ID, AttemptBackend::HerdrCodex, 2)
             .expect("create two");
-        store
-            .mark_started("attempt-2", "workspace-2", "agent-2", 3)
-            .expect("start two");
+        mark_started_for_test(&mut store, "attempt-2", "workspace-2", "agent-2", 3);
         store
             .record_observation("attempt-2", AttemptState::Failed, 1, 4)
             .expect("fail two");
-        let records = store.list_nonterminal().expect("list");
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].attempt_id(), "attempt-1");
+        let page = store.list_nonterminal_page(None, 64).expect("list page");
+        assert!(!page.has_more());
+        assert_eq!(page.records().len(), 1);
+        assert_eq!(page.records()[0].attempt_id(), "attempt-1");
+    }
+
+    #[test]
+    fn operator_resolution_is_closed_and_effect_free() {
+        let database = TestDatabase::new();
+        let mut store = AttemptStore::open(&database.path).expect("open store");
+        store
+            .create(ATTEMPT_ID, ISSUE_ID, AttemptBackend::HerdrCodex, 1)
+            .expect("create");
+        assert_eq!(
+            store.resolve(ATTEMPT_ID, AttemptResolution::ConfirmAbsent, 2),
+            Err(AttemptStoreError::InvalidTransition)
+        );
+        store
+            .mark_workspace_pending(ATTEMPT_ID, 2)
+            .expect("workspace intent");
+        assert_eq!(
+            store
+                .resolve(ATTEMPT_ID, AttemptResolution::ConfirmAbsent, 3)
+                .expect("confirm workspace absent")
+                .state(),
+            AttemptState::Created
+        );
+        assert_eq!(
+            store.resolve(ATTEMPT_ID, AttemptResolution::ConfirmAbsent, 4),
+            Err(AttemptStoreError::InvalidTransition)
+        );
+
+        store
+            .mark_workspace_pending(ATTEMPT_ID, 4)
+            .expect("workspace intent retry");
+        store
+            .mark_workspace_ready(ATTEMPT_ID, "workspace-1", 4)
+            .expect("workspace ready");
+        store
+            .mark_agent_pending(ATTEMPT_ID, 4)
+            .expect("agent intent");
+        assert_eq!(
+            store
+                .resolve(ATTEMPT_ID, AttemptResolution::ConfirmAbsent, 5)
+                .expect("confirm agent absent")
+                .state(),
+            AttemptState::WorkspaceReady
+        );
+        store
+            .mark_agent_pending(ATTEMPT_ID, 5)
+            .expect("agent intent retry");
+        store
+            .mark_agent_ready(ATTEMPT_ID, "workspace-1", "agent-1", 5)
+            .expect("agent ready");
+        store
+            .mark_prompt_pending(ATTEMPT_ID, 5)
+            .expect("prompt intent");
+        assert_eq!(
+            store
+                .resolve(ATTEMPT_ID, AttemptResolution::ConfirmAbsent, 6)
+                .expect("confirm prompt absent")
+                .state(),
+            AttemptState::AgentReady
+        );
+        store
+            .mark_prompt_pending(ATTEMPT_ID, 6)
+            .expect("prompt intent retry");
+        assert_eq!(
+            store
+                .resolve(ATTEMPT_ID, AttemptResolution::ConfirmDelivered, 7)
+                .expect("confirm prompt delivered")
+                .state(),
+            AttemptState::Running
+        );
+        assert_eq!(
+            store.resolve(ATTEMPT_ID, AttemptResolution::ConfirmDelivered, 8),
+            Err(AttemptStoreError::InvalidTransition)
+        );
+    }
+
+    #[test]
+    fn keyset_pages_are_bounded_and_complete() {
+        let database = TestDatabase::new();
+        let mut store = AttemptStore::open(&database.path).expect("open store");
+        for index in 0..66 {
+            let attempt_id = format!("attempt-{index:03}");
+            store
+                .create(&attempt_id, ISSUE_ID, AttemptBackend::HerdrCodex, 1)
+                .expect("create");
+        }
+        assert_eq!(
+            store.list_nonterminal_page(None, 0).err(),
+            Some(AttemptStoreError::InvalidInput)
+        );
+        let first = store.list_nonterminal_page(None, 64).expect("first page");
+        assert_eq!(first.records().len(), 64);
+        assert!(first.has_more());
+        let cursor = first
+            .records()
+            .last()
+            .expect("last first row")
+            .attempt_id()
+            .to_owned();
+        let second = store
+            .list_nonterminal_page(Some(&cursor), 64)
+            .expect("second page");
+        assert_eq!(second.records().len(), 2);
+        assert!(!second.has_more());
+        let ids = first
+            .records()
+            .iter()
+            .chain(second.records())
+            .map(AttemptRecord::attempt_id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 66);
+        assert_eq!(ids.first().copied(), Some("attempt-000"));
+        assert_eq!(ids.last().copied(), Some("attempt-065"));
+        assert_eq!(
+            store
+                .list_nonterminal_page(Some("attempt-missing"), 64)
+                .err(),
+            Some(AttemptStoreError::InvalidInput)
+        );
+
+        mark_started_for_test(&mut store, &cursor, "workspace-failed", "agent-failed", 2);
+        store
+            .record_observation(&cursor, AttemptState::Failed, 1, 3)
+            .expect("fail attempt");
+        let after_failed = store
+            .list_nonterminal_page(Some(&cursor), 64)
+            .expect("failed cursor remains a keyset anchor");
+        assert_eq!(
+            after_failed
+                .records()
+                .iter()
+                .map(AttemptRecord::attempt_id)
+                .collect::<Vec<_>>(),
+            vec!["attempt-064", "attempt-065"]
+        );
+    }
+
+    #[test]
+    fn bounded_nonterminal_listing_rejects_corrupt_rows() {
+        let database = TestDatabase::new();
+        {
+            let mut store = AttemptStore::open(&database.path).expect("open store");
+            store
+                .create(ATTEMPT_ID, ISSUE_ID, AttemptBackend::HerdrCodex, 1)
+                .expect("create");
+        }
+        let connection = Connection::open(&database.path).expect("raw database");
+        connection
+            .execute("UPDATE attempts SET workspace_ref = 'unexpected'", [])
+            .expect("corrupt row");
+        drop(connection);
+        let store = AttemptStore::open(&database.path).expect("reopen store");
+        assert_eq!(
+            store.list_nonterminal_page(None, 1).err(),
+            Some(AttemptStoreError::Database)
+        );
     }
 
     #[cfg(unix)]
@@ -1153,6 +1880,92 @@ mod tests {
             AttemptStore::open(&symlink).err(),
             Some(AttemptStoreError::UnsafePath)
         );
+
+        let database_hardlink = database.root.join("database-hardlink.db");
+        fs::hard_link(&database.path, &database_hardlink).expect("database hardlink");
+        assert_eq!(
+            AttemptStore::open(&database.path).err(),
+            Some(AttemptStoreError::UnsafePath)
+        );
+        fs::remove_file(&database_hardlink).expect("remove database hardlink");
+
+        fs::set_permissions(&database.root, fs::Permissions::from_mode(0o750))
+            .expect("unsafe state directory mode");
+        assert_eq!(
+            AttemptStore::open(&database.path).err(),
+            Some(AttemptStoreError::UnsafePath)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_directory_lock_contends_and_releases_on_drop() {
+        if let (Ok(mode), Ok(path)) = (
+            std::env::var("NAGI_ATTEMPT_STORE_LOCK_PROBE"),
+            std::env::var("NAGI_ATTEMPT_STORE_LOCK_DB"),
+        ) {
+            let opened = AttemptStore::open(path);
+            let valid = match mode.as_str() {
+                "contend" => matches!(opened, Err(AttemptStoreError::Busy)),
+                "after_drop" => opened.is_ok(),
+                _ => false,
+            };
+            assert!(valid, "unexpected lock probe result");
+            return;
+        }
+
+        let database = TestDatabase::new();
+        let first = AttemptStore::open(&database.path).expect("first store");
+        let path = database.path.clone();
+        let second = std::thread::spawn(move || AttemptStore::open(&path).err())
+            .join()
+            .expect("second store");
+        assert_eq!(second, Some(AttemptStoreError::Busy));
+
+        let test_binary = std::env::current_exe().expect("test binary");
+        let child = std::process::Command::new(test_binary)
+            .args([
+                "--exact",
+                "attempt_store::tests::state_directory_lock_contends_and_releases_on_drop",
+                "--nocapture",
+            ])
+            .env("NAGI_ATTEMPT_STORE_LOCK_PROBE", "contend")
+            .env("NAGI_ATTEMPT_STORE_LOCK_DB", &database.path)
+            .status()
+            .expect("contending child");
+        assert!(child.success(), "child entered a held lock");
+
+        drop(first);
+        let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "attempt_store::tests::state_directory_lock_contends_and_releases_on_drop",
+                "--nocapture",
+            ])
+            .env("NAGI_ATTEMPT_STORE_LOCK_PROBE", "after_drop")
+            .env("NAGI_ATTEMPT_STORE_LOCK_DB", &database.path)
+            .status()
+            .expect("released child");
+        assert!(child.success(), "child could not acquire released lock");
+        AttemptStore::open(&database.path).expect("lock released after drop");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_store_rejects_database_path_replacement_before_use() {
+        let database = TestDatabase::new();
+        let store = AttemptStore::open(&database.path).expect("store");
+        let replacement = database.root.join("replacement.db");
+        fs::copy(&database.path, &replacement).expect("copy database");
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600))
+            .expect("replacement mode");
+        let displaced = database.root.join("displaced.db");
+        fs::rename(&database.path, &displaced).expect("displace database");
+        fs::rename(&replacement, &database.path).expect("replace database path");
+        assert_eq!(
+            store.get(ATTEMPT_ID).err(),
+            Some(AttemptStoreError::UnsafePath)
+        );
     }
 
     #[test]
@@ -1208,9 +2021,7 @@ mod tests {
         );
         assert_corrupt_row(
             |store| {
-                store
-                    .mark_started(ATTEMPT_ID, "workspace-1", "agent-1", 2)
-                    .expect("start");
+                mark_started_for_test(store, ATTEMPT_ID, "workspace-1", "agent-1", 2);
             },
             |connection| {
                 connection
@@ -1220,9 +2031,7 @@ mod tests {
         );
         assert_corrupt_row(
             |store| {
-                store
-                    .mark_started(ATTEMPT_ID, "workspace-1", "agent-1", 2)
-                    .expect("start");
+                mark_started_for_test(store, ATTEMPT_ID, "workspace-1", "agent-1", 2);
                 store
                     .record_observation(ATTEMPT_ID, AttemptState::Observed, 1, 3)
                     .expect("observe");
@@ -1235,9 +2044,7 @@ mod tests {
         );
         assert_corrupt_row(
             |store| {
-                store
-                    .mark_started(ATTEMPT_ID, "workspace-1", "agent-1", 2)
-                    .expect("start");
+                mark_started_for_test(store, ATTEMPT_ID, "workspace-1", "agent-1", 2);
                 store
                     .record_observation(ATTEMPT_ID, AttemptState::Observed, 1, 3)
                     .expect("observe");
@@ -1251,9 +2058,7 @@ mod tests {
         let report = report_json(ATTEMPT_ID, "herdr+codex", "agent-1");
         assert_corrupt_row(
             |store| {
-                store
-                    .mark_started(ATTEMPT_ID, "workspace-1", "agent-1", 2)
-                    .expect("start");
+                mark_started_for_test(store, ATTEMPT_ID, "workspace-1", "agent-1", 2);
             },
             |connection| {
                 connection
@@ -1267,9 +2072,7 @@ mod tests {
         let report = report_json(ATTEMPT_ID, "herdr+codex", "agent-1");
         assert_corrupt_row(
             |store| {
-                store
-                    .mark_started(ATTEMPT_ID, "workspace-1", "agent-1", 2)
-                    .expect("start");
+                mark_started_for_test(store, ATTEMPT_ID, "workspace-1", "agent-1", 2);
                 store.record_report(ATTEMPT_ID, &report, 3).expect("report");
             },
             |connection| {
@@ -1281,9 +2084,7 @@ mod tests {
         let report = report_json(ATTEMPT_ID, "herdr+codex", "agent-1");
         assert_corrupt_row(
             |store| {
-                store
-                    .mark_started(ATTEMPT_ID, "workspace-1", "agent-1", 2)
-                    .expect("start");
+                mark_started_for_test(store, ATTEMPT_ID, "workspace-1", "agent-1", 2);
                 store.record_report(ATTEMPT_ID, &report, 3).expect("report");
             },
             |connection| {
@@ -1314,9 +2115,7 @@ mod tests {
         store
             .create(ATTEMPT_ID, ISSUE_ID, AttemptBackend::HerdrCodex, 1)
             .expect("create");
-        store
-            .mark_started(ATTEMPT_ID, "workspace-1", "agent-1", 2)
-            .expect("start");
+        mark_started_for_test(&mut store, ATTEMPT_ID, "workspace-1", "agent-1", 2);
         let record = store
             .record_observation(ATTEMPT_ID, AttemptState::Observed, 1, 3)
             .expect("observation");
@@ -1343,6 +2142,33 @@ mod tests {
             "summary": "synthetic observation"
         })
         .to_string()
+    }
+
+    fn mark_started_for_test(
+        store: &mut AttemptStore,
+        attempt_id: &str,
+        workspace_ref: &str,
+        agent_ref: &str,
+        now_ms: i64,
+    ) -> AttemptRecord {
+        store
+            .mark_workspace_pending(attempt_id, now_ms)
+            .expect("workspace intent");
+        store
+            .mark_workspace_ready(attempt_id, workspace_ref, now_ms)
+            .expect("workspace ready");
+        store
+            .mark_agent_pending(attempt_id, now_ms)
+            .expect("agent intent");
+        store
+            .mark_agent_ready(attempt_id, workspace_ref, agent_ref, now_ms)
+            .expect("agent ready");
+        store
+            .mark_prompt_pending(attempt_id, now_ms)
+            .expect("prompt intent");
+        store
+            .confirm_prompt(attempt_id, now_ms)
+            .expect("prompt confirmed")
     }
 
     fn assert_corrupt_row<Setup, Corrupt>(setup: Setup, corrupt: Corrupt)

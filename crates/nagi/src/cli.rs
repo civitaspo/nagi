@@ -15,6 +15,8 @@ use crate::linear::credentials::{CredentialManager, bounded_client_id};
 #[cfg(target_os = "macos")]
 use crate::linear::read::{self, LinearIssueBinding};
 #[cfg(target_os = "macos")]
+use crate::work::{self, AttemptResolution, WorkError};
+#[cfg(target_os = "macos")]
 use serde::Serialize;
 #[cfg(all(target_os = "macos", feature = "macos-keychain-contract"))]
 use std::ffi::OsStr;
@@ -55,13 +57,16 @@ pub enum CliError {
     ReadContract(ReadContractError),
     /// The managed Codex authentication boundary rejected its operation.
     Codex(CodexError),
+    /// The single-issue work boundary rejected its operation.
+    #[cfg(target_os = "macos")]
+    Work(WorkError),
 }
 
 impl fmt::Display for CliError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Usage => formatter.write_str(
-                "usage: nagi auth linear login | status | logout --confirm-revoke | nagi auth codex login | status | logout | nagi contract linear read",
+                "usage: nagi auth linear login|status|logout --confirm-revoke | nagi auth codex login|status|logout | nagi contract linear read | nagi work start --config PATH | nagi work status|interrupt --config PATH --attempt ID | nagi work list --config PATH [--after ATTEMPT] | nagi work resolve --config PATH --attempt ID --confirm-absent|--confirm-delivered | nagi work collect --config PATH --attempt ID --report PATH",
             ),
             Self::Configuration => {
                 formatter.write_str("Linear OAuth local configuration is invalid")
@@ -69,13 +74,15 @@ impl fmt::Display for CliError {
             Self::Credential(error) => error.fmt(formatter),
             Self::ReadContract(error) => error.fmt(formatter),
             Self::Codex(error) => error.fmt(formatter),
+            #[cfg(target_os = "macos")]
+            Self::Work(error) => error.fmt(formatter),
         }
     }
 }
 
 impl std::error::Error for CliError {}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum Command {
     LinearLogin,
     LinearStatus,
@@ -84,6 +91,38 @@ enum Command {
     CodexStatus,
     CodexLogout,
     ReadContract,
+    #[cfg(target_os = "macos")]
+    Work(WorkCommand),
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum WorkCommand {
+    Start {
+        config: std::path::PathBuf,
+    },
+    Status {
+        config: std::path::PathBuf,
+        attempt_id: String,
+    },
+    List {
+        config: std::path::PathBuf,
+        after: Option<String>,
+    },
+    Resolve {
+        config: std::path::PathBuf,
+        attempt_id: String,
+        resolution: AttemptResolution,
+    },
+    Interrupt {
+        config: std::path::PathBuf,
+        attempt_id: String,
+    },
+    Collect {
+        config: std::path::PathBuf,
+        attempt_id: String,
+        report: std::path::PathBuf,
+    },
 }
 
 /// Runs the command using process arguments and environment configuration.
@@ -183,6 +222,43 @@ where
                 reject_unknown_linear_configuration()?;
                 run_read_contract()?;
             }
+            Command::Work(work_command) => match work_command {
+                WorkCommand::Start { config } => {
+                    let status = work::run_start(&config).map_err(CliError::Work)?;
+                    println!("{}", work::render_status(&status).map_err(CliError::Work)?);
+                }
+                WorkCommand::Status { config, attempt_id } => {
+                    let status = work::run_status(&config, &attempt_id).map_err(CliError::Work)?;
+                    println!("{}", work::render_status(&status).map_err(CliError::Work)?);
+                }
+                WorkCommand::List { config, after } => {
+                    let page = work::run_list(&config, after.as_deref()).map_err(CliError::Work)?;
+                    println!("{}", work::render_list(&page).map_err(CliError::Work)?);
+                }
+                WorkCommand::Resolve {
+                    config,
+                    attempt_id,
+                    resolution,
+                } => {
+                    let status = work::run_resolve(&config, &attempt_id, resolution)
+                        .map_err(CliError::Work)?;
+                    println!("{}", work::render_status(&status).map_err(CliError::Work)?);
+                }
+                WorkCommand::Interrupt { config, attempt_id } => {
+                    let status =
+                        work::run_interrupt(&config, &attempt_id).map_err(CliError::Work)?;
+                    println!("{}", work::render_status(&status).map_err(CliError::Work)?);
+                }
+                WorkCommand::Collect {
+                    config,
+                    attempt_id,
+                    report,
+                } => {
+                    let result =
+                        work::run_collect(&config, &attempt_id, &report).map_err(CliError::Work)?;
+                    println!("{}", work::render_collect(&result).map_err(CliError::Work)?);
+                }
+            },
         }
         Ok(())
     }
@@ -198,8 +274,149 @@ where
     match first.to_str() {
         Some("auth") => parse_auth(arguments),
         Some("contract") => parse_contract_linear(arguments),
+        #[cfg(target_os = "macos")]
+        Some("work") => parse_work(arguments),
         _ => Err(CliError::Usage),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn parse_work<I>(mut arguments: I) -> Result<Command, CliError>
+where
+    I: Iterator<Item = OsString>,
+{
+    let Some(operation) = arguments.next().and_then(|value| value.into_string().ok()) else {
+        return Err(CliError::Usage);
+    };
+    let Some(config_flag) = arguments.next() else {
+        return Err(CliError::Usage);
+    };
+    if config_flag != "--config" {
+        return Err(CliError::Usage);
+    }
+    let Some(config) = arguments.next() else {
+        return Err(CliError::Usage);
+    };
+    let config = config
+        .into_string()
+        .map(std::path::PathBuf::from)
+        .map_err(|_| CliError::Usage)?;
+    match operation.as_str() {
+        "start" if arguments.next().is_none() => Ok(Command::Work(WorkCommand::Start { config })),
+        "status" => parse_work_attempt(arguments, config, false),
+        "interrupt" => parse_work_attempt(arguments, config, true),
+        "list" => parse_work_list(arguments, config),
+        "resolve" => parse_work_resolve(arguments, config),
+        "collect" => parse_work_collect(arguments, config),
+        _ => Err(CliError::Usage),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn parse_work_list<I>(mut arguments: I, config: std::path::PathBuf) -> Result<Command, CliError>
+where
+    I: Iterator<Item = OsString>,
+{
+    let after = match arguments.next() {
+        None => None,
+        Some(flag) if flag == std::ffi::OsStr::new("--after") => Some(
+            arguments
+                .next()
+                .and_then(|value| value.into_string().ok())
+                .ok_or(CliError::Usage)?,
+        ),
+        Some(_) => return Err(CliError::Usage),
+    };
+    if arguments.next().is_some() {
+        return Err(CliError::Usage);
+    }
+    Ok(Command::Work(WorkCommand::List { config, after }))
+}
+
+#[cfg(target_os = "macos")]
+fn parse_work_resolve<I>(mut arguments: I, config: std::path::PathBuf) -> Result<Command, CliError>
+where
+    I: Iterator<Item = OsString>,
+{
+    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--attempt")) {
+        return Err(CliError::Usage);
+    }
+    let Some(attempt_id) = arguments.next().and_then(|value| value.into_string().ok()) else {
+        return Err(CliError::Usage);
+    };
+    let resolution = match arguments.next().as_deref() {
+        Some(flag) if flag == std::ffi::OsStr::new("--confirm-absent") => {
+            AttemptResolution::ConfirmAbsent
+        }
+        Some(flag) if flag == std::ffi::OsStr::new("--confirm-delivered") => {
+            AttemptResolution::ConfirmDelivered
+        }
+        _ => return Err(CliError::Usage),
+    };
+    if arguments.next().is_some() {
+        return Err(CliError::Usage);
+    }
+    Ok(Command::Work(WorkCommand::Resolve {
+        config,
+        attempt_id,
+        resolution,
+    }))
+}
+
+#[cfg(target_os = "macos")]
+fn parse_work_attempt<I>(
+    mut arguments: I,
+    config: std::path::PathBuf,
+    interrupt: bool,
+) -> Result<Command, CliError>
+where
+    I: Iterator<Item = OsString>,
+{
+    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--attempt")) {
+        return Err(CliError::Usage);
+    }
+    let Some(attempt_id) = arguments.next().and_then(|value| value.into_string().ok()) else {
+        return Err(CliError::Usage);
+    };
+    if arguments.next().is_some() {
+        return Err(CliError::Usage);
+    }
+    Ok(Command::Work(if interrupt {
+        WorkCommand::Interrupt { config, attempt_id }
+    } else {
+        WorkCommand::Status { config, attempt_id }
+    }))
+}
+
+#[cfg(target_os = "macos")]
+fn parse_work_collect<I>(mut arguments: I, config: std::path::PathBuf) -> Result<Command, CliError>
+where
+    I: Iterator<Item = OsString>,
+{
+    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--attempt")) {
+        return Err(CliError::Usage);
+    }
+    let Some(attempt_id) = arguments.next().and_then(|value| value.into_string().ok()) else {
+        return Err(CliError::Usage);
+    };
+    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--report")) {
+        return Err(CliError::Usage);
+    }
+    let Some(report) = arguments.next() else {
+        return Err(CliError::Usage);
+    };
+    let report = report
+        .into_string()
+        .map(std::path::PathBuf::from)
+        .map_err(|_| CliError::Usage)?;
+    if arguments.next().is_some() {
+        return Err(CliError::Usage);
+    }
+    Ok(Command::Work(WorkCommand::Collect {
+        config,
+        attempt_id,
+        report,
+    }))
 }
 
 fn parse_auth<I>(mut arguments: I) -> Result<Command, CliError>
@@ -246,6 +463,8 @@ where
         Command::CodexLogin | Command::CodexStatus | Command::CodexLogout => {
             return Err(CliError::Usage);
         }
+        #[cfg(target_os = "macos")]
+        Command::Work(_) => return Err(CliError::Usage),
     }
     Ok(operation)
 }
@@ -529,6 +748,194 @@ mod tests {
             parse_arguments(args(&["contract", "linear", "read"]).into_iter()),
             Ok(Command::ReadContract)
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parser_accepts_only_explicit_work_forms() {
+        let config = std::path::PathBuf::from("/private/nagi/work.json");
+        assert_eq!(
+            parse_arguments(
+                args(&["work", "start", "--config", "/private/nagi/work.json"]).into_iter()
+            ),
+            Ok(Command::Work(WorkCommand::Start {
+                config: config.clone(),
+            }))
+        );
+        assert_eq!(
+            parse_arguments(
+                args(&[
+                    "work",
+                    "status",
+                    "--config",
+                    "/private/nagi/work.json",
+                    "--attempt",
+                    "attempt-1",
+                ])
+                .into_iter()
+            ),
+            Ok(Command::Work(WorkCommand::Status {
+                config: config.clone(),
+                attempt_id: "attempt-1".to_owned(),
+            }))
+        );
+        assert_eq!(
+            parse_arguments(
+                args(&[
+                    "work",
+                    "collect",
+                    "--config",
+                    "/private/nagi/work.json",
+                    "--attempt",
+                    "attempt-1",
+                    "--report",
+                    "/private/nagi/report.json",
+                ])
+                .into_iter()
+            ),
+            Ok(Command::Work(WorkCommand::Collect {
+                config: config.clone(),
+                attempt_id: "attempt-1".to_owned(),
+                report: std::path::PathBuf::from("/private/nagi/report.json"),
+            }))
+        );
+        assert_eq!(
+            parse_arguments(
+                args(&["work", "list", "--config", "/private/nagi/work.json"]).into_iter()
+            ),
+            Ok(Command::Work(WorkCommand::List {
+                config: config.clone(),
+                after: None,
+            }))
+        );
+        assert_eq!(
+            parse_arguments(
+                args(&[
+                    "work",
+                    "list",
+                    "--config",
+                    "/private/nagi/work.json",
+                    "--after",
+                    "attempt-1",
+                ])
+                .into_iter()
+            ),
+            Ok(Command::Work(WorkCommand::List {
+                config: config.clone(),
+                after: Some("attempt-1".to_owned()),
+            }))
+        );
+        assert_eq!(
+            parse_arguments(
+                args(&[
+                    "work",
+                    "resolve",
+                    "--config",
+                    "/private/nagi/work.json",
+                    "--attempt",
+                    "attempt-1",
+                    "--confirm-absent",
+                ])
+                .into_iter()
+            ),
+            Ok(Command::Work(WorkCommand::Resolve {
+                config: config.clone(),
+                attempt_id: "attempt-1".to_owned(),
+                resolution: AttemptResolution::ConfirmAbsent,
+            }))
+        );
+        assert_eq!(
+            parse_arguments(
+                args(&[
+                    "work",
+                    "resolve",
+                    "--config",
+                    "/private/nagi/work.json",
+                    "--attempt",
+                    "attempt-1",
+                    "--confirm-delivered",
+                ])
+                .into_iter()
+            ),
+            Ok(Command::Work(WorkCommand::Resolve {
+                config,
+                attempt_id: "attempt-1".to_owned(),
+                resolution: AttemptResolution::ConfirmDelivered,
+            }))
+        );
+        for values in [
+            &[
+                "work",
+                "start",
+                "--config",
+                "/private/nagi/work.json",
+                "--token",
+                "secret",
+            ][..],
+            &[
+                "work",
+                "status",
+                "--config",
+                "/private/nagi/work.json",
+                "--attempt",
+                "attempt-1",
+                "extra",
+            ][..],
+            &[
+                "work",
+                "collect",
+                "--config",
+                "/private/nagi/work.json",
+                "--attempt",
+                "attempt-1",
+            ][..],
+            &[
+                "work",
+                "list",
+                "--config",
+                "/private/nagi/work.json",
+                "extra",
+            ][..],
+            &[
+                "work",
+                "list",
+                "--config",
+                "/private/nagi/work.json",
+                "--after",
+            ][..],
+            &[
+                "work",
+                "list",
+                "--config",
+                "/private/nagi/work.json",
+                "--after",
+                "attempt-1",
+                "extra",
+            ][..],
+            &[
+                "work",
+                "resolve",
+                "--config",
+                "/private/nagi/work.json",
+                "--attempt",
+                "attempt-1",
+            ][..],
+            &[
+                "work",
+                "resolve",
+                "--config",
+                "/private/nagi/work.json",
+                "--attempt",
+                "attempt-1",
+                "--confirm-absent",
+                "--confirm-delivered",
+            ][..],
+        ] {
+            assert_eq!(
+                parse_arguments(values.iter().map(OsString::from)),
+                Err(CliError::Usage)
+            );
+        }
     }
 
     #[test]

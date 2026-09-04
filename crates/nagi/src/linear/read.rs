@@ -139,6 +139,21 @@ impl LinearIssueBinding {
             issue_id: bounded_id(issue_id.into())?,
         })
     }
+
+    /// Returns the exact organization UUID binding.
+    pub fn workspace_id(&self) -> &str {
+        &self.workspace_id
+    }
+
+    /// Returns the exact team UUID binding.
+    pub fn team_id(&self) -> &str {
+        &self.team_id
+    }
+
+    /// Returns the exact issue UUID binding.
+    pub fn issue_id(&self) -> &str {
+        &self.issue_id
+    }
 }
 
 impl fmt::Debug for LinearIssueBinding {
@@ -165,6 +180,16 @@ pub struct IssueInput {
 }
 
 impl IssueInput {
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn for_test(
+        id: &str,
+        identifier: &str,
+        title: &str,
+        description: Option<&str>,
+    ) -> Self {
+        Self::from_record(id, identifier, title, description).expect("valid test issue input")
+    }
+
     /// Returns the canonical issue UUID.
     pub fn id(&self) -> &str {
         &self.id
