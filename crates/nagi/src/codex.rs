@@ -252,6 +252,36 @@ fn open_verified_codex_executable(home: &Path) -> Result<VerifiedCodexSource, Co
     Ok(VerifiedCodexSource { file, identity })
 }
 
+/// Verifies an explicitly selected directory contains the pinned Codex CLI.
+/// This is used by the Herdr work runner so Herdr's inherited PATH cannot fall
+/// back to an ambient vendor installation.
+#[cfg(target_os = "macos")]
+pub(crate) fn validate_codex_executable_directory(directory: &Path) -> Result<(), CodexError> {
+    validate_path_text(directory).map_err(|_| CodexError::ExecutableUnavailable)?;
+    validate_no_symlink_components(directory).map_err(|_| CodexError::ExecutableUntrusted)?;
+    validate_existing_directory(directory, false).map_err(|_| CodexError::ExecutableUntrusted)?;
+    let path = directory.join("codex");
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+        .map_err(|_| CodexError::ExecutableUnavailable)?;
+    verify_codex_binary_file(&mut file, CODEX_BINARY_SHA256, &CODEX_BINARY_HEADER, None)?;
+    Ok(())
+}
+
+/// Verifies an explicitly selected managed `CODEX_HOME` without creating or
+/// modifying it.
+#[cfg(target_os = "macos")]
+pub(crate) fn validate_managed_codex_home(path: &Path) -> Result<(), CodexError> {
+    validate_path_text(path).map_err(|_| CodexError::Configuration)?;
+    validate_no_symlink_components(path).map_err(|_| CodexError::ManagedHomeUnsafe)?;
+    validate_existing_directory(path, true).map_err(|_| CodexError::ManagedHomeUnsafe)?;
+    verify_private_file(&path.join(MANAGED_MARKER_NAME), MANAGED_MARKER)?;
+    verify_private_file(&path.join(MANAGED_CONFIG_NAME), MANAGED_CONFIG)?;
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 fn validate_codex_source_parents(home: &Path, executable: &Path) -> Result<(), CodexError> {
     let relative = executable

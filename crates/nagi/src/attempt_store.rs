@@ -117,6 +117,8 @@ impl AttemptBackend {
 pub enum AttemptState {
     /// The attempt has been durably created but not started.
     Created,
+    /// Workspace creation completed and the workspace reference is bound.
+    WorkspaceReady,
     /// The selected backend has been started.
     Running,
     /// A lifecycle observation has been recorded.
@@ -127,6 +129,8 @@ pub enum AttemptState {
     Blocked,
     /// The backend observed a failed attempt.
     Failed,
+    /// An interrupt intent was durably recorded and awaits reconciliation.
+    InterruptPending,
 }
 
 impl AttemptState {
@@ -134,22 +138,26 @@ impl AttemptState {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Created => "created",
+            Self::WorkspaceReady => "workspace_ready",
             Self::Running => "running",
             Self::Observed => "observed",
             Self::ReportReady => "report_ready",
             Self::Blocked => "blocked",
             Self::Failed => "failed",
+            Self::InterruptPending => "interrupt_pending",
         }
     }
 
     fn parse(value: &str) -> Result<Self, AttemptStoreError> {
         match value {
             "created" => Ok(Self::Created),
+            "workspace_ready" => Ok(Self::WorkspaceReady),
             "running" => Ok(Self::Running),
             "observed" => Ok(Self::Observed),
             "report_ready" => Ok(Self::ReportReady),
             "blocked" => Ok(Self::Blocked),
             "failed" => Ok(Self::Failed),
+            "interrupt_pending" => Ok(Self::InterruptPending),
             _ => Err(AttemptStoreError::Database),
         }
     }
@@ -315,6 +323,48 @@ impl AttemptStore {
         Ok(record)
     }
 
+    /// Binds the workspace produced by one create effect before any agent
+    /// effect is issued. Repeating the exact binding is idempotent.
+    pub fn mark_workspace_ready(
+        &mut self,
+        attempt_id: &str,
+        workspace_ref: &str,
+        now_ms: i64,
+    ) -> Result<AttemptRecord, AttemptStoreError> {
+        validate_attempt_id(attempt_id)?;
+        validate_opaque_ref(workspace_ref)?;
+        validate_timestamp(now_ms)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| AttemptStoreError::Database)?;
+        let current = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::NotFound)?;
+        validate_update_timestamp(&current, now_ms)?;
+        if current.state == AttemptState::WorkspaceReady {
+            if current.workspace_ref.as_deref() != Some(workspace_ref) {
+                return Err(AttemptStoreError::DuplicateConflict);
+            }
+            transaction
+                .commit()
+                .map_err(|_| AttemptStoreError::Database)?;
+            return Ok(current);
+        }
+        if current.state != AttemptState::Created {
+            return Err(AttemptStoreError::InvalidTransition);
+        }
+        transaction
+            .execute(
+                "UPDATE attempts SET lifecycle = 'workspace_ready', workspace_ref = ?1, updated_at_ms = ?2 WHERE attempt_id = ?3",
+                params![workspace_ref, now_ms, attempt_id],
+            )
+            .map_err(|_| AttemptStoreError::Database)?;
+        let record = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::Database)?;
+        transaction
+            .commit()
+            .map_err(|_| AttemptStoreError::Database)?;
+        Ok(record)
+    }
+
     /// Marks a created attempt running while atomically binding its required
     /// workspace and agent references. Repeating the same binding is
     /// idempotent; a changed binding or later lifecycle state is rejected.
@@ -346,7 +396,15 @@ impl AttemptStore {
                 .map_err(|_| AttemptStoreError::Database)?;
             return Ok(current);
         }
-        if current.state != AttemptState::Created {
+        if matches!(current.state, AttemptState::WorkspaceReady)
+            && current.workspace_ref.as_deref() != Some(workspace_ref)
+        {
+            return Err(AttemptStoreError::DuplicateConflict);
+        }
+        if !matches!(
+            current.state,
+            AttemptState::Created | AttemptState::WorkspaceReady
+        ) {
             return Err(AttemptStoreError::InvalidTransition);
         }
         transaction
@@ -360,6 +418,62 @@ impl AttemptStore {
             .commit()
             .map_err(|_| AttemptStoreError::Database)?;
         Ok(record)
+    }
+
+    /// Records an interrupt intent before sending the one external key
+    /// effect. A repeated pending intent is idempotent and never authorizes a
+    /// second effect by itself.
+    pub fn mark_interrupt_pending(
+        &mut self,
+        attempt_id: &str,
+        now_ms: i64,
+    ) -> Result<AttemptRecord, AttemptStoreError> {
+        self.begin_interrupt_pending(attempt_id, now_ms)
+            .map(|(record, _)| record)
+    }
+
+    /// Records an interrupt intent and reports whether this call changed the
+    /// durable state. The boolean gates the single corresponding external
+    /// effect, so a retry after an ambiguous failure cannot blindly repeat it.
+    pub fn begin_interrupt_pending(
+        &mut self,
+        attempt_id: &str,
+        now_ms: i64,
+    ) -> Result<(AttemptRecord, bool), AttemptStoreError> {
+        validate_attempt_id(attempt_id)?;
+        validate_timestamp(now_ms)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| AttemptStoreError::Database)?;
+        let current = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::NotFound)?;
+        validate_update_timestamp(&current, now_ms)?;
+        if current.state == AttemptState::InterruptPending {
+            transaction
+                .commit()
+                .map_err(|_| AttemptStoreError::Database)?;
+            return Ok((current, false));
+        }
+        if !matches!(
+            current.state,
+            AttemptState::Running
+                | AttemptState::Observed
+                | AttemptState::Blocked
+                | AttemptState::InterruptPending
+        ) {
+            return Err(AttemptStoreError::InvalidTransition);
+        }
+        transaction
+            .execute(
+                "UPDATE attempts SET lifecycle = 'interrupt_pending', updated_at_ms = ?1 WHERE attempt_id = ?2",
+                params![now_ms, attempt_id],
+            )
+            .map_err(|_| AttemptStoreError::Database)?;
+        let record = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::Database)?;
+        transaction
+            .commit()
+            .map_err(|_| AttemptStoreError::Database)?;
+        Ok((record, true))
     }
 
     /// Records one observation with a strictly increasing revision.
@@ -402,7 +516,10 @@ impl AttemptStore {
         }
         if !matches!(
             current.state,
-            AttemptState::Running | AttemptState::Observed | AttemptState::Blocked
+            AttemptState::Running
+                | AttemptState::Observed
+                | AttemptState::Blocked
+                | AttemptState::InterruptPending
         ) {
             return Err(AttemptStoreError::InvalidTransition);
         }
@@ -463,7 +580,10 @@ impl AttemptStore {
         }
         if !matches!(
             current.state,
-            AttemptState::Running | AttemptState::Observed | AttemptState::Blocked
+            AttemptState::Running
+                | AttemptState::Observed
+                | AttemptState::Blocked
+                | AttemptState::InterruptPending
         ) {
             return Err(AttemptStoreError::InvalidTransition);
         }
@@ -588,14 +708,19 @@ fn decode_raw(raw: RawAttempt) -> Result<AttemptRecord, AttemptStoreError> {
         None => None,
     };
     let refs_present = raw.workspace_ref.is_some() && raw.agent_ref.is_some();
+    let workspace_only = raw.workspace_ref.is_some() && raw.agent_ref.is_none();
     let refs_absent = raw.workspace_ref.is_none() && raw.agent_ref.is_none();
     let valid_lifecycle = match state {
         AttemptState::Created => refs_absent && observation_revision == 0 && report_json.is_none(),
+        AttemptState::WorkspaceReady => {
+            workspace_only && observation_revision == 0 && report_json.is_none()
+        }
         AttemptState::Running => refs_present && observation_revision == 0 && report_json.is_none(),
         AttemptState::Observed | AttemptState::Blocked | AttemptState::Failed => {
             refs_present && observation_revision > 0 && report_json.is_none()
         }
         AttemptState::ReportReady => refs_present && report_json.is_some(),
+        AttemptState::InterruptPending => refs_present && report_json.is_none(),
     };
     if !valid_lifecycle {
         return Err(AttemptStoreError::Database);

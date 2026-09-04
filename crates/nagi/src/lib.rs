@@ -14,4 +14,7 @@ pub mod codex;
 
 pub mod linear;
 
+#[cfg(target_os = "macos")]
+pub mod work;
+
 pub mod cli;

@@ -14,6 +14,7 @@
 use crate::agent_report::AgentReport;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -194,6 +195,55 @@ impl HerdrRuntime {
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
     }
+
+    /// Returns a stable opaque binding for a workspace in this exact runtime.
+    /// The runtime path itself is never returned or persisted.
+    pub fn workspace_binding(&self, workspace_id: &str) -> Result<String, HerdrError> {
+        let workspace_id = validated_workspace_id(workspace_id)?;
+        Ok(format!("{}:{workspace_id}", self.binding_prefix()))
+    }
+
+    /// Returns a stable opaque binding for an agent terminal in this exact
+    /// runtime. The runtime path itself is never returned or persisted.
+    pub fn agent_binding(&self, terminal_id: &str) -> Result<String, HerdrError> {
+        validate_response_id(terminal_id)?;
+        Ok(format!("{}:{terminal_id}", self.binding_prefix()))
+    }
+
+    fn binding_prefix(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update(self.session.as_bytes());
+        digest.update([0]);
+        digest.update(self.home.as_os_str().as_encoded_bytes());
+        digest.update([0]);
+        digest.update(self.socket_path.as_os_str().as_encoded_bytes());
+        let digest = digest.finalize();
+        let mut text = String::with_capacity(65);
+        text.push('r');
+        for byte in digest {
+            use std::fmt::Write as _;
+            write!(&mut text, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        text
+    }
+
+    fn workspace_id_from_binding<'a>(&self, value: &'a str) -> Result<&'a str, HerdrError> {
+        let (prefix, workspace_id) = value.split_once(':').ok_or(HerdrError::InvalidInput)?;
+        if prefix != self.binding_prefix() {
+            return Err(HerdrError::InvalidInput);
+        }
+        validated_workspace_id(workspace_id)?;
+        Ok(workspace_id)
+    }
+
+    fn terminal_id_from_binding<'a>(&self, value: &'a str) -> Result<&'a str, HerdrError> {
+        let (prefix, terminal_id) = value.split_once(':').ok_or(HerdrError::InvalidInput)?;
+        if prefix != self.binding_prefix() {
+            return Err(HerdrError::InvalidInput);
+        }
+        validate_response_id(terminal_id)?;
+        Ok(terminal_id)
+    }
 }
 
 impl fmt::Debug for HerdrRuntime {
@@ -219,6 +269,8 @@ pub struct HerdrProcessConfig {
     tmpdir: PathBuf,
     config_path: PathBuf,
     runtime: HerdrRuntime,
+    agent_executable_dir: Option<PathBuf>,
+    codex_home: Option<PathBuf>,
 }
 
 impl HerdrProcessConfig {
@@ -242,7 +294,36 @@ impl HerdrProcessConfig {
             tmpdir,
             config_path,
             runtime,
+            agent_executable_dir: None,
+            codex_home: None,
         })
+    }
+
+    /// Adds the explicit owner-verified directory containing the selected
+    /// vendor executable. Herdr receives this directory first in its PATH;
+    /// no ambient vendor executable is discovered.
+    pub fn with_agent_executable_dir(
+        mut self,
+        directory: impl Into<PathBuf>,
+    ) -> Result<Self, HerdrError> {
+        let directory = directory.into();
+        validate_agent_executable_directory(&directory)?;
+        self.agent_executable_dir = Some(directory);
+        Ok(self)
+    }
+
+    /// Adds the explicit private `CODEX_HOME` inherited by Herdr's agent.
+    pub fn with_codex_home(mut self, home: impl Into<PathBuf>) -> Result<Self, HerdrError> {
+        let home = home.into();
+        validate_private_directory(&home)?;
+        self.codex_home = Some(home);
+        Ok(self)
+    }
+
+    /// Rechecks every configured Herdr and vendor-runtime path before an
+    /// operation that may contact the external runtime.
+    pub fn validate(&self) -> Result<(), HerdrError> {
+        validate_process_config(self)
     }
 }
 
@@ -308,6 +389,18 @@ impl HerdrCliTransport {
             .config_path
             .to_str()
             .ok_or(TransportError::Unavailable)?;
+        let path = self
+            .config
+            .agent_executable_dir
+            .as_deref()
+            .map(|directory| {
+                directory
+                    .to_str()
+                    .map(|directory| format!("{directory}:{SAFE_PATH}"))
+                    .ok_or(TransportError::Unavailable)
+            })
+            .transpose()?
+            .unwrap_or_else(|| SAFE_PATH.to_owned());
         let session = self.config.runtime.session();
 
         let mut command = std::process::Command::new(&self.config.executable);
@@ -317,12 +410,18 @@ impl HerdrCliTransport {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .env_clear()
-            .env("PATH", SAFE_PATH)
+            .env("PATH", path)
             .env("HOME", home)
             .env("TMPDIR", tmpdir)
             .env("HERDR_CONFIG_PATH", config_path)
             .env("HERDR_SESSION", session)
             .env("TERM", "xterm-256color");
+        if let Some(codex_home) = self.config.codex_home.as_deref() {
+            command.env(
+                "CODEX_HOME",
+                codex_home.to_str().ok_or(TransportError::Unavailable)?,
+            );
+        }
         let captured = crate::process_supervisor::run_bounded_capture(
             command,
             CLI_TIMEOUT,
@@ -464,6 +563,26 @@ impl WorkspaceHandle {
     pub fn pane_id(&self) -> &str {
         &self.pane_id
     }
+
+    /// Returns the opaque runtime-bound reference suitable for durable state.
+    pub fn runtime_binding(&self) -> Result<String, HerdrError> {
+        self.runtime.workspace_binding(&self.workspace_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        runtime: HerdrRuntime,
+        workspace_id: &str,
+        tab_id: &str,
+        pane_id: &str,
+    ) -> Self {
+        Self {
+            workspace_id: workspace_id.to_owned(),
+            tab_id: tab_id.to_owned(),
+            pane_id: pane_id.to_owned(),
+            runtime,
+        }
+    }
 }
 
 impl fmt::Debug for WorkspaceHandle {
@@ -483,6 +602,7 @@ pub struct AgentHandle {
     name: String,
     workspace_id: String,
     pane_id: String,
+    terminal_id: String,
     kind: HerdrAgentKind,
     runtime: HerdrRuntime,
 }
@@ -501,6 +621,34 @@ impl AgentHandle {
     /// Returns the pane containing the agent.
     pub fn pane_id(&self) -> &str {
         &self.pane_id
+    }
+
+    /// Returns the stable Herdr terminal reference used for reconnect.
+    pub fn terminal_id(&self) -> &str {
+        &self.terminal_id
+    }
+
+    /// Returns the opaque runtime-bound reference suitable for durable state.
+    pub fn runtime_binding(&self) -> Result<String, HerdrError> {
+        self.runtime.agent_binding(&self.terminal_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        runtime: HerdrRuntime,
+        name: &str,
+        workspace_id: &str,
+        pane_id: &str,
+        terminal_id: &str,
+    ) -> Self {
+        Self {
+            name: name.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            pane_id: pane_id.to_owned(),
+            terminal_id: terminal_id.to_owned(),
+            kind: HerdrAgentKind::Codex,
+            runtime,
+        }
     }
 }
 
@@ -561,6 +709,21 @@ impl AgentObservation {
     pub fn revision(&self) -> u64 {
         self.revision
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        workspace_id: &str,
+        pane_id: &str,
+        status: AgentStatus,
+        revision: u64,
+    ) -> Self {
+        Self {
+            workspace_id: workspace_id.to_owned(),
+            pane_id: pane_id.to_owned(),
+            status,
+            revision,
+        }
+    }
 }
 
 impl fmt::Debug for AgentObservation {
@@ -585,6 +748,16 @@ pub trait AgentBackend {
         workspace: &WorkspaceHandle,
         name: &str,
     ) -> Result<AgentHandle, HerdrError>;
+    /// Reattaches to a stored workspace and terminal reference after a
+    /// controller restart, validating the current session snapshot first.
+    fn attach(
+        &mut self,
+        workspace_ref: &str,
+        agent_ref: &str,
+    ) -> Result<(WorkspaceHandle, AgentHandle), HerdrError> {
+        let _ = (workspace_ref, agent_ref);
+        Err(HerdrError::UnsupportedOperation)
+    }
     /// Submits one prompt without waiting on lifecycle state.
     fn prompt(&mut self, agent: &AgentHandle, text: &str) -> Result<(), HerdrError>;
     /// Reads one bounded socket snapshot for the agent.
@@ -758,9 +931,57 @@ where
             name: name.to_owned(),
             workspace_id: response_workspace_id,
             pane_id,
+            terminal_id: response.agent.terminal_id,
             kind: self.kind,
             runtime: self.runtime.clone(),
         })
+    }
+
+    fn attach(
+        &mut self,
+        workspace_ref: &str,
+        agent_ref: &str,
+    ) -> Result<(WorkspaceHandle, AgentHandle), HerdrError> {
+        let workspace_id = self.runtime.workspace_id_from_binding(workspace_ref)?;
+        let terminal_id = self.runtime.terminal_id_from_binding(agent_ref)?;
+        let workspace_id = workspace_id.to_owned();
+        let terminal_id = terminal_id.to_owned();
+        let response = self
+            .socket
+            .snapshot(self.runtime.socket_path(), SNAPSHOT_REQUEST)
+            .map_err(HerdrError::Transport)?;
+        let snapshot = decode_snapshot(response)?;
+        let mut matching_agents = snapshot.agents.iter().filter(|entry| {
+            entry.workspace_id == workspace_id
+                && entry.terminal_id == terminal_id
+                && entry.agent.as_deref() == Some(self.kind.cli_kind())
+        });
+        let snapshot_agent = matching_agents.next().ok_or(HerdrError::AgentNotFound)?;
+        if matching_agents.next().is_some() {
+            return Err(HerdrError::UnexpectedResponse);
+        }
+        let name = snapshot_agent
+            .name
+            .as_deref()
+            .ok_or(HerdrError::MalformedResponse)?;
+        validate_agent_name(name).map_err(|_| HerdrError::MalformedResponse)?;
+        let tab_id = validated_tab_id_for_workspace(&snapshot_agent.tab_id, &workspace_id)?;
+        let pane_id = validated_pane_id_for_workspace(&snapshot_agent.pane_id, &workspace_id)?;
+        let workspace = WorkspaceHandle {
+            workspace_id: workspace_id.clone(),
+            tab_id: tab_id.clone(),
+            pane_id: pane_id.clone(),
+            runtime: self.runtime.clone(),
+        };
+        let agent = AgentHandle {
+            name: name.to_owned(),
+            workspace_id,
+            pane_id,
+            terminal_id,
+            kind: self.kind,
+            runtime: self.runtime.clone(),
+        };
+        Ok((workspace, agent))
     }
 
     fn prompt(&mut self, agent: &AgentHandle, text: &str) -> Result<(), HerdrError> {
@@ -852,6 +1073,14 @@ impl AgentBackend for ProductionHerdrCodexRunner {
         self.inner.agent_start(workspace, name)
     }
 
+    fn attach(
+        &mut self,
+        workspace_ref: &str,
+        agent_ref: &str,
+    ) -> Result<(WorkspaceHandle, AgentHandle), HerdrError> {
+        self.inner.attach(workspace_ref, agent_ref)
+    }
+
     fn prompt(&mut self, agent: &AgentHandle, text: &str) -> Result<(), HerdrError> {
         self.inner.prompt(agent, text)
     }
@@ -894,6 +1123,14 @@ impl AgentBackend for ProductionHerdrCursorAgentRunner {
         name: &str,
     ) -> Result<AgentHandle, HerdrError> {
         self.inner.agent_start(workspace, name)
+    }
+
+    fn attach(
+        &mut self,
+        workspace_ref: &str,
+        agent_ref: &str,
+    ) -> Result<(WorkspaceHandle, AgentHandle), HerdrError> {
+        self.inner.attach(workspace_ref, agent_ref)
     }
 
     fn prompt(&mut self, agent: &AgentHandle, text: &str) -> Result<(), HerdrError> {
@@ -1171,23 +1408,7 @@ fn validate_pane_ref(pane: &PaneRef) -> Result<(), HerdrError> {
 }
 
 fn parse_snapshot(response: Vec<u8>, agent: &AgentHandle) -> Result<AgentObservation, HerdrError> {
-    if response.len() > MAX_SOCKET_RESPONSE_BYTES {
-        return Err(HerdrError::Transport(TransportError::OutputTooLarge));
-    }
-    let envelope: RpcEnvelope<SnapshotResult> =
-        serde_json::from_slice(&response).map_err(|_| HerdrError::MalformedResponse)?;
-    validate_response_id(&envelope.id)?;
-    if envelope.id != SNAPSHOT_REQUEST_ID {
-        return Err(HerdrError::UnexpectedResponse);
-    }
-    expect_result_type(&envelope.result.result_type, "session_snapshot")?;
-    let snapshot = envelope.result.snapshot;
-    if snapshot.version != HERDR_VERSION || snapshot.protocol != HERDR_PROTOCOL {
-        return Err(HerdrError::UnexpectedResponse);
-    }
-    for entry in &snapshot.agents {
-        validate_agent_ref(entry)?;
-    }
+    let snapshot = decode_snapshot(response)?;
     let mut matching_agents = snapshot
         .agents
         .iter()
@@ -1211,15 +1432,6 @@ fn parse_snapshot(response: Vec<u8>, agent: &AgentHandle) -> Result<AgentObserva
     {
         return Err(HerdrError::UnexpectedResponse);
     }
-    // These collections are required by the checked session.snapshot schema.
-    // Their entries are intentionally ignored so terminal/path fields are not
-    // retained by Nagi.
-    let _ = (
-        snapshot.workspaces,
-        snapshot.tabs,
-        snapshot.panes,
-        snapshot.layouts,
-    );
 
     // Only the bounded identifiers and lifecycle fields survive parsing. The
     // snapshot response, including any terminal or path fields, is dropped.
@@ -1231,6 +1443,36 @@ fn parse_snapshot(response: Vec<u8>, agent: &AgentHandle) -> Result<AgentObserva
         status: snapshot_agent.agent_status,
         revision: snapshot_agent.revision,
     })
+}
+
+fn decode_snapshot(response: Vec<u8>) -> Result<Snapshot, HerdrError> {
+    if response.len() > MAX_SOCKET_RESPONSE_BYTES {
+        return Err(HerdrError::Transport(TransportError::OutputTooLarge));
+    }
+    let envelope: RpcEnvelope<SnapshotResult> =
+        serde_json::from_slice(&response).map_err(|_| HerdrError::MalformedResponse)?;
+    validate_response_id(&envelope.id)?;
+    if envelope.id != SNAPSHOT_REQUEST_ID {
+        return Err(HerdrError::UnexpectedResponse);
+    }
+    expect_result_type(&envelope.result.result_type, "session_snapshot")?;
+    let snapshot = envelope.result.snapshot;
+    if snapshot.version != HERDR_VERSION || snapshot.protocol != HERDR_PROTOCOL {
+        return Err(HerdrError::UnexpectedResponse);
+    }
+    for entry in &snapshot.agents {
+        validate_agent_ref(entry)?;
+    }
+    // These collections are required by the checked session.snapshot schema.
+    // Their entries are intentionally ignored so terminal/path fields are not
+    // retained by Nagi.
+    let _ = (
+        &snapshot.workspaces,
+        &snapshot.tabs,
+        &snapshot.panes,
+        &snapshot.layouts,
+    );
+    Ok(snapshot)
 }
 
 fn validate_session(value: &str) -> Result<(), HerdrError> {
@@ -1301,6 +1543,39 @@ fn validate_process_config(config: &HerdrProcessConfig) -> Result<(), HerdrError
     validate_private_directory(config.runtime.home())?;
     validate_private_directory(&config.tmpdir)?;
     validate_private_config(&config.config_path)?;
+    if let Some(directory) = config.agent_executable_dir.as_deref() {
+        validate_agent_executable_directory(directory)?;
+    }
+    if let Some(home) = config.codex_home.as_deref() {
+        validate_private_directory(home)?;
+    }
+    Ok(())
+}
+
+fn validate_agent_executable_directory(path: &Path) -> Result<(), HerdrError> {
+    validate_runtime_path(path)?;
+    if path.to_str().is_some_and(|value| value.contains(':')) {
+        return Err(HerdrError::ExecutableUntrusted);
+    }
+    validate_no_symlink_components(path).map_err(|_| HerdrError::ExecutableUntrusted)?;
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|_| HerdrError::ExecutableUnavailable)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(HerdrError::ExecutableUntrusted);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mode = metadata.permissions().mode();
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || mode & 0o500 != 0o500
+            || mode & 0o022 != 0
+            || mode & 0o7000 != 0
+        {
+            return Err(HerdrError::ExecutableUntrusted);
+        }
+    }
+    validate_existing_executable(&path.join("codex"))?;
     Ok(())
 }
 
@@ -2304,6 +2579,7 @@ mod tests {
             name: AGENT_NAME.to_owned(),
             workspace_id: WORKSPACE_ID.to_owned(),
             pane_id: PANE_ID.to_owned(),
+            terminal_id: "terminal-1".to_owned(),
             kind: HerdrAgentKind::Codex,
             runtime: runtime(),
         });

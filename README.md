@@ -29,7 +29,24 @@ dependencies; they are not bundled helpers, and Nagi does not reimplement
 vendor TUIs or protocols. Codex App Server is an optional future high-fidelity
 backend, not a Phase 0 gate.
 
-The repository is in its initial setup phase. The implementation will be added through focused pull requests.
+## Single-issue work
+
+On macOS, the first usable work slice accepts one owner-only JSON configuration
+and one exact Linear issue UUID:
+
+```text
+nagi work start --config CONFIG
+nagi work status --config CONFIG --attempt ATTEMPT
+nagi work interrupt --config CONFIG --attempt ATTEMPT
+nagi work collect --config CONFIG --attempt ATTEMPT --report REPORT
+```
+
+The configuration supplies all local paths explicitly, including the canonical
+Git worktree, Herdr private runtime, attempt database, verified Codex CLI
+directory, and managed `CODEX_HOME`. Nagi reads one issue in memory, delegates
+workspace and vendor process ownership to Herdr, and prints only bounded status
+or report metadata. Herdr lifecycle is observational; no command changes
+Linear state or installs hooks/configuration.
 
 ## Project documentation
 
