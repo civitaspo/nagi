@@ -2,6 +2,8 @@
 
 pub mod agent_report;
 
+pub mod attempt_store;
+
 pub(crate) mod process_supervisor;
 
 pub mod herdr;
