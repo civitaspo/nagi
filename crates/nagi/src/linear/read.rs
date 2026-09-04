@@ -180,7 +180,7 @@ pub struct IssueInput {
 }
 
 impl IssueInput {
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn for_test(
         id: &str,
         identifier: &str,

@@ -564,7 +564,7 @@ impl WorkspaceHandle {
         self.runtime.workspace_binding(&self.workspace_id)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn for_test(
         runtime: HerdrRuntime,
         workspace_id: &str,
@@ -628,7 +628,7 @@ impl AgentHandle {
         self.runtime.agent_binding(&self.terminal_id)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn for_test(
         runtime: HerdrRuntime,
         name: &str,
@@ -705,7 +705,7 @@ impl AgentObservation {
         self.revision
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn for_test(
         workspace_id: &str,
         pane_id: &str,
