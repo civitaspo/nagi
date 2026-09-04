@@ -218,21 +218,11 @@ use std::io::{self, Read, Seek, Write};
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 #[cfg(target_os = "macos")]
-use std::os::unix::process::CommandExt;
-#[cfg(target_os = "macos")]
 use std::path::{Component, Path, PathBuf};
 #[cfg(target_os = "macos")]
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 #[cfg(target_os = "macos")]
-use std::sync::Arc;
-#[cfg(target_os = "macos")]
-use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(target_os = "macos")]
-use std::thread;
-#[cfg(target_os = "macos")]
-use std::time::Instant;
-#[cfg(target_os = "macos")]
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroize;
 
 #[cfg(target_os = "macos")]
 fn deployment_home() -> Result<PathBuf, CodexError> {
@@ -958,150 +948,18 @@ fn run_foreground_and_verify(spec: &CommandSpec, expected: CodexStatus) -> Resul
 
 #[cfg(target_os = "macos")]
 fn run_status(spec: &CommandSpec) -> Result<CodexStatus, CodexError> {
-    let mut command = spec.to_command()?;
-    // Status is the only captured operation. Give it a private process group
-    // so a helper or descendant cannot retain a pipe after a timeout or
-    // oversized-output failure and keep the reader threads alive.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut child = command.spawn().map_err(|_| CodexError::ProcessSpawn)?;
-    let stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            terminate_and_reap(&mut child);
-            return Err(CodexError::ProcessSpawn);
-        }
-    };
-    let stderr = match child.stderr.take() {
-        Some(stderr) => stderr,
-        None => {
-            terminate_and_reap(&mut child);
-            return Err(CodexError::ProcessSpawn);
-        }
-    };
-    let exceeded = Arc::new(AtomicBool::new(false));
-    let stdout_exceeded = Arc::clone(&exceeded);
-    let stderr_exceeded = Arc::clone(&exceeded);
-    let stdout_reader = thread::spawn(move || read_bounded(stdout, stdout_exceeded));
-    let stderr_reader = thread::spawn(move || read_bounded(stderr, stderr_exceeded));
-
-    let deadline = Instant::now() + STATUS_TIMEOUT;
-    let status_result = loop {
-        match child_has_exited(&child) {
-            Ok(true) => {
-                // WNOWAIT leaves the direct child unreaped while its process
-                // group is terminated. This keeps the PID/group binding valid
-                // and prevents a PID-reuse race before cleanup.
-                break terminate_and_reap_with_status(&mut child)
-                    .map_err(|_| CodexError::ProcessFailed);
-            }
-            Ok(false) => {}
-            Err(_) => {
-                terminate_and_reap(&mut child);
-                break Err(CodexError::ProcessFailed);
-            }
-        }
-        if exceeded.load(Ordering::Acquire) {
-            terminate_and_reap(&mut child);
-            break Err(CodexError::StatusOutputTooLarge);
-        }
-        if Instant::now() >= deadline {
-            terminate_and_reap(&mut child);
-            break Err(CodexError::StatusTimedOut);
-        }
-        thread::sleep(std::time::Duration::from_millis(10));
-    };
-
-    let stdout_result = stdout_reader.join();
-    let stderr_result = stderr_reader.join();
-    let status = status_result?;
-    let stdout = match stdout_result {
-        Ok(Ok(value)) => value,
-        Ok(Err(())) => return Err(CodexError::StatusOutputTooLarge),
-        Err(_) => return Err(CodexError::ProcessFailed),
-    };
-    let stderr = match stderr_result {
-        Ok(Ok(value)) => value,
-        Ok(Err(())) => return Err(CodexError::StatusOutputTooLarge),
-        Err(_) => return Err(CodexError::ProcessFailed),
-    };
-    classify_status(status, &stdout, &stderr)
-}
-
-#[cfg(target_os = "macos")]
-fn read_bounded<R: Read>(
-    mut reader: R,
-    exceeded: Arc<AtomicBool>,
-) -> Result<Zeroizing<Vec<u8>>, ()> {
-    let mut output = Vec::new();
-    let mut buffer = [0_u8; 4096];
-    loop {
-        let count = match reader.read(&mut buffer) {
-            Ok(count) => count,
-            Err(_) => {
-                exceeded.store(true, Ordering::Release);
-                return Err(());
-            }
-        };
-        if count == 0 {
-            return Ok(Zeroizing::new(output));
-        }
-        if output.len().saturating_add(count) > STATUS_OUTPUT_LIMIT {
-            output.zeroize();
-            exceeded.store(true, Ordering::Release);
-            return Err(());
-        }
-        output.extend_from_slice(&buffer[..count]);
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn terminate_and_reap(child: &mut Child) {
-    let _ = terminate_and_reap_with_status(child);
-}
-
-#[cfg(target_os = "macos")]
-fn terminate_and_reap_with_status(child: &mut Child) -> Result<ExitStatus, io::Error> {
-    terminate_process_group(child);
-    let _ = child.kill();
-    child.wait()
-}
-
-#[cfg(target_os = "macos")]
-fn terminate_process_group(child: &Child) {
-    let process_group = child.id() as libc::pid_t;
-    if process_group > 0 {
-        // The status child was started with setsid, so its PID is the private
-        // process-group ID. Ignore ESRCH and let Child::kill cover a direct
-        // child whose group has already exited.
-        unsafe {
-            let _ = libc::kill(-process_group, libc::SIGKILL);
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn child_has_exited(child: &Child) -> Result<bool, io::Error> {
-    let child_id = child.id() as libc::id_t;
-    let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
-    let result = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            child_id,
-            &mut info,
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        )
-    };
-    if result == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(unsafe { info.si_pid() } != 0)
+    let captured = crate::process_supervisor::run_bounded_capture(
+        spec.to_command()?,
+        STATUS_TIMEOUT,
+        STATUS_OUTPUT_LIMIT,
+    )
+    .map_err(|error| match error {
+        crate::process_supervisor::CaptureError::Spawn => CodexError::ProcessSpawn,
+        crate::process_supervisor::CaptureError::Failed => CodexError::ProcessFailed,
+        crate::process_supervisor::CaptureError::TimedOut => CodexError::StatusTimedOut,
+        crate::process_supervisor::CaptureError::OutputTooLarge => CodexError::StatusOutputTooLarge,
+    })?;
+    classify_status(captured.status, &captured.stdout, &captured.stderr)
 }
 
 #[cfg(target_os = "macos")]
