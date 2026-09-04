@@ -6,6 +6,8 @@ pub(crate) mod process_supervisor;
 
 pub mod herdr;
 
+pub mod herdr_recovery;
+
 pub mod codex;
 
 pub mod linear;
