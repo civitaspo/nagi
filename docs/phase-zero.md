@@ -51,6 +51,36 @@ The spike covers:
   report session identity; lifecycle state is derived from screen-manifest
   detection. `idle`, `done`, and `blocked` are observations and must never
   directly become Linear `Done`.
+- The focused `herdr+codex` runner maps workspace creation to `workspace
+  create`, starts Codex with `agent start <name> --kind codex --pane <pane>`,
+  submits prompts with `agent prompt`, interrupts with `agent send-keys
+  <name> ctrl+c`, and observes through a bounded `session.snapshot` request.
+  Reports are accepted only through the strict `nagi::agent_report` parser.
+  Herdr 0.8.2 has no direct agent-resume command, so the runner returns a
+  typed unsupported/deferred result; session restore remains part of the
+  later observation and recovery gate. Stopping delegates to Herdr's
+  workspace close operation and never kills a vendor process directly.
+  The named session and isolated `HOME` are one binding; the socket endpoint is
+  derived as Herdr's session socket beneath that `HOME` rather than accepted
+  as an independent path. The `workspace_created` response is accepted only
+  when its required workspace, tab, and root-pane fields are present and their
+  embedded workspace/tab references cross-bind.
+  `agent_started` additionally requires the schema's agent fields and a
+  bounded argv witness whose first element is the canonical `codex` launch.
+  The production CLI transport receives an explicitly selected Herdr
+  executable and private `HOME`, `TMPDIR`, and configuration paths, clears the
+  inherited environment, verifies the exact `herdr 0.8.2` version, and bounds
+  process output and lifetime. A prompt is necessarily passed as one Herdr
+  CLI argv element, so a local process-list observer may see it while that
+  short-lived command runs; Nagi never logs or persists the argv. Every
+  executable and private-runtime ancestor is checked for non-symlink,
+  root/current-user ownership, and no unsafe write or set-id bits (root-owned
+  sticky temporary-directory ancestors are the narrow OS temporary-space
+  exception). The executable and version are rechecked before each invocation,
+  but a same-UID actor can still replace a path after the check and the
+  reported version is self-attested; immutable artifact provenance and a
+  verified private executable copy remain a later signed runtime-manifest
+  gate.
 - Narrow hooks that report session start, restore, and exit; semantic lifecycle
   state when supported; stable session references; and a candidate,
   machine-readable result report, including a hook-validated report when
