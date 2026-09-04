@@ -34,9 +34,6 @@ const MAX_REQUEST_BYTES: usize = 128 * 1024;
 const MAX_RESPONSE_ID_BYTES: usize = 128;
 const MAX_CLI_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_SOCKET_RESPONSE_BYTES: usize = 1024 * 1024;
-const MAX_AGENT_ARGV_ITEMS: usize = 32;
-const MAX_AGENT_ARGV_BYTES: usize = 4 * 1024;
-const MAX_AGENT_ARG_BYTES: usize = 512;
 const CLI_TIMEOUT: Duration = Duration::from_secs(30);
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 const SAFE_PATH: &str = "/usr/bin:/bin";
@@ -134,25 +131,10 @@ impl From<TransportError> for HerdrError {
     }
 }
 
-/// A bounded Herdr CLI command.
-///
-/// `args` can contain a prompt for the duration of one call, but the request
-/// is never serialized to a file or included in an adapter error.
-struct CliRequest {
-    args: Vec<String>,
-}
-
-impl CliRequest {
-    /// Returns the exact argv that the transport must pass to `herdr`.
-    fn args(&self) -> &[String] {
-        &self.args
-    }
-}
-
 /// Injectable process/CLI effect for the adapter.
 trait CliTransport {
     /// Executes one already-validated Herdr CLI request.
-    fn run(&mut self, request: &CliRequest) -> Result<Vec<u8>, TransportError>;
+    fn run(&mut self, args: &[String]) -> Result<Vec<u8>, TransportError>;
 }
 
 /// Injectable Unix-socket snapshot effect for the adapter.
@@ -360,20 +342,13 @@ impl fmt::Debug for HerdrCliTransport {
 }
 
 impl CliTransport for HerdrCliTransport {
-    fn run(&mut self, request: &CliRequest) -> Result<Vec<u8>, TransportError> {
-        // Do not log or format `request.args()`: prompts are necessarily one
+    fn run(&mut self, args: &[String]) -> Result<Vec<u8>, TransportError> {
+        // Do not log or format `args`: prompts are necessarily one
         // argv element and can be visible to local process-list observers for
         // the lifetime of this command.
         self.verify_version()
             .map_err(|_| TransportError::Unavailable)?;
-        self.run_command(
-            request
-                .args()
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .as_slice(),
-        )
+        self.run_command(&args.iter().map(String::as_str).collect::<Vec<_>>())
     }
 }
 
@@ -397,12 +372,6 @@ impl UnixSocketTransport {
             return Err(HerdrError::InvalidInput);
         }
         Ok(Self { timeout })
-    }
-}
-
-impl Default for UnixSocketTransport {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -854,8 +823,7 @@ where
         {
             return Err(HerdrError::InvalidInput);
         }
-        let request = CliRequest { args };
-        let response = self.cli.run(&request).map_err(HerdrError::Transport)?;
+        let response = self.cli.run(&args).map_err(HerdrError::Transport)?;
         if response.len() > MAX_CLI_RESPONSE_BYTES {
             return Err(HerdrError::Transport(TransportError::OutputTooLarge));
         }
@@ -1006,19 +974,7 @@ fn validate_response_id(value: &str) -> Result<(), HerdrError> {
 }
 
 fn validate_agent_argv(argv: &[String]) -> Result<(), HerdrError> {
-    if argv.is_empty() || argv.len() > MAX_AGENT_ARGV_ITEMS || argv[0] != "codex" {
-        return Err(HerdrError::UnexpectedResponse);
-    }
-    let total_bytes = argv.iter().try_fold(0usize, |total, argument| {
-        if argument.is_empty()
-            || argument.len() > MAX_AGENT_ARG_BYTES
-            || argument.chars().any(char::is_control)
-        {
-            return None;
-        }
-        total.checked_add(argument.len().saturating_add(1))
-    });
-    if total_bytes.is_none_or(|bytes| bytes > MAX_AGENT_ARGV_BYTES) {
+    if argv.len() != 1 || argv[0] != "codex" {
         return Err(HerdrError::UnexpectedResponse);
     }
     Ok(())
@@ -1637,14 +1593,10 @@ fn validated_pane_id_for_workspace(
 fn validate_workspace_handle(workspace: &WorkspaceHandle) -> Result<(), HerdrError> {
     let workspace_id =
         validated_workspace_id(workspace.workspace_id()).map_err(|_| HerdrError::InvalidInput)?;
-    let tab_id = validated_tab_id_for_workspace(workspace.tab_id(), &workspace_id)
+    validated_tab_id_for_workspace(workspace.tab_id(), &workspace_id)
         .map_err(|_| HerdrError::InvalidInput)?;
     validated_pane_id_for_workspace(workspace.pane_id(), &workspace_id)
         .map_err(|_| HerdrError::InvalidInput)?;
-    let (tab_workspace, _) = tab_id.split_once(":t").ok_or(HerdrError::InvalidInput)?;
-    if tab_workspace != workspace_id {
-        return Err(HerdrError::InvalidInput);
-    }
     Ok(())
 }
 
@@ -1718,8 +1670,8 @@ mod tests {
     }
 
     impl CliTransport for FakeCli {
-        fn run(&mut self, request: &CliRequest) -> Result<Vec<u8>, TransportError> {
-            self.requests.push(request.args().to_vec());
+        fn run(&mut self, args: &[String]) -> Result<Vec<u8>, TransportError> {
+            self.requests.push(args.to_vec());
             self.responses
                 .pop_front()
                 .unwrap_or(Err(TransportError::Unavailable))
@@ -2157,10 +2109,11 @@ mod tests {
             Err(HerdrError::UnexpectedResponse)
         );
 
-        let mut oversized_argv = agent_response("agent_started");
-        oversized_argv["result"]["argv"] = json!(vec!["codex"; MAX_AGENT_ARGV_ITEMS + 1]);
+        let mut trailing_argv = agent_response("agent_started");
+        trailing_argv["result"]["argv"] =
+            json!(["codex", "--dangerously-bypass-approvals-and-sandbox"]);
         assert_eq!(
-            start_result(oversized_argv),
+            start_result(trailing_argv),
             Err(HerdrError::UnexpectedResponse)
         );
 
@@ -2280,10 +2233,8 @@ mod tests {
     fn production_constructor_verifies_version_and_uses_isolated_process_environment() {
         let runtime = PrivateRuntime::new();
         let mut cli = HerdrCliTransport::new(runtime.config.clone()).expect("verified fake Herdr");
-        let request = CliRequest {
-            args: vec!["--session".into(), SESSION.into(), "probe".into()],
-        };
-        let output = cli.run(&request).expect("bounded process response");
+        let args = vec!["--session".into(), SESSION.into(), "probe".into()];
+        let output = cli.run(&args).expect("bounded process response");
         let output = String::from_utf8(output).expect("synthetic environment output");
         assert!(output.contains("|/usr/bin:/bin\n"));
         assert!(output.contains(&format!("{}|", runtime.config.runtime.home().display())));
