@@ -5,7 +5,7 @@ pub mod oauth;
 pub mod credentials;
 
 #[cfg(any(test, target_os = "macos"))]
-pub(crate) mod read;
+pub mod read;
 
 #[cfg(test)]
 mod polling;

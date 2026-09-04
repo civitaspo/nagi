@@ -1230,10 +1230,10 @@ impl CredentialManager {
     /// remains held. A failed provider verification never reaches the binding
     /// write.
     #[cfg(any(test, target_os = "macos"))]
-    pub(crate) fn with_verified_read(
+    pub(crate) fn with_verified_read<T>(
         &mut self,
-        callback: impl FnOnce(&str) -> Result<VerifiedReadOutcome, ReadContractError>,
-    ) -> Result<(), ReadContractError> {
+        callback: impl FnOnce(&str) -> Result<VerifiedReadOutcome<T>, ReadContractError>,
+    ) -> Result<T, ReadContractError> {
         let _guard = self
             .critical_section
             .lock()
@@ -1242,10 +1242,10 @@ impl CredentialManager {
             .load_access_record()
             .map_err(ReadContractError::Credential)?;
         let outcome = callback(record.envelope.access_token.as_str())?;
-        let viewer_id = outcome.into_viewer_id();
+        let (viewer_id, value) = outcome.into_parts();
         self.bind_viewer_id(record, viewer_id)
             .map_err(ReadContractError::Credential)?;
-        Ok(())
+        Ok(value)
     }
 
     /// Explicitly revokes the latest refresh token and then removes local state.
@@ -2246,12 +2246,16 @@ mod tests {
         let writes = Rc::clone(&store.writes);
         let mut manager = fake_manager(store, FakeTransport::new([]), NOW_MS, authorizer());
 
-        manager
+        let typed_value = manager
             .with_verified_read(|token| {
                 assert_eq!(token, ACCESS);
-                Ok(VerifiedReadOutcome::for_test(VIEWER))
+                Ok(VerifiedReadOutcome::with_value(
+                    Zeroizing::new(VIEWER.to_owned()),
+                    7_u8,
+                ))
             })
             .expect("verified read");
+        assert_eq!(typed_value, 7);
         assert_eq!(writes.get(), 1);
         let record = manager.load_record().expect("record").expect("record");
         assert_eq!(record.envelope.revision, 2);
@@ -2368,7 +2372,9 @@ mod tests {
         let writes = Rc::clone(&store.writes);
         let mut manager = fake_manager(store, FakeTransport::new([]), NOW_MS, authorizer());
         assert_eq!(
-            manager.with_verified_read(|_| Err(ReadContractError::ActorIdentityMismatch)),
+            manager.with_verified_read(|_| {
+                Err::<VerifiedReadOutcome<()>, _>(ReadContractError::ActorIdentityMismatch)
+            }),
             Err(ReadContractError::ActorIdentityMismatch)
         );
         assert_eq!(writes.get(), 0);
@@ -2382,7 +2388,9 @@ mod tests {
         );
 
         assert_eq!(
-            manager.with_verified_read(|_| Err(ReadContractError::ReadFieldsInvalid)),
+            manager.with_verified_read(|_| {
+                Err::<VerifiedReadOutcome<()>, _>(ReadContractError::ReadFieldsInvalid)
+            }),
             Err(ReadContractError::ReadFieldsInvalid)
         );
         assert_eq!(writes.get(), 0);
