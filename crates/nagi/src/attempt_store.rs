@@ -666,7 +666,6 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), AttemptStoreErro
         _ => return Err(AttemptStoreError::SchemaMismatch),
     }
     validate_schema_objects(connection)?;
-    validate_schema_shape(connection)?;
     let validated_version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(|_| AttemptStoreError::Database)?;
@@ -700,48 +699,6 @@ fn validate_schema_objects(connection: &Connection) -> Result<(), AttemptStoreEr
         object_count += 1;
     }
     if object_count != 1 {
-        return Err(AttemptStoreError::SchemaMismatch);
-    }
-    Ok(())
-}
-
-fn validate_schema_shape(connection: &Connection) -> Result<(), AttemptStoreError> {
-    let mut statement = connection
-        .prepare("PRAGMA table_info(attempts)")
-        .map_err(|_| AttemptStoreError::Database)?;
-    let mut rows = statement
-        .query([])
-        .map_err(|_| AttemptStoreError::Database)?;
-    const EXPECTED: &[(&str, &str, i64, i64)] = &[
-        ("attempt_id", "TEXT", 1, 1),
-        ("issue_id", "TEXT", 1, 0),
-        ("backend", "TEXT", 1, 0),
-        ("lifecycle", "TEXT", 1, 0),
-        ("workspace_ref", "TEXT", 0, 0),
-        ("agent_ref", "TEXT", 0, 0),
-        ("observation_revision", "INTEGER", 1, 0),
-        ("report_json", "TEXT", 0, 0),
-        ("created_at_ms", "INTEGER", 1, 0),
-        ("updated_at_ms", "INTEGER", 1, 0),
-    ];
-    let mut index = 0;
-    while let Some(row) = rows.next().map_err(|_| AttemptStoreError::Database)? {
-        if index >= EXPECTED.len() {
-            return Err(AttemptStoreError::SchemaMismatch);
-        }
-        let name: String = row.get(1).map_err(|_| AttemptStoreError::Database)?;
-        let declared_type: String = row.get(2).map_err(|_| AttemptStoreError::Database)?;
-        let not_null: i64 = row.get(3).map_err(|_| AttemptStoreError::Database)?;
-        let primary_key: i64 = row.get(5).map_err(|_| AttemptStoreError::Database)?;
-        let expected = EXPECTED[index];
-        if (name.as_str(), declared_type.as_str(), not_null, primary_key)
-            != (expected.0, expected.1, expected.2, expected.3)
-        {
-            return Err(AttemptStoreError::SchemaMismatch);
-        }
-        index += 1;
-    }
-    if index != EXPECTED.len() {
         return Err(AttemptStoreError::SchemaMismatch);
     }
     Ok(())
