@@ -45,12 +45,12 @@ The spike covers:
   `observe`, `interrupt`, `resume`, `collect_report`, and `stop`. Implement
   `herdr+codex` first, then `herdr+cursor-agent`. Cursor scope is the Cursor
   Agent CLI, never the Cursor desktop application.
-- Herdr lifecycle observation, interruption, recovery, and reconnect. Herdr's
-  documented Codex and Cursor integrations primarily report session identity;
-  lifecycle state is derived from screen-manifest detection. `idle`, `done`,
-  and `blocked` are observations and must never directly become Linear `Done`.
-  Use the Herdr CLI for ordinary orchestration and the socket API for
-  snapshots, event subscriptions, and long-lived tracking.
+- The later Agent observation and recovery gate covers Herdr lifecycle
+  observation, agent interruption/resume, crash recovery, and reconnect event
+  reconciliation. Herdr's documented Codex and Cursor integrations primarily
+  report session identity; lifecycle state is derived from screen-manifest
+  detection. `idle`, `done`, and `blocked` are observations and must never
+  directly become Linear `Done`.
 - Narrow hooks that report session start, restore, and exit; semantic lifecycle
   state when supported; stable session references; and a candidate,
   machine-readable result report, including a hook-validated report when
@@ -112,7 +112,7 @@ negative cases pass.
 | Linear authentication | The private app completes authorization-code plus PKCE S256, returns the app actor, uses only `scope=read`, stores tokens in Keychain, and passes callback expiry and replay checks. | No-go; do not broaden scope or fall back to a user actor. |
 | Linear read contract | Live reads use exact supplied IDs for the synthetic setup issue with bounded pagination and redacted evidence; enumeration and domain-data writes remain forbidden. | No-go for Linear integration. |
 | Temporal contract | The required workflow operations replay and recover after interruption or process termination without losing durable state or crossing database boundaries. Replay compatibility is checked by a sanitized synthetic `History` corpus produced by the pinned sidecar, intentionally committed/public as a repository fixture, and replayed server-free by default tests; raw captures remain private. Its manifest records `"deploymentVersioning": "not_exercised"`; the witness includes exact two-run Continue-As-New linkage and explicit no-routing coverage for Worker Deployment Versioning. | No-go for workflow implementation. |
-| Herdr CLI/socket contract | The selected Herdr revision and external runtime satisfy the bounded CLI and Unix socket contract for workspace, session, snapshot, subscription, interruption, reconnect, and recovery behavior. | No-go for agent execution. |
+| Herdr CLI/socket contract | The selected Herdr revision, API protocol/schema, external CLI, and Unix socket transport satisfy bounded workspace/session orchestration, snapshots, subscriptions, and graceful restart/resnapshot behavior. Agent interruption/resume, crash recovery, and reconnect event reconciliation remain in the later Agent observation and recovery gate. | No-go for agent execution. |
 | Normalized agent report | Backends emit reports accepted only after Nagi validates the contract in ADR-0003 and applies its redaction and acceptance checks. | No-go for result handling. |
 | Agent observation and recovery | Screen-manifest observations, hooks, interrupt/resume, reconnect, duplicate/out-of-order events, TTLs, and unknown states reconcile durably; `idle`, `done`, and `blocked` never directly imply Linear `Done`. | No-go for controller progression. |
 | Managed Codex authentication | Only if the `herdr+codex` contract proves it necessary, the dormant P0-11 boundary passes its existing narrow gate. Otherwise it is not a Phase 0 gate and any change/removal is a separate corrective ADR/PR. | Keep the path blocked; do not add PAT, user-actor, or silent fallback. |
