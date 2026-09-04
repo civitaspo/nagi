@@ -8,7 +8,7 @@
 
 pub use crate::attempt_store::AttemptResolution;
 use crate::attempt_store::{
-    AttemptBackend, AttemptRecord, AttemptState, AttemptStore, AttemptStoreError,
+    AttemptBackend, AttemptPage, AttemptRecord, AttemptState, AttemptStore, AttemptStoreError,
 };
 use crate::codex::{self, CodexError};
 use crate::herdr::{
@@ -22,10 +22,12 @@ use getrandom::fill as fill_random;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -35,7 +37,7 @@ const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_REPORT_BYTES: u64 = 16 * 1024;
 const MAX_PROMPT_BYTES: usize = 64 * 1024;
 const MAX_ATTEMPT_ID_BYTES: usize = 128;
-const MAX_LIST_ATTEMPTS: usize = 64;
+const MAX_LIST_PAGE: usize = 64;
 const MAX_LIST_OUTPUT_BYTES: usize = 16 * 1024;
 const REPOSITORY_TIMEOUT: Duration = Duration::from_secs(10);
 const REPOSITORY_OUTPUT_BYTES: usize = 16 * 1024;
@@ -61,6 +63,8 @@ pub enum WorkError {
     ReportFile,
     /// Secure attempt-ID generation or the system clock failed.
     LocalRuntime,
+    /// Another controller command currently owns the attempt database lock.
+    Busy,
 }
 
 impl fmt::Display for WorkError {
@@ -74,6 +78,7 @@ impl fmt::Display for WorkError {
             Self::Codex(error) => return error.fmt(formatter),
             Self::ReportFile => "work report file is invalid",
             Self::LocalRuntime => "work local runtime is unavailable",
+            Self::Busy => "work attempt database is busy",
         };
         formatter.write_str(message)
     }
@@ -125,12 +130,23 @@ pub struct WorkConfig {
 impl WorkConfig {
     /// Loads one bounded JSON configuration from an explicit owner-only file.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, WorkError> {
+        Self::from_file(Self::read_file(path)?)
+    }
+
+    /// Reads only the explicit attempt database locator. This path is used by
+    /// operator-only discovery and resolution, which must remain available
+    /// when runtime or repository setup is unavailable.
+    fn load_attempt_db(path: impl AsRef<Path>) -> Result<PathBuf, WorkError> {
+        let raw = Self::read_file(path)?;
+        validate_explicit_path(&raw.attempt_db)?;
+        Ok(raw.attempt_db)
+    }
+
+    fn read_file(path: impl AsRef<Path>) -> Result<WorkConfigFile, WorkError> {
         let path = path.as_ref();
         let bytes =
             read_private_file(path, MAX_CONFIG_BYTES).map_err(|_| WorkError::Configuration)?;
-        let raw: WorkConfigFile =
-            serde_json::from_slice(&bytes).map_err(|_| WorkError::Configuration)?;
-        Self::from_file(raw)
+        serde_json::from_slice(&bytes).map_err(|_| WorkError::Configuration)
     }
 
     fn from_file(raw: WorkConfigFile) -> Result<Self, WorkError> {
@@ -238,6 +254,74 @@ struct WorkConfigFile {
     codex_home: PathBuf,
 }
 
+/// An owner-only advisory lock held for the complete controller operation.
+/// Closing the descriptor releases it after a crash; no lease or retry policy
+/// is layered on top of the OS lock.
+struct AttemptCommandLock {
+    _file: File,
+}
+
+impl AttemptCommandLock {
+    fn acquire(database_path: &Path) -> Result<Self, WorkError> {
+        validate_explicit_path(database_path)?;
+        let mut lock_path = database_path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let lock_path = PathBuf::from(lock_path);
+        validate_explicit_path(&lock_path)?;
+        let parent = lock_path.parent().ok_or(WorkError::Configuration)?;
+        validate_no_symlink_components(parent)?;
+
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        options
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .mode(0o600);
+        let file = options
+            .open(&lock_path)
+            .map_err(|_| WorkError::LocalRuntime)?;
+        validate_lock_file(&file, &lock_path)?;
+
+        #[cfg(unix)]
+        {
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if result != 0 {
+                let code = std::io::Error::last_os_error().raw_os_error();
+                if code == Some(libc::EWOULDBLOCK) || code == Some(libc::EAGAIN) {
+                    return Err(WorkError::Busy);
+                }
+                return Err(WorkError::LocalRuntime);
+            }
+            validate_lock_file(&file, &lock_path)?;
+        }
+        Ok(Self { _file: file })
+    }
+}
+
+fn validate_lock_file(file: &File, path: &Path) -> Result<(), WorkError> {
+    let metadata = file.metadata().map_err(|_| WorkError::LocalRuntime)?;
+    if !metadata.is_file() {
+        return Err(WorkError::LocalRuntime);
+    }
+    #[cfg(unix)]
+    {
+        let path_metadata = fs::symlink_metadata(path).map_err(|_| WorkError::LocalRuntime)?;
+        if path_metadata.file_type().is_symlink()
+            || !path_metadata.is_file()
+            || metadata.dev() != path_metadata.dev()
+            || metadata.ino() != path_metadata.ino()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.nlink() != 1
+            || metadata.permissions().mode() != 0o100600
+        {
+            return Err(WorkError::LocalRuntime);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 /// The redacted machine-readable status emitted by `work start/status` and
 /// after interrupt reconciliation.
 #[derive(Clone, Serialize)]
@@ -251,6 +335,33 @@ pub struct WorkStatus {
 
 /// One bounded, redacted record emitted by `work list`.
 pub type WorkListRecord = WorkStatus;
+
+/// One bounded page emitted by `work list`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkListPage {
+    records: Vec<WorkListRecord>,
+    has_more: bool,
+}
+
+impl WorkListPage {
+    fn from_attempt_page(page: AttemptPage) -> Self {
+        Self {
+            records: page.records().iter().map(WorkStatus::from_record).collect(),
+            has_more: page.has_more(),
+        }
+    }
+}
+
+impl fmt::Debug for WorkListPage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkListPage")
+            .field("record_count", &self.records.len())
+            .field("has_more", &self.has_more)
+            .finish()
+    }
+}
 
 impl WorkStatus {
     fn from_record(record: &AttemptRecord) -> Self {
@@ -473,6 +584,7 @@ pub fn collect_with<B: AgentBackend>(
 /// Runs the production `work start` sequence.
 pub fn run_start(config_path: &Path) -> Result<WorkStatus, WorkError> {
     let config = WorkConfig::load(config_path)?;
+    let _lock = AttemptCommandLock::acquire(&config.attempt_db)?;
     let mut store = AttemptStore::open(&config.attempt_db)?;
     let mut manager =
         CredentialManager::production_read(config.client_id.clone(), config.callback_port)
@@ -486,6 +598,7 @@ pub fn run_start(config_path: &Path) -> Result<WorkStatus, WorkError> {
 /// Runs the production `work status` sequence.
 pub fn run_status(config_path: &Path, attempt_id: &str) -> Result<WorkStatus, WorkError> {
     let config = WorkConfig::load(config_path)?;
+    let _lock = AttemptCommandLock::acquire(&config.attempt_db)?;
     validate_attempt_id(attempt_id)?;
     let mut store = AttemptStore::open(&config.attempt_db)?;
     let current = store
@@ -534,13 +647,17 @@ pub fn run_status(config_path: &Path, attempt_id: &str) -> Result<WorkStatus, Wo
     Ok(WorkStatus::from_record(&record))
 }
 
-/// Lists nonterminal attempts without contacting Linear, Herdr, or a
-/// provider. The durable store fails closed when the bounded cap is exceeded.
-pub fn run_list(config_path: &Path) -> Result<Vec<WorkListRecord>, WorkError> {
-    let config = WorkConfig::load(config_path)?;
-    let store = AttemptStore::open(&config.attempt_db)?;
-    let records = store.list_nonterminal_bounded(MAX_LIST_ATTEMPTS)?;
-    Ok(records.iter().map(WorkStatus::from_record).collect())
+/// Lists one bounded nonterminal page without contacting Linear, Herdr, or a
+/// provider. The optional cursor is the last visible attempt ID.
+pub fn run_list(
+    config_path: &Path,
+    after_attempt_id: Option<&str>,
+) -> Result<WorkListPage, WorkError> {
+    let attempt_db = WorkConfig::load_attempt_db(config_path)?;
+    let _lock = AttemptCommandLock::acquire(&attempt_db)?;
+    let store = AttemptStore::open(&attempt_db)?;
+    let page = store.list_nonterminal_page(after_attempt_id, MAX_LIST_PAGE)?;
+    Ok(WorkListPage::from_attempt_page(page))
 }
 
 /// Applies one explicit operator resolution without any external effect.
@@ -549,9 +666,10 @@ pub fn run_resolve(
     attempt_id: &str,
     resolution: AttemptResolution,
 ) -> Result<WorkStatus, WorkError> {
-    let config = WorkConfig::load(config_path)?;
+    let attempt_db = WorkConfig::load_attempt_db(config_path)?;
+    let _lock = AttemptCommandLock::acquire(&attempt_db)?;
     validate_attempt_id(attempt_id)?;
-    let mut store = AttemptStore::open(&config.attempt_db)?;
+    let mut store = AttemptStore::open(&attempt_db)?;
     let record = store.resolve(attempt_id, resolution, now_ms()?)?;
     Ok(WorkStatus::from_record(&record))
 }
@@ -559,6 +677,7 @@ pub fn run_resolve(
 /// Runs the production `work interrupt` sequence.
 pub fn run_interrupt(config_path: &Path, attempt_id: &str) -> Result<WorkStatus, WorkError> {
     let config = WorkConfig::load(config_path)?;
+    let _lock = AttemptCommandLock::acquire(&config.attempt_db)?;
     validate_attempt_id(attempt_id)?;
     let mut store = AttemptStore::open(&config.attempt_db)?;
     let mut backend = production_backend(&config)?;
@@ -573,6 +692,7 @@ pub fn run_collect(
     report_path: &Path,
 ) -> Result<WorkCollectResult, WorkError> {
     let config = WorkConfig::load(config_path)?;
+    let _lock = AttemptCommandLock::acquire(&config.attempt_db)?;
     validate_attempt_id(attempt_id)?;
     let mut store = AttemptStore::open(&config.attempt_db)?;
     let mut backend = production_backend(&config)?;
@@ -585,11 +705,11 @@ pub fn render_status(status: &WorkStatus) -> Result<String, WorkError> {
 }
 
 /// Serializes bounded redacted records for the CLI.
-pub fn render_list(records: &[WorkListRecord]) -> Result<String, WorkError> {
-    if records.len() > MAX_LIST_ATTEMPTS {
+pub fn render_list(page: &WorkListPage) -> Result<String, WorkError> {
+    if page.records.len() > MAX_LIST_PAGE {
         return Err(WorkError::LocalRuntime);
     }
-    let rendered = serde_json::to_string(records).map_err(|_| WorkError::LocalRuntime)?;
+    let rendered = serde_json::to_string(page).map_err(|_| WorkError::LocalRuntime)?;
     if rendered.len() > MAX_LIST_OUTPUT_BYTES {
         return Err(WorkError::LocalRuntime);
     }
@@ -1207,10 +1327,14 @@ mod tests {
             backend: AttemptBackend::HerdrCodex.as_str(),
             observation_revision: 0,
         }];
-        let output = render_list(&records).expect("list");
+        let output = render_list(&WorkListPage {
+            records: records.clone(),
+            has_more: true,
+        })
+        .expect("list");
         let value: serde_json::Value = serde_json::from_str(&output).expect("list JSON");
         assert_eq!(
-            value[0]
+            value["records"][0]
                 .as_object()
                 .expect("record")
                 .keys()
@@ -1225,7 +1349,13 @@ mod tests {
         );
         assert!(!output.contains("issue"));
         assert!(!output.contains("workspaceRef"));
-        assert!(render_list(&vec![records[0].clone(); MAX_LIST_ATTEMPTS + 1]).is_err());
+        assert!(
+            render_list(&WorkListPage {
+                records: vec![records[0].clone(); MAX_LIST_PAGE + 1],
+                has_more: false,
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -1248,6 +1378,95 @@ mod tests {
             "token": "secret"
         });
         assert!(serde_json::from_value::<WorkConfigFile>(value).is_err());
+    }
+
+    #[test]
+    fn list_and_resolve_load_only_the_database_locator() {
+        let database = TestDatabase::new();
+        let config_path = database.root.join("config.json");
+        let value = json!({
+            "client_id": "client",
+            "callback_port": 43871,
+            "workspace_id": WORKSPACE,
+            "team_id": TEAM,
+            "issue_id": ISSUE_ID,
+            "attempt_db": database.path,
+            "repository": "/missing/repository",
+            "herdr_executable": "/missing/herdr",
+            "herdr_home": "/missing/herdr-home",
+            "herdr_tmpdir": "/missing/herdr-tmp",
+            "herdr_config": "/missing/herdr.toml",
+            "herdr_session": "nagi-session",
+            "codex_executable_dir": "/missing/codex-bin",
+            "codex_home": "/missing/codex-home"
+        });
+        fs::write(&config_path, value.to_string()).expect("config");
+        #[cfg(unix)]
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).expect("config mode");
+        assert_eq!(
+            WorkConfig::load_attempt_db(&config_path).expect("database locator"),
+            database.path
+        );
+        assert!(matches!(
+            WorkConfig::load(&config_path),
+            Err(WorkError::Configuration)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_lock_blocks_a_second_controller_at_each_effect_boundary() {
+        let database = TestDatabase::new();
+        for boundary in ["workspace", "agent"] {
+            let first = AttemptCommandLock::acquire(&database.path).expect("first lock");
+            let path = database.path.clone();
+            let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let entered_by_second = Arc::clone(&entered);
+            let second = std::thread::spawn(move || {
+                if AttemptCommandLock::acquire(&path).is_ok() {
+                    entered_by_second.store(true, Ordering::Relaxed);
+                }
+            });
+            second.join().expect("second controller");
+            assert!(
+                !entered.load(Ordering::Relaxed),
+                "{boundary} effect entered"
+            );
+            drop(first);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_lock_rejects_unsafe_lock_files() {
+        let database = TestDatabase::new();
+        let lock_path = PathBuf::from(format!("{}.lock", database.path.display()));
+        let lock_target = database.root.join("lock-target");
+        fs::write(&lock_target, b"lock").expect("lock target");
+        fs::set_permissions(&lock_target, fs::Permissions::from_mode(0o600))
+            .expect("lock target mode");
+        std::os::unix::fs::symlink(&lock_target, &lock_path).expect("lock symlink");
+        assert_eq!(
+            AttemptCommandLock::acquire(&database.path).err(),
+            Some(WorkError::LocalRuntime)
+        );
+        fs::remove_file(&lock_path).expect("remove lock symlink");
+
+        let lock = AttemptCommandLock::acquire(&database.path).expect("lock");
+        drop(lock);
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o644))
+            .expect("unsafe lock mode");
+        assert_eq!(
+            AttemptCommandLock::acquire(&database.path).err(),
+            Some(WorkError::LocalRuntime)
+        );
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600)).expect("lock mode");
+        let hardlink = database.root.join("lock-hardlink");
+        fs::hard_link(&lock_path, &hardlink).expect("lock hardlink");
+        assert_eq!(
+            AttemptCommandLock::acquire(&database.path).err(),
+            Some(WorkError::LocalRuntime)
+        );
     }
 
     #[test]
@@ -1361,10 +1580,12 @@ mod tests {
 
     fn only_attempt(store: &AttemptStore) -> AttemptRecord {
         store
-            .list_nonterminal()
+            .list_nonterminal_page(None, MAX_LIST_PAGE)
             .expect("attempt listing")
-            .into_iter()
+            .records()
+            .iter()
             .next()
+            .cloned()
             .expect("one attempt")
     }
 

@@ -66,7 +66,7 @@ impl fmt::Display for CliError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Usage => formatter.write_str(
-                "usage: nagi auth linear login|status|logout --confirm-revoke | nagi auth codex login|status|logout | nagi contract linear read | nagi work start --config PATH | nagi work status|interrupt --config PATH --attempt ID | nagi work list --config PATH | nagi work resolve --config PATH --attempt ID --confirm-absent|--confirm-delivered | nagi work collect --config PATH --attempt ID --report PATH",
+                "usage: nagi auth linear login|status|logout --confirm-revoke | nagi auth codex login|status|logout | nagi contract linear read | nagi work start --config PATH | nagi work status|interrupt --config PATH --attempt ID | nagi work list --config PATH [--after ATTEMPT] | nagi work resolve --config PATH --attempt ID --confirm-absent|--confirm-delivered | nagi work collect --config PATH --attempt ID --report PATH",
             ),
             Self::Configuration => {
                 formatter.write_str("Linear OAuth local configuration is invalid")
@@ -107,6 +107,7 @@ enum WorkCommand {
     },
     List {
         config: std::path::PathBuf,
+        after: Option<String>,
     },
     Resolve {
         config: std::path::PathBuf,
@@ -230,9 +231,9 @@ where
                     let status = work::run_status(&config, &attempt_id).map_err(CliError::Work)?;
                     println!("{}", work::render_status(&status).map_err(CliError::Work)?);
                 }
-                WorkCommand::List { config } => {
-                    let records = work::run_list(&config).map_err(CliError::Work)?;
-                    println!("{}", work::render_list(&records).map_err(CliError::Work)?);
+                WorkCommand::List { config, after } => {
+                    let page = work::run_list(&config, after.as_deref()).map_err(CliError::Work)?;
+                    println!("{}", work::render_list(&page).map_err(CliError::Work)?);
                 }
                 WorkCommand::Resolve {
                     config,
@@ -304,11 +305,32 @@ where
         "start" if arguments.next().is_none() => Ok(Command::Work(WorkCommand::Start { config })),
         "status" => parse_work_attempt(arguments, config, false),
         "interrupt" => parse_work_attempt(arguments, config, true),
-        "list" if arguments.next().is_none() => Ok(Command::Work(WorkCommand::List { config })),
+        "list" => parse_work_list(arguments, config),
         "resolve" => parse_work_resolve(arguments, config),
         "collect" => parse_work_collect(arguments, config),
         _ => Err(CliError::Usage),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn parse_work_list<I>(mut arguments: I, config: std::path::PathBuf) -> Result<Command, CliError>
+where
+    I: Iterator<Item = OsString>,
+{
+    let after = match arguments.next() {
+        None => None,
+        Some(flag) if flag == std::ffi::OsStr::new("--after") => Some(
+            arguments
+                .next()
+                .and_then(|value| value.into_string().ok())
+                .ok_or(CliError::Usage)?,
+        ),
+        Some(_) => return Err(CliError::Usage),
+    };
+    if arguments.next().is_some() {
+        return Err(CliError::Usage);
+    }
+    Ok(Command::Work(WorkCommand::List { config, after }))
 }
 
 #[cfg(target_os = "macos")]
@@ -782,7 +804,25 @@ mod tests {
                 args(&["work", "list", "--config", "/private/nagi/work.json"]).into_iter()
             ),
             Ok(Command::Work(WorkCommand::List {
-                config: config.clone()
+                config: config.clone(),
+                after: None,
+            }))
+        );
+        assert_eq!(
+            parse_arguments(
+                args(&[
+                    "work",
+                    "list",
+                    "--config",
+                    "/private/nagi/work.json",
+                    "--after",
+                    "attempt-1",
+                ])
+                .into_iter()
+            ),
+            Ok(Command::Work(WorkCommand::List {
+                config: config.clone(),
+                after: Some("attempt-1".to_owned()),
             }))
         );
         assert_eq!(
@@ -854,6 +894,22 @@ mod tests {
                 "list",
                 "--config",
                 "/private/nagi/work.json",
+                "extra",
+            ][..],
+            &[
+                "work",
+                "list",
+                "--config",
+                "/private/nagi/work.json",
+                "--after",
+            ][..],
+            &[
+                "work",
+                "list",
+                "--config",
+                "/private/nagi/work.json",
+                "--after",
+                "attempt-1",
                 "extra",
             ][..],
             &[

@@ -118,12 +118,14 @@ pub enum AttemptState {
     /// The attempt has been durably created but not started.
     Created,
     /// Workspace creation is durably pending; no create effect may be
-    /// repeated until a snapshot proves the workspace absent.
+    /// repeated until an exact snapshot or explicit operator resolution
+    /// authorizes a new effect.
     WorkspacePending,
     /// Workspace creation completed and the workspace reference is bound.
     WorkspaceReady,
     /// Agent creation is durably pending; no start effect may be repeated
-    /// until a snapshot proves the named agent absent.
+    /// until an exact snapshot or explicit operator resolution authorizes a
+    /// new effect.
     AgentPending,
     /// Agent creation completed and both runtime references are bound.
     AgentReady,
@@ -767,32 +769,14 @@ impl AttemptStore {
         load_record(&self.connection, attempt_id)
     }
 
-    /// Returns all attempts that have not reached the terminal failed state.
-    pub fn list_nonterminal(&self) -> Result<Vec<AttemptRecord>, AttemptStoreError> {
-        let mut statement = self
-            .connection
-            .prepare(&format!(
-                "SELECT {SELECT_COLUMNS} FROM attempts WHERE lifecycle != 'failed' ORDER BY created_at_ms, attempt_id"
-            ))
-            .map_err(|_| AttemptStoreError::Database)?;
-        let mut rows = statement
-            .query([])
-            .map_err(|_| AttemptStoreError::Database)?;
-        let mut records = Vec::new();
-        while let Some(row) = rows.next().map_err(|_| AttemptStoreError::Database)? {
-            records.push(decode_raw(
-                raw_from_row(row).map_err(|_| AttemptStoreError::Database)?,
-            )?);
-        }
-        Ok(records)
-    }
-
-    /// Returns at most `limit` nonterminal attempts, failing closed if more
-    /// rows exist. This keeps operator-facing discovery bounded.
-    pub fn list_nonterminal_bounded(
+    /// Returns one bounded keyset page of nonterminal attempts. The optional
+    /// cursor is the last visible attempt ID from the preceding page and must
+    /// still identify a visible, valid row.
+    pub fn list_nonterminal_page(
         &self,
+        after_attempt_id: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<AttemptRecord>, AttemptStoreError> {
+    ) -> Result<AttemptPage, AttemptStoreError> {
         if limit == 0 {
             return Err(AttemptStoreError::InvalidInput);
         }
@@ -800,14 +784,33 @@ impl AttemptStore {
             .ok()
             .and_then(|limit| limit.checked_add(1))
             .ok_or(AttemptStoreError::InvalidInput)?;
+        let cursor = match after_attempt_id {
+            None => None,
+            Some(attempt_id) => {
+                validate_attempt_id(attempt_id)?;
+                let record = load_record(&self.connection, attempt_id)?
+                    .ok_or(AttemptStoreError::InvalidInput)?;
+                if record.state() == AttemptState::Failed {
+                    return Err(AttemptStoreError::InvalidInput);
+                }
+                Some((record.created_at_ms(), attempt_id.to_owned()))
+            }
+        };
         let mut statement = self
             .connection
             .prepare(&format!(
-                "SELECT {SELECT_COLUMNS} FROM attempts WHERE lifecycle != 'failed' ORDER BY created_at_ms, attempt_id LIMIT ?1"
+                "SELECT {SELECT_COLUMNS} FROM attempts WHERE lifecycle != 'failed' AND (?1 IS NULL OR created_at_ms > ?2 OR (created_at_ms = ?2 AND attempt_id > ?3)) ORDER BY created_at_ms, attempt_id LIMIT ?4"
             ))
             .map_err(|_| AttemptStoreError::Database)?;
+        let cursor_created = cursor.as_ref().map(|cursor| cursor.0);
+        let cursor_id = cursor.as_ref().map(|cursor| cursor.1.as_str());
         let mut rows = statement
-            .query(params![query_limit])
+            .query(params![
+                cursor_created,
+                cursor_created,
+                cursor_id,
+                query_limit,
+            ])
             .map_err(|_| AttemptStoreError::Database)?;
         let mut records = Vec::new();
         while let Some(row) = rows.next().map_err(|_| AttemptStoreError::Database)? {
@@ -815,10 +818,11 @@ impl AttemptStore {
                 raw_from_row(row).map_err(|_| AttemptStoreError::Database)?,
             )?);
         }
-        if records.len() > limit {
-            return Err(AttemptStoreError::InvalidInput);
+        let has_more = records.len() > limit;
+        if has_more {
+            records.pop();
         }
-        Ok(records)
+        Ok(AttemptPage { records, has_more })
     }
 
     fn transition_idempotent(
@@ -851,6 +855,24 @@ impl AttemptStore {
             .commit()
             .map_err(|_| AttemptStoreError::Database)?;
         Ok(record)
+    }
+}
+
+/// One bounded page from the nonterminal attempt listing.
+pub struct AttemptPage {
+    records: Vec<AttemptRecord>,
+    has_more: bool,
+}
+
+impl AttemptPage {
+    /// Returns the records in deterministic keyset order.
+    pub fn records(&self) -> &[AttemptRecord] {
+        &self.records
+    }
+
+    /// Returns whether another page follows this one.
+    pub const fn has_more(&self) -> bool {
+        self.has_more
     }
 }
 
@@ -1465,9 +1487,10 @@ mod tests {
         store
             .record_observation("attempt-2", AttemptState::Failed, 1, 4)
             .expect("fail two");
-        let records = store.list_nonterminal().expect("list");
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].attempt_id(), "attempt-1");
+        let page = store.list_nonterminal_page(None, 64).expect("list page");
+        assert!(!page.has_more());
+        assert_eq!(page.records().len(), 1);
+        assert_eq!(page.records()[0].attempt_id(), "attempt-1");
     }
 
     #[test]
@@ -1545,24 +1568,55 @@ mod tests {
     }
 
     #[test]
-    fn bounded_nonterminal_listing_fails_closed_over_the_limit() {
+    fn keyset_pages_are_bounded_and_complete() {
         let database = TestDatabase::new();
         let mut store = AttemptStore::open(&database.path).expect("open store");
-        for attempt_id in ["attempt-1", "attempt-2"] {
+        for index in 0..66 {
+            let attempt_id = format!("attempt-{index:03}");
             store
-                .create(attempt_id, ISSUE_ID, AttemptBackend::HerdrCodex, 1)
+                .create(&attempt_id, ISSUE_ID, AttemptBackend::HerdrCodex, 1)
                 .expect("create");
         }
         assert_eq!(
-            store.list_nonterminal_bounded(1),
-            Err(AttemptStoreError::InvalidInput)
+            store.list_nonterminal_page(None, 0).err(),
+            Some(AttemptStoreError::InvalidInput)
         );
+        let first = store.list_nonterminal_page(None, 64).expect("first page");
+        assert_eq!(first.records().len(), 64);
+        assert!(first.has_more());
+        let cursor = first.records().last().expect("last first row").attempt_id();
+        let second = store
+            .list_nonterminal_page(Some(cursor), 64)
+            .expect("second page");
+        assert_eq!(second.records().len(), 2);
+        assert!(!second.has_more());
+        let ids = first
+            .records()
+            .iter()
+            .chain(second.records())
+            .map(AttemptRecord::attempt_id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 66);
+        assert_eq!(ids.first().copied(), Some("attempt-000"));
+        assert_eq!(ids.last().copied(), Some("attempt-065"));
         assert_eq!(
             store
-                .list_nonterminal_bounded(2)
-                .expect("bounded list")
-                .len(),
-            2
+                .list_nonterminal_page(Some("attempt-missing"), 64)
+                .err(),
+            Some(AttemptStoreError::InvalidInput)
+        );
+
+        let failed_id = "attempt-failed";
+        store
+            .create(failed_id, ISSUE_ID, AttemptBackend::HerdrCodex, 2)
+            .expect("create failed");
+        mark_started_for_test(&mut store, failed_id, "workspace-failed", "agent-failed", 2);
+        store
+            .record_observation(failed_id, AttemptState::Failed, 1, 3)
+            .expect("fail attempt");
+        assert_eq!(
+            store.list_nonterminal_page(Some(failed_id), 64).err(),
+            Some(AttemptStoreError::InvalidInput)
         );
     }
 
@@ -1582,8 +1636,8 @@ mod tests {
         drop(connection);
         let store = AttemptStore::open(&database.path).expect("reopen store");
         assert_eq!(
-            store.list_nonterminal_bounded(1),
-            Err(AttemptStoreError::Database)
+            store.list_nonterminal_page(None, 1).err(),
+            Some(AttemptStoreError::Database)
         );
     }
 
