@@ -10,12 +10,24 @@ boundary is [ADR-0003](adr/0003-herdr-agent-runtime-boundary.md).
 The spike covers:
 
 - Linear access through [ADR-0001](adr/0001-linear-oauth-pkce.md): the private
-  OAuth app uses `actor=app`, PKCE S256, and `scope=read`. Live reads use only
-  operator-supplied exact IDs for a synthetic setup issue and bounded pages of
-  its synthetic comments and fixture graph. Only opaque IDs, timestamps,
-  `pageInfo`, and redacted content presence or digests may appear in public
-  evidence. Provider enumeration, broad polling, domain-data writes, and
-  company data remain outside Phase 0.
+  OAuth app uses `actor=app`, PKCE S256, and `scope=read`. A separate test
+  workspace is not required: live access runs only in an explicitly approved
+  scope of the operator-specified target workspace and team, using a
+  dedicated, pre-created synthetic setup issue addressed by exact locally
+  supplied IDs. Live reads are limited to that issue and bounded pagination
+  over its synthetic comments and fixture graph. Only opaque IDs, update
+  timestamps, `pageInfo`, and redacted content presence or digests may appear
+  in public evidence. P0-06 workspace/team issue-collection polling,
+  identifier discovery, existing issue-body reads, inclusive `updatedAt`
+  watermarks with overlap, edit/archive/not-found behavior, nested and broad
+  bounded pagination, rate limits, malformed responses, and cancellation are
+  hermetic synthetic-provider tests. They never enumerate existing live
+  records or perform broad live provider-record polling; domain-data writes
+  and company data remain outside Phase 0. Issue-head and scan documents carry
+  the exact team binding, `includeArchived: true`, and bounded `first` values.
+  Pagination upper bounds come from provider responses; scans use inclusive
+  `updatedAt` bounds with overlap, and the watermark advances only after every
+  root and nested page succeeds.
 - Temporal behavior required by the workflow design: replay,
   Signal-With-Start, Update validation and handling, Query, heartbeat,
   cancellation, Continue-As-New, process-kill recovery, history persistence,
@@ -61,9 +73,10 @@ The spike covers:
 - `nagi watch` as an operator surface for Nagi state and Herdr observations;
   it must remain usable without a native Codex or Cursor desktop sidebar.
 - Safety and privacy boundaries around process liveness, safe shutdown,
-  duplicate-open prevention, filesystem and network access, credentials,
-  evidence, and sandbox escapes. Old P0-13/P0-14 concerns are generalized
-  here as Herdr observation, interruption, and recovery concerns.
+  duplicate-open prevention, validator and Herdr/vendor-process isolation, and
+  rejection of filesystem, network, credential, or sandbox escapes. Old
+  P0-13/P0-14 concerns are generalized here as Herdr observation,
+  interruption, and recovery concerns.
 - Release trust controls and encrypted test snapshots, using test material
   only.
 
@@ -81,34 +94,12 @@ provider control-plane mutations in Phase 0; Issue, Comment, and all other
 domain-data writes remain forbidden. If a setup issue is needed, it is
 provisioned out of band; the spike itself does not create or modify it.
 
-## Normalized agent report (provisional)
+## Normalized agent report
 
-Backends return a normalized, redacted report to Nagi. `done` is an agent
-outcome only; Nagi performs acceptance and result validation before making any
-Linear completion decision. The provisional shape is:
-
-```json
-{
-  "schemaVersion": 1,
-  "attemptId": "opaque-attempt-id",
-  "backend": "herdr+codex",
-  "agentSessionRef": "opaque-session-reference",
-  "outcome": "continue",
-  "validation": {
-    "status": "not_run"
-  },
-  "commitRef": "optional-sanitized-commit-ref",
-  "pullRequestRef": "optional-sanitized-pr-ref",
-  "summary": "Bounded, sanitized summary."
-}
-```
-
-The allowed outcomes are `continue`, `review`, `blocked`, `done`, and
-`failed`. Optional commit and pull-request references are omitted when absent.
-Reports contain no raw terminal output, prompts, provider payloads, tokens,
-private machine paths, or unbounded text. The exact JSON schema, bounds, and
-validation vectors are defined and verified by the dedicated `test: define and
-verify the normalized agent report` PR, the third PR in the sequence.
+See the provisional normalized, redacted report contract in
+[ADR-0003](adr/0003-herdr-agent-runtime-boundary.md). An agent `done` outcome
+never completes Linear; Nagi validates the report and owns acceptance and the
+final completion decision.
 
 ## Go/no-go gates
 
@@ -120,13 +111,13 @@ negative cases pass.
 | --- | --- | --- |
 | Linear authentication | The private app completes authorization-code plus PKCE S256, returns the app actor, uses only `scope=read`, stores tokens in Keychain, and passes callback expiry and replay checks. | No-go; do not broaden scope or fall back to a user actor. |
 | Linear read contract | Live reads use exact supplied IDs for the synthetic setup issue with bounded pagination and redacted evidence; enumeration and domain-data writes remain forbidden. | No-go for Linear integration. |
-| Temporal contract | The required workflow operations replay and recover after interruption or process termination without losing durable state or crossing database boundaries. | No-go for workflow implementation. |
+| Temporal contract | The required workflow operations replay and recover after interruption or process termination without losing durable state or crossing database boundaries. Replay compatibility is checked by a sanitized synthetic `History` corpus produced by the pinned sidecar, intentionally committed/public as a repository fixture, and replayed server-free by default tests; raw captures remain private. Its manifest records `"deploymentVersioning": "not_exercised"`; the witness includes exact two-run Continue-As-New linkage and explicit no-routing coverage for Worker Deployment Versioning. | No-go for workflow implementation. |
 | Herdr CLI/socket contract | The selected Herdr revision and external runtime satisfy the bounded CLI and Unix socket contract for workspace, session, snapshot, subscription, interruption, reconnect, and recovery behavior. | No-go for agent execution. |
-| Normalized agent report | `herdr+codex` and later `herdr+cursor-agent` emit the validated redacted report shape with attempt/session binding, allowed outcome handling, and no secret or private-path leakage. | No-go for result handling. |
+| Normalized agent report | Backends emit reports accepted only after Nagi validates the contract in ADR-0003 and applies its redaction and acceptance checks. | No-go for result handling. |
 | Agent observation and recovery | Screen-manifest observations, hooks, interrupt/resume, reconnect, duplicate/out-of-order events, TTLs, and unknown states reconcile durably; `idle`, `done`, and `blocked` never directly imply Linear `Done`. | No-go for controller progression. |
 | Managed Codex authentication | Only if the `herdr+codex` contract proves it necessary, the dormant P0-11 boundary passes its existing narrow gate. Otherwise it is not a Phase 0 gate and any change/removal is a separate corrective ADR/PR. | Keep the path blocked; do not add PAT, user-actor, or silent fallback. |
 | Operator surface | `nagi watch` can show Nagi state and Herdr observations, interrupt safely, and reconnect without relying on a desktop sidebar. | No-go for operator workflow. |
-| Safety and privacy | Fault injection leaves no unverified external write and proves secrets, raw provider data, prompts, terminal output, and private paths do not reach public evidence or durable controller payloads. | No-go; retain only redacted evidence. |
+| Safety and privacy | Fault injection leaves no unverified external write and proves no secret reaches argv, env, logs, crash reports, Temporal payloads, prompts, worktrees, SQLite, or evidence. Access and refresh tokens have bounded in-process lifetimes; application-owned secret buffers are zeroized where supported. Tests prove tokens never reach those observable channels; the contract does not claim zeroization of HTTP/TLS/OS copies outside application control. No escape to disallowed resources is permitted. | No-go; retain only redacted evidence. |
 | Release trust | The standalone executable and test-material release controls meet their reviewed contract without bundling Herdr or vendor CLIs. | No-go for a trusted release. |
 
 All mandatory gates must pass on the same current revision for **go**. A

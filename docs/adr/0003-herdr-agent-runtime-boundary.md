@@ -111,14 +111,9 @@ report` PR, the third PR in the sequence.
 
 ## Phase 0 sequencing and related decisions
 
-The remaining Phase 0 work is split into these focused pull requests, in order:
-
-1. `docs: adopt the Herdr agent-runtime boundary`
-2. `test: verify the Herdr CLI/socket contract`
-3. `test: define and verify the normalized agent report`
-4. `feat: add the Herdr runner adapter`
-5. `test: verify hook ordering, reconnect, and reconciliation`
-6. `feat: add the Cursor Agent CLI adapter`
+The exact focused Phase 0 pull-request sequence is maintained in the
+[Phase 0 plan](../phase-zero.md). The architectural implementation order is
+`herdr+codex` first, then `herdr+cursor-agent`.
 
 The old P0-13 and P0-14 concerns are generalized around Herdr observation,
 interruption, and recovery. Codex App Server is an optional future
@@ -133,10 +128,7 @@ changing or removing the implementation requires a separate corrective
 ADR/PR. No PAT, user-actor, or silent provider fallback is introduced.
 
 The existing Linear OAuth boundary remains `actor=app`, PKCE S256, and
-`scope=read`. The Temporal controller direction remains unchanged. The first
-documentation PR is plan-only; after it is ready, the exact current SHA must
-receive both the adversarial Sol/low review and the ponytail review before the
-next focused PR proceeds.
+`scope=read`. The Temporal controller direction remains unchanged.
 
 ## Consequences
 
