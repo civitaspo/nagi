@@ -1,4 +1,4 @@
-//! The narrow `herdr+codex` agent backend boundary.
+//! The narrow Herdr agent backend boundary for Codex and Cursor Agent CLI.
 //!
 //! Herdr owns the workspace, pane, PTY, agent launch, and session runtime.
 //! This module only maps the Nagi operations to the documented Herdr 0.8.2
@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 
 /// The backend identifier for this adapter.
 pub const BACKEND: &str = "herdr+codex";
+/// The backend identifier for the Cursor Agent CLI adapter.
+pub const CURSOR_AGENT_BACKEND: &str = "herdr+cursor-agent";
 /// The Herdr release selected by the checked CLI/socket contract.
 pub const HERDR_VERSION: &str = "0.8.2";
 /// The Herdr socket protocol selected by the checked contract.
@@ -111,7 +113,9 @@ impl fmt::Display for HerdrError {
             Self::UnexpectedResponse => "Herdr response was unexpected",
             Self::AgentNotFound => "Herdr agent was not found in the session snapshot",
             Self::InvalidReport => "normalized agent report is invalid",
-            Self::BackendMismatch => "normalized agent report backend is not herdr+codex",
+            Self::BackendMismatch => {
+                "normalized agent report backend is not the selected Herdr adapter"
+            }
             Self::ReportBindingMismatch => "normalized agent report binding does not match",
             Self::UnsupportedOperation => "Herdr agent resume is unsupported by this release",
             Self::ExecutableUnavailable => "Herdr executable is unavailable",
@@ -398,7 +402,7 @@ impl SocketSnapshotTransport for UnixSocketTransport {
 /// socket transports. The injected transport seam remains private to this
 /// crate; callers use the stable [`AgentBackend`] operation surface.
 pub struct ProductionHerdrCodexRunner {
-    inner: HerdrCodexRunner<HerdrCliTransport, UnixSocketTransport>,
+    inner: HerdrAgentRunner<HerdrCliTransport, UnixSocketTransport>,
 }
 
 impl ProductionHerdrCodexRunner {
@@ -408,7 +412,30 @@ impl ProductionHerdrCodexRunner {
         let runtime = config.runtime.clone();
         let cli = HerdrCliTransport::new(config)?;
         Ok(Self {
-            inner: HerdrCodexRunner::new(cli, UnixSocketTransport::new(), runtime),
+            inner: HerdrAgentRunner::new(cli, UnixSocketTransport::new(), runtime),
+        })
+    }
+}
+
+/// A directly callable production runner for the Cursor Agent CLI through
+/// Herdr's validated process and socket transports.
+pub struct ProductionHerdrCursorAgentRunner {
+    inner: HerdrAgentRunner<HerdrCliTransport, UnixSocketTransport>,
+}
+
+impl ProductionHerdrCursorAgentRunner {
+    /// Builds a production runner after verifying the exact Herdr executable
+    /// and private runtime configuration.
+    pub fn connect(config: HerdrProcessConfig) -> Result<Self, HerdrError> {
+        let runtime = config.runtime.clone();
+        let cli = HerdrCliTransport::new(config)?;
+        Ok(Self {
+            inner: HerdrAgentRunner::with_kind(
+                HerdrAgentKind::Cursor,
+                cli,
+                UnixSocketTransport::new(),
+                runtime,
+            ),
         })
     }
 }
@@ -455,6 +482,7 @@ pub struct AgentHandle {
     name: String,
     workspace_id: String,
     pane_id: String,
+    kind: HerdrAgentKind,
 }
 
 impl AgentHandle {
@@ -549,7 +577,7 @@ impl fmt::Debug for AgentObservation {
 pub trait AgentBackend {
     /// Creates a Herdr workspace and returns its initial tab and pane handles.
     fn workspace_create(&mut self, cwd: &Path, label: &str) -> Result<WorkspaceHandle, HerdrError>;
-    /// Starts the fixed `codex` agent kind in the workspace's root pane.
+    /// Starts the selected Herdr agent kind in the workspace's root pane.
     fn agent_start(
         &mut self,
         workspace: &WorkspaceHandle,
@@ -575,25 +603,69 @@ pub trait AgentBackend {
     fn stop(&mut self, workspace: &WorkspaceHandle) -> Result<(), HerdrError>;
 }
 
-/// The `herdr+codex` adapter over injected CLI and socket effects.
-struct HerdrCodexRunner<C, S> {
-    cli: C,
-    socket: S,
-    runtime: HerdrRuntime,
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum HerdrAgentKind {
+    Codex,
+    Cursor,
 }
 
-impl<C, S> HerdrCodexRunner<C, S> {
-    /// Creates a runner bound to one explicitly selected private session.
-    fn new(cli: C, socket: S, runtime: HerdrRuntime) -> Self {
-        Self {
-            cli,
-            socket,
-            runtime,
+impl HerdrAgentKind {
+    const fn cli_kind(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Cursor => "cursor",
+        }
+    }
+
+    const fn launch_argv(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Cursor => "agent",
+        }
+    }
+
+    const fn backend(self) -> &'static str {
+        match self {
+            Self::Codex => BACKEND,
+            Self::Cursor => CURSOR_AGENT_BACKEND,
         }
     }
 }
 
-impl<C, S> AgentBackend for HerdrCodexRunner<C, S>
+/// The shared Herdr adapter over injected CLI and socket effects.
+struct HerdrAgentRunner<C, S> {
+    cli: C,
+    socket: S,
+    runtime: HerdrRuntime,
+    kind: HerdrAgentKind,
+}
+
+impl<C, S> HerdrAgentRunner<C, S> {
+    /// Creates a Codex runner bound to one explicitly selected private session.
+    fn new(cli: C, socket: S, runtime: HerdrRuntime) -> Self {
+        Self::with_kind(HerdrAgentKind::Codex, cli, socket, runtime)
+    }
+
+    /// Creates a runner for one closed Herdr agent profile.
+    fn with_kind(kind: HerdrAgentKind, cli: C, socket: S, runtime: HerdrRuntime) -> Self {
+        Self {
+            cli,
+            socket,
+            runtime,
+            kind,
+        }
+    }
+
+    fn validate_agent(&self, agent: &AgentHandle) -> Result<(), HerdrError> {
+        validate_agent_handle(agent)?;
+        if agent.kind != self.kind {
+            return Err(HerdrError::InvalidInput);
+        }
+        Ok(())
+    }
+}
+
+impl<C, S> AgentBackend for HerdrAgentRunner<C, S>
 where
     C: CliTransport,
     S: SocketSnapshotTransport,
@@ -648,7 +720,7 @@ where
             "start",
             name,
             "--kind",
-            "codex",
+            self.kind.cli_kind(),
             "--pane",
             workspace.pane_id(),
         ])?;
@@ -663,20 +735,21 @@ where
             || response_workspace_id != workspace.workspace_id()
             || response_tab_id != workspace.tab_id()
             || response.agent.name != name
-            || response.agent.agent != "codex"
+            || response.agent.agent != self.kind.cli_kind()
         {
             return Err(HerdrError::UnexpectedResponse);
         }
-        validate_agent_argv(&response.argv)?;
+        validate_agent_argv(&response.argv, self.kind.launch_argv())?;
         Ok(AgentHandle {
             name: name.to_owned(),
             workspace_id: response_workspace_id,
             pane_id,
+            kind: self.kind,
         })
     }
 
     fn prompt(&mut self, agent: &AgentHandle, text: &str) -> Result<(), HerdrError> {
-        validate_agent_handle(agent)?;
+        self.validate_agent(agent)?;
         validate_prompt(text)?;
         let response: AgentPromptedResult =
             self.run_cli(["agent", "prompt", agent.name(), text])?;
@@ -694,7 +767,7 @@ where
             return Err(HerdrError::UnexpectedResponse);
         }
         if let Some(response_kind) = response.agent.agent.as_deref()
-            && response_kind != "codex"
+            && response_kind != self.kind.cli_kind()
         {
             return Err(HerdrError::UnexpectedResponse);
         }
@@ -702,7 +775,7 @@ where
     }
 
     fn observe(&mut self, agent: &AgentHandle) -> Result<AgentObservation, HerdrError> {
-        validate_agent_handle(agent)?;
+        self.validate_agent(agent)?;
         let response = self
             .socket
             .snapshot(self.runtime.socket_path(), SNAPSHOT_REQUEST)
@@ -711,14 +784,14 @@ where
     }
 
     fn interrupt(&mut self, agent: &AgentHandle) -> Result<(), HerdrError> {
-        validate_agent_handle(agent)?;
+        self.validate_agent(agent)?;
         let response: OkResult = self.run_cli(["agent", "send-keys", agent.name(), "ctrl+c"])?;
         expect_result_type(&response.result_type, "ok")?;
         Ok(())
     }
 
     fn resume(&mut self, agent: &AgentHandle) -> Result<(), HerdrError> {
-        validate_agent_handle(agent)?;
+        self.validate_agent(agent)?;
         Err(HerdrError::UnsupportedOperation)
     }
 
@@ -731,7 +804,7 @@ where
         validate_report_binding(expected_attempt_id)?;
         validate_report_binding(expected_agent_session_ref)?;
         let report = AgentReport::parse_json(report_json).map_err(|_| HerdrError::InvalidReport)?;
-        if report.backend() != BACKEND {
+        if report.backend() != self.kind.backend() {
             return Err(HerdrError::BackendMismatch);
         }
         if report.attempt_id() != expected_attempt_id
@@ -795,7 +868,51 @@ impl AgentBackend for ProductionHerdrCodexRunner {
     }
 }
 
-impl<C, S> HerdrCodexRunner<C, S>
+impl AgentBackend for ProductionHerdrCursorAgentRunner {
+    fn workspace_create(&mut self, cwd: &Path, label: &str) -> Result<WorkspaceHandle, HerdrError> {
+        self.inner.workspace_create(cwd, label)
+    }
+
+    fn agent_start(
+        &mut self,
+        workspace: &WorkspaceHandle,
+        name: &str,
+    ) -> Result<AgentHandle, HerdrError> {
+        self.inner.agent_start(workspace, name)
+    }
+
+    fn prompt(&mut self, agent: &AgentHandle, text: &str) -> Result<(), HerdrError> {
+        self.inner.prompt(agent, text)
+    }
+
+    fn observe(&mut self, agent: &AgentHandle) -> Result<AgentObservation, HerdrError> {
+        self.inner.observe(agent)
+    }
+
+    fn interrupt(&mut self, agent: &AgentHandle) -> Result<(), HerdrError> {
+        self.inner.interrupt(agent)
+    }
+
+    fn resume(&mut self, agent: &AgentHandle) -> Result<(), HerdrError> {
+        self.inner.resume(agent)
+    }
+
+    fn collect_report(
+        &mut self,
+        expected_attempt_id: &str,
+        expected_agent_session_ref: &str,
+        report_json: &str,
+    ) -> Result<AgentReport, HerdrError> {
+        self.inner
+            .collect_report(expected_attempt_id, expected_agent_session_ref, report_json)
+    }
+
+    fn stop(&mut self, workspace: &WorkspaceHandle) -> Result<(), HerdrError> {
+        self.inner.stop(workspace)
+    }
+}
+
+impl<C, S> HerdrAgentRunner<C, S>
 where
     C: CliTransport,
 {
@@ -844,7 +961,7 @@ struct WorkspaceCreatedResult {
 
 // Herdr 0.8.2 declares `argv` required on the `agent_started` result. The
 // adapter additionally requires the name and kind fields that identify its
-// requested canonical Codex launch.
+// requested canonical vendor launch.
 #[derive(Deserialize)]
 struct AgentStartedResult {
     #[serde(rename = "type")]
@@ -965,8 +1082,8 @@ fn validate_response_id(value: &str) -> Result<(), HerdrError> {
     Ok(())
 }
 
-fn validate_agent_argv(argv: &[String]) -> Result<(), HerdrError> {
-    if argv.len() != 1 || argv[0] != "codex" {
+fn validate_agent_argv(argv: &[String], expected: &str) -> Result<(), HerdrError> {
+    if argv.len() != 1 || argv[0] != expected {
         return Err(HerdrError::UnexpectedResponse);
     }
     Ok(())
@@ -1075,7 +1192,7 @@ fn parse_snapshot(response: Vec<u8>, agent: &AgentHandle) -> Result<AgentObserva
         return Err(HerdrError::UnexpectedResponse);
     }
     if let Some(response_kind) = snapshot_agent.agent.as_deref()
-        && response_kind != "codex"
+        && response_kind != agent.kind.cli_kind()
     {
         return Err(HerdrError::UnexpectedResponse);
     }
@@ -1632,7 +1749,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     #[cfg(unix)]
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::{UnixListener, UnixStream};
     #[cfg(unix)]
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1734,11 +1851,19 @@ mod tests {
     }
 
     fn agent_response(result_type: &str) -> serde_json::Value {
+        agent_response_for(result_type, "codex", "codex")
+    }
+
+    fn agent_response_for(
+        result_type: &str,
+        agent_kind: &str,
+        launch_argument: &str,
+    ) -> serde_json::Value {
         let mut result = json!({
             "type": result_type,
             "agent": {
                 "name": AGENT_NAME,
-                "agent": "codex",
+                "agent": agent_kind,
                 "terminal_id": "terminal-1",
                 "agent_status": "idle",
                 "workspace_id": WORKSPACE_ID,
@@ -1749,9 +1874,13 @@ mod tests {
             }
         });
         if result_type == "agent_started" {
-            result["argv"] = json!(["codex"]);
+            result["argv"] = json!([launch_argument]);
         }
         envelope("cli:agent", result)
+    }
+
+    fn cursor_agent_response(result_type: &str) -> serde_json::Value {
+        agent_response_for(result_type, "cursor", "agent")
     }
 
     fn ok_response(id: &str) -> serde_json::Value {
@@ -1759,6 +1888,10 @@ mod tests {
     }
 
     fn snapshot_response(status: &str) -> serde_json::Value {
+        snapshot_response_for(status, "codex")
+    }
+
+    fn snapshot_response_for(status: &str, agent_kind: &str) -> serde_json::Value {
         envelope(
             SNAPSHOT_REQUEST_ID,
             json!({
@@ -1772,7 +1905,7 @@ mod tests {
                     "layouts": [],
                     "agents": [{
                         "name": AGENT_NAME,
-                        "agent": "codex",
+                        "agent": agent_kind,
                         "terminal_id": "terminal-1",
                         "agent_status": status,
                         "workspace_id": WORKSPACE_ID,
@@ -1790,8 +1923,8 @@ mod tests {
     fn runner(
         cli_responses: impl IntoIterator<Item = Result<Vec<u8>, TransportError>>,
         socket_response: Result<Vec<u8>, TransportError>,
-    ) -> HerdrCodexRunner<FakeCli, FakeSocket> {
-        HerdrCodexRunner::new(
+    ) -> HerdrAgentRunner<FakeCli, FakeSocket> {
+        HerdrAgentRunner::new(
             FakeCli::new(cli_responses),
             FakeSocket {
                 response: socket_response,
@@ -1802,7 +1935,23 @@ mod tests {
         )
     }
 
-    fn workspace_and_agent(runner: &mut HerdrCodexRunner<FakeCli, FakeSocket>) -> AgentHandle {
+    fn cursor_runner(
+        cli_responses: impl IntoIterator<Item = Result<Vec<u8>, TransportError>>,
+        socket_response: Result<Vec<u8>, TransportError>,
+    ) -> HerdrAgentRunner<FakeCli, FakeSocket> {
+        HerdrAgentRunner::with_kind(
+            HerdrAgentKind::Cursor,
+            FakeCli::new(cli_responses),
+            FakeSocket {
+                response: socket_response,
+                path: None,
+                request: None,
+            },
+            runtime(),
+        )
+    }
+
+    fn workspace_and_agent(runner: &mut HerdrAgentRunner<FakeCli, FakeSocket>) -> AgentHandle {
         let workspace = runner
             .workspace_create(Path::new("/synthetic/workspace"), "synthetic")
             .expect("workspace response");
@@ -1823,6 +1972,31 @@ mod tests {
             .workspace_create(Path::new("/synthetic/workspace"), "synthetic")
             .expect("workspace response");
         runner.agent_start(&workspace, AGENT_NAME)
+    }
+
+    fn cursor_start_result(response: serde_json::Value) -> Result<AgentHandle, HerdrError> {
+        let mut runner = cursor_runner(
+            [
+                FakeCli::response(workspace_response()),
+                FakeCli::response(response),
+            ],
+            Err(TransportError::Unavailable),
+        );
+        let workspace = runner
+            .workspace_create(Path::new("/synthetic/workspace"), "synthetic")
+            .expect("workspace response");
+        runner.agent_start(&workspace, AGENT_NAME)
+    }
+
+    fn cursor_workspace_and_agent(
+        runner: &mut HerdrAgentRunner<FakeCli, FakeSocket>,
+    ) -> AgentHandle {
+        let workspace = runner
+            .workspace_create(Path::new("/synthetic/workspace"), "synthetic")
+            .expect("workspace response");
+        runner
+            .agent_start(&workspace, AGENT_NAME)
+            .expect("agent response")
     }
 
     #[test]
@@ -1897,6 +2071,149 @@ mod tests {
     }
 
     #[test]
+    fn cursor_agent_uses_exact_cli_argv_and_shared_operations() {
+        let responses = [
+            FakeCli::response(workspace_response()),
+            FakeCli::response(cursor_agent_response("agent_started")),
+            FakeCli::response(cursor_agent_response("agent_prompted")),
+            FakeCli::response(ok_response("cli:agent:send-keys")),
+            FakeCli::response(ok_response("cli:workspace:close")),
+        ];
+        let mut runner = cursor_runner(responses, Err(TransportError::Unavailable));
+        let workspace = runner
+            .workspace_create(Path::new("/synthetic/workspace"), "synthetic")
+            .expect("workspace response");
+        let agent = runner
+            .agent_start(&workspace, AGENT_NAME)
+            .expect("agent response");
+        runner
+            .prompt(&agent, "inspect the bounded fixture")
+            .expect("prompt response");
+        runner.interrupt(&agent).expect("interrupt response");
+        runner.stop(&workspace).expect("stop response");
+
+        assert_eq!(
+            runner.cli.requests,
+            vec![
+                vec![
+                    "--session",
+                    SESSION,
+                    "workspace",
+                    "create",
+                    "--cwd",
+                    "/synthetic/workspace",
+                    "--label",
+                    "synthetic",
+                    "--no-focus"
+                ],
+                vec![
+                    "--session",
+                    SESSION,
+                    "agent",
+                    "start",
+                    AGENT_NAME,
+                    "--kind",
+                    "cursor",
+                    "--pane",
+                    PANE_ID
+                ],
+                vec![
+                    "--session",
+                    SESSION,
+                    "agent",
+                    "prompt",
+                    AGENT_NAME,
+                    "inspect the bounded fixture"
+                ],
+                vec![
+                    "--session",
+                    SESSION,
+                    "agent",
+                    "send-keys",
+                    AGENT_NAME,
+                    "ctrl+c"
+                ],
+                vec!["--session", SESSION, "workspace", "close", WORKSPACE_ID],
+            ]
+            .into_iter()
+            .map(|args| args.into_iter().map(String::from).collect())
+            .collect::<Vec<Vec<String>>>()
+        );
+    }
+
+    #[test]
+    fn cursor_agent_start_requires_cursor_kind_and_canonical_agent_argv() {
+        let mut wrong_argv = cursor_agent_response("agent_started");
+        wrong_argv["result"]["argv"] = json!(["cursor"]);
+        assert_eq!(
+            cursor_start_result(wrong_argv),
+            Err(HerdrError::UnexpectedResponse)
+        );
+
+        let mut trailing_argv = cursor_agent_response("agent_started");
+        trailing_argv["result"]["argv"] = json!(["agent", "--dangerous"]);
+        assert_eq!(
+            cursor_start_result(trailing_argv),
+            Err(HerdrError::UnexpectedResponse)
+        );
+
+        assert_eq!(
+            cursor_start_result(agent_response("agent_started")),
+            Err(HerdrError::UnexpectedResponse)
+        );
+    }
+
+    #[test]
+    fn cursor_reports_require_cursor_backend_and_exact_binding() {
+        let report = json!({
+            "schemaVersion": 1,
+            "attemptId": "attempt-1",
+            "backend": CURSOR_AGENT_BACKEND,
+            "agentSessionRef": "session-1",
+            "outcome": "continue",
+            "validation": {"status": "not_run"},
+            "summary": "synthetic observation"
+        })
+        .to_string();
+        let mut runner = cursor_runner([], Err(TransportError::Unavailable));
+        assert!(
+            runner
+                .collect_report("attempt-1", "session-1", &report)
+                .is_ok()
+        );
+        assert_eq!(
+            runner.collect_report("attempt-2", "session-1", &report),
+            Err(HerdrError::ReportBindingMismatch)
+        );
+        assert_eq!(
+            runner.collect_report("attempt-1", "session-2", &report),
+            Err(HerdrError::ReportBindingMismatch)
+        );
+        let wrong_backend = report.replace(CURSOR_AGENT_BACKEND, BACKEND);
+        assert_eq!(
+            runner.collect_report("attempt-1", "session-1", &wrong_backend),
+            Err(HerdrError::BackendMismatch)
+        );
+    }
+
+    #[test]
+    fn cursor_lifecycle_is_observation_only() {
+        let mut runner = cursor_runner(
+            [
+                FakeCli::response(workspace_response()),
+                FakeCli::response(cursor_agent_response("agent_started")),
+            ],
+            FakeSocket::new_response(snapshot_response_for("done", "cursor")),
+        );
+        let agent = cursor_workspace_and_agent(&mut runner);
+        let observation = runner.observe(&agent).expect("snapshot response");
+        assert_eq!(observation.status(), AgentStatus::Done);
+        assert_eq!(observation.revision(), 7);
+        assert_eq!(observation.workspace_id(), WORKSPACE_ID);
+        assert_eq!(observation.pane_id(), PANE_ID);
+    }
+
+    #[test]
     fn observe_sends_one_bounded_snapshot_request_and_keeps_only_lifecycle_fields() {
         let response = FakeCli::response(workspace_response());
         let socket_response = FakeSocket::new_response(snapshot_response("done"));
@@ -1926,6 +2243,7 @@ mod tests {
             name: AGENT_NAME.to_owned(),
             workspace_id: WORKSPACE_ID.to_owned(),
             pane_id: PANE_ID.to_owned(),
+            kind: HerdrAgentKind::Codex,
         });
         assert_eq!(result, Err(HerdrError::UnsupportedOperation));
         assert!(runner.cli.requests.is_empty());
@@ -2237,6 +2555,8 @@ mod tests {
         assert!(output.contains(&format!("|{}|", SESSION)));
         let _runner = ProductionHerdrCodexRunner::connect(runtime.config.clone())
             .expect("production runner constructor");
+        let _cursor_runner = ProductionHerdrCursorAgentRunner::connect(runtime.config.clone())
+            .expect("Cursor production runner constructor");
     }
 
     #[cfg(unix)]
@@ -2354,22 +2674,40 @@ mod tests {
         let runtime = PrivateRuntime::new();
         let socket_path = runtime.config.runtime.socket_path().to_owned();
         let listener = UnixListener::bind(&socket_path).expect("synthetic Unix socket");
+        const SERVER_TIMEOUT: Duration = Duration::from_secs(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
         let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("socket client");
-            let mut request = vec![0_u8; SNAPSHOT_REQUEST.len()];
-            stream.read_exact(&mut request).expect("snapshot request");
-            assert_eq!(request, SNAPSHOT_REQUEST);
-            stream
-                .write_all(b"{\"id\":\"nagi-observe\",\"result\":{}}\n")
-                .expect("snapshot response");
+            (|| {
+                let (mut stream, _) = listener.accept().map_err(|_| ())?;
+                stream
+                    .set_read_timeout(Some(SERVER_TIMEOUT))
+                    .map_err(|_| ())?;
+                stream
+                    .set_write_timeout(Some(SERVER_TIMEOUT))
+                    .map_err(|_| ())?;
+                let mut request = vec![0_u8; SNAPSHOT_REQUEST.len()];
+                stream.read_exact(&mut request).map_err(|_| ())?;
+                if request != SNAPSHOT_REQUEST {
+                    return Err(());
+                }
+                stream
+                    .write_all(b"{\"id\":\"nagi-observe\",\"result\":{}}\n")
+                    .map_err(|_| ())?;
+                release_rx.recv_timeout(SERVER_TIMEOUT).map_err(|_| ())?;
+                Ok(())
+            })()
         });
         let mut socket = UnixSocketTransport {
             timeout: Duration::from_secs(1),
         };
-        let response = socket
-            .snapshot(&socket_path, SNAPSHOT_REQUEST)
-            .expect("snapshot response");
-        server.join().expect("socket server");
+        let response = socket.snapshot(&socket_path, SNAPSHOT_REQUEST);
+        if response.is_err() {
+            let _ = UnixStream::connect(&socket_path);
+        }
+        let _ = release_tx.send(());
+        let server_result = server.join().expect("socket server");
+        assert_eq!(server_result, Ok(()));
+        let response = response.expect("snapshot response");
         assert_eq!(response, b"{\"id\":\"nagi-observe\",\"result\":{}}\n");
     }
 
