@@ -755,17 +755,6 @@ struct IssueInputRecord {
     team: Option<Team>,
 }
 
-impl Drop for IssueInputRecord {
-    fn drop(&mut self) {
-        self.id.zeroize();
-        self.identifier.zeroize();
-        self.title.zeroize();
-        if let Some(description) = self.description.as_mut() {
-            description.zeroize();
-        }
-    }
-}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CommentConnection {
