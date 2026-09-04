@@ -2169,11 +2169,13 @@ mod tests {
     impl PrivateRuntime {
         fn new() -> Self {
             static NEXT_RUNTIME: AtomicUsize = AtomicUsize::new(0);
-            let root = std::env::temp_dir().join(format!(
-                ".h-{}-{}",
-                std::process::id(),
-                NEXT_RUNTIME.fetch_add(1, Ordering::Relaxed)
-            ));
+            let root = std::fs::canonicalize(std::env::temp_dir())
+                .expect("canonical private test root")
+                .join(format!(
+                    ".h-{}-{}",
+                    std::process::id(),
+                    NEXT_RUNTIME.fetch_add(1, Ordering::Relaxed)
+                ));
             std::fs::create_dir(&root).expect("private test root");
             std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
                 .expect("private test root mode");
