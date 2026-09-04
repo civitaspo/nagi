@@ -27,6 +27,7 @@
         "linear",
         "temporal",
         "codex",
+        "herdr",
         "operator-surface",
         "safety",
         "release"
@@ -45,26 +46,52 @@
     },
     "versions": {
       "type": "object",
-      "additionalProperties": false,
-      "required": ["rust", "temporalCli", "temporalRustSdk", "codex"],
-      "properties": {
-        "rust": {
-          "type": "string",
-          "const": "1.98.0"
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "required": ["rust", "temporalCli", "temporalRustSdk", "codex"],
+          "properties": {
+            "rust": {
+              "type": "string",
+              "const": "1.98.0"
+            },
+            "temporalCli": {
+              "type": "string",
+              "const": "1.8.2"
+            },
+            "temporalRustSdk": {
+              "type": "string",
+              "const": "0.7.0"
+            },
+            "codex": {
+              "type": "string",
+              "const": "0.151.0"
+            }
+          }
         },
-        "temporalCli": {
-          "type": "string",
-          "const": "1.8.2"
-        },
-        "temporalRustSdk": {
-          "type": "string",
-          "const": "0.7.0"
-        },
-        "codex": {
-          "type": "string",
-          "const": "0.151.0"
+        {
+          "additionalProperties": false,
+          "required": ["herdr", "herdrProtocol", "herdrSchema", "herdrRevision"],
+          "properties": {
+            "herdr": {
+              "type": "string",
+              "const": "0.8.2"
+            },
+            "herdrProtocol": {
+              "type": "integer",
+              "const": 20
+            },
+            "herdrSchema": {
+              "type": "integer",
+              "const": 1
+            },
+            "herdrRevision": {
+              "type": "string",
+              "const": "9eb521456ac0d19d3ab3d9d7cea3cca10baa8a4c"
+            }
+          }
         }
-      }
+      ]
     },
     "checks": {
       "type": "array",

@@ -7,6 +7,7 @@ rust = { version = "1.98.0", components = ["clippy", "rustfmt"] }
 "aqua:openai/codex" = "0.151.0"
 "aqua:temporalio/cli" = "1.8.2"
 "aqua:protocolbuffers/protobuf/protoc" = "36.1"
+herdr = "0.8.2"
 
 [tasks.lint]
 description = "Run repository and Rust lint checks"
@@ -77,6 +78,10 @@ run = "scripts/contracts/temporal-activities.sh"
 [tasks."contract:temporal-replay"]
 description = "Run the explicitly enabled local Temporal replay compatibility contract"
 run = "scripts/contracts/temporal-replay.sh"
+
+[tasks."contract:herdr"]
+description = "Run the explicitly enabled local Herdr CLI/socket contract"
+run = "scripts/contracts/herdr.sh"
 
 [tasks."contract:live"]
 description = "Preflight explicitly enabled live-provider contract tests"

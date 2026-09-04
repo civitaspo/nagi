@@ -61,6 +61,21 @@ const RAW_BUILD_SCRIPT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../scripts/contracts/build-raw.sh"
 );
+#[cfg(unix)]
+const HERDR_SCRIPT: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../scripts/contracts/herdr.sh"
+);
+#[cfg(unix)]
+const HERDR_SCRIPT_SOURCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../scripts/contracts/herdr.sh"
+));
+#[cfg(unix)]
+const HERDR_SOCKET_SOURCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../scripts/contracts/herdr_socket.rb"
+));
 
 type TomlTable = TomlMap<String, TomlValue>;
 
@@ -326,6 +341,11 @@ fn versions_are_a_strict_source_and_revision_manifest() {
             "codex_source",
             "codex_tag",
             "codex_revision",
+            "herdr",
+            "herdr_source",
+            "herdr_tag",
+            "herdr_tag_object",
+            "herdr_revision",
         ],
     );
     assert_eq!(
@@ -339,6 +359,7 @@ fn versions_are_a_strict_source_and_revision_manifest() {
         ("temporal_cli", "1.8.2"),
         ("temporal_rust_sdk", "0.7.0"),
         ("codex", "0.151.0"),
+        ("herdr", "0.8.2"),
     ] {
         assert_eq!(toml_string("version manifest", versions, key), expected);
     }
@@ -375,6 +396,14 @@ fn versions_are_a_strict_source_and_revision_manifest() {
             "rust-v0.151.0",
             "78c290807ce710180111df227df3b7a4fe845452",
         ),
+        (
+            "herdr_source",
+            "herdr_tag",
+            "herdr_revision",
+            "https://github.com/herdrdev/herdr",
+            "v0.8.2",
+            "9eb521456ac0d19d3ab3d9d7cea3cca10baa8a4c",
+        ),
     ] {
         assert_eq!(
             toml_string("version manifest", versions, source_key),
@@ -385,6 +414,10 @@ fn versions_are_a_strict_source_and_revision_manifest() {
         assert_hex_revision(actual_revision);
         assert_eq!(actual_revision, revision);
     }
+    assert_eq!(
+        toml_string("version manifest", versions, "herdr_tag_object"),
+        "34ba52cc6ff3b723e6fc0130485ec24582dbe205"
+    );
 }
 
 #[test]
@@ -558,6 +591,7 @@ fn tool_manifests_cross_check_declared_versions_and_backends() {
         ("aqua:openai/codex", "0.151.0"),
         ("aqua:temporalio/cli", "1.8.2"),
         ("aqua:protocolbuffers/protobuf/protoc", "36.1"),
+        ("herdr", "0.8.2"),
     ] {
         assert_eq!(toml_string("mise tool", tools, tool), version);
     }
@@ -573,6 +607,7 @@ fn tool_manifests_cross_check_declared_versions_and_backends() {
             "36.1",
             "aqua:protocolbuffers/protobuf/protoc",
         ),
+        ("herdr", "0.8.2", "aqua:herdrdev/herdr"),
     ] {
         let entries = lock_tools
             .get(tool)
@@ -668,6 +703,38 @@ fn codex_auth_contract_is_opt_in_and_status_only() {
 
     if !cfg!(target_os = "macos") {
         let explicit = command_output(CODEX_AUTH_SCRIPT, &[("NAGI_CONTRACT_CODEX_AUTH", "1")]);
+        assert_eq!(explicit.status.code(), Some(2));
+        assert!(!bytes_contain(&explicit.stdout, b"/"));
+        assert!(!bytes_contain(&explicit.stderr, b"/"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn herdr_contract_is_opt_in_and_socket_only() {
+    let skip = command_output(HERDR_SCRIPT, &[]);
+    assert_eq!(skip.status.code(), Some(0));
+    assert!(bytes_contain(&skip.stdout, b"SKIP"));
+    assert!(skip.stderr.is_empty());
+    assert!(HERDR_SCRIPT_SOURCE.contains("NAGI_CONTRACT_HERDR"));
+    assert!(HERDR_SCRIPT_SOURCE.contains("live_validate_clean_revision"));
+    assert!(HERDR_SCRIPT_SOURCE.contains("api schema --json"));
+    assert!(HERDR_SCRIPT_SOURCE.contains("workspace create"));
+    assert!(HERDR_SCRIPT_SOURCE.contains("workspace close"));
+    assert!(HERDR_SCRIPT_SOURCE.contains("server stop"));
+    assert!(HERDR_SCRIPT_SOURCE.contains("remove_stale_sockets"));
+    assert!(HERDR_SCRIPT_SOURCE.contains("\\\"gate\\\":\\\"herdr\\\""));
+    assert!(HERDR_SCRIPT_SOURCE.contains("herdrProtocol"));
+    assert!(HERDR_SCRIPT_SOURCE.contains("herdrSchema"));
+    assert!(HERDR_SCRIPT_SOURCE.contains("herdrRevision"));
+    assert!(HERDR_SOCKET_SOURCE.contains("UNIXSocket"));
+    assert!(HERDR_SOCKET_SOURCE.contains("MAX_LINE_BYTES"));
+    assert!(HERDR_SOCKET_SOURCE.contains("malformed JSON"));
+    assert!(HERDR_SOCKET_SOURCE.contains("events.subscribe"));
+    assert!(HERDR_SOCKET_SOURCE.contains("subscription_started"));
+
+    if !cfg!(target_os = "macos") {
+        let explicit = command_output(HERDR_SCRIPT, &[("NAGI_CONTRACT_HERDR", "1")]);
         assert_eq!(explicit.status.code(), Some(2));
         assert!(!bytes_contain(&explicit.stdout, b"/"));
         assert!(!bytes_contain(&explicit.stderr, b"/"));
