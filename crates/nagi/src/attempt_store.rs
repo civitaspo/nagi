@@ -306,6 +306,20 @@ impl fmt::Debug for AttemptStore {
     }
 }
 
+impl Drop for AttemptStore {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            // macOS can retain a directory flock until the owning descriptor's
+            // close is processed; make the release explicit before fields
+            // are dropped so a following controller can proceed promptly.
+            unsafe {
+                libc::flock(self.lock_file.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+    }
+}
+
 impl AttemptStore {
     /// Opens or initializes an owner-only database at the explicit path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, AttemptStoreError> {
@@ -1876,6 +1890,20 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn state_directory_lock_contends_and_releases_on_drop() {
+        if let (Ok(mode), Ok(path)) = (
+            std::env::var("NAGI_ATTEMPT_STORE_LOCK_PROBE"),
+            std::env::var("NAGI_ATTEMPT_STORE_LOCK_DB"),
+        ) {
+            let opened = AttemptStore::open(path);
+            let valid = match mode.as_str() {
+                "contend" => matches!(opened, Err(AttemptStoreError::Busy)),
+                "after_drop" => opened.is_ok(),
+                _ => false,
+            };
+            assert!(valid, "unexpected lock probe result");
+            return;
+        }
+
         let database = TestDatabase::new();
         let first = AttemptStore::open(&database.path).expect("first store");
         let path = database.path.clone();
@@ -1883,7 +1911,32 @@ mod tests {
             .join()
             .expect("second store");
         assert_eq!(second, Some(AttemptStoreError::Busy));
+
+        let test_binary = std::env::current_exe().expect("test binary");
+        let child = std::process::Command::new(test_binary)
+            .args([
+                "--exact",
+                "attempt_store::tests::state_directory_lock_contends_and_releases_on_drop",
+                "--nocapture",
+            ])
+            .env("NAGI_ATTEMPT_STORE_LOCK_PROBE", "contend")
+            .env("NAGI_ATTEMPT_STORE_LOCK_DB", &database.path)
+            .status()
+            .expect("contending child");
+        assert!(child.success(), "child entered a held lock");
+
         drop(first);
+        let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "attempt_store::tests::state_directory_lock_contends_and_releases_on_drop",
+                "--nocapture",
+            ])
+            .env("NAGI_ATTEMPT_STORE_LOCK_PROBE", "after_drop")
+            .env("NAGI_ATTEMPT_STORE_LOCK_DB", &database.path)
+            .status()
+            .expect("released child");
+        assert!(child.success(), "child could not acquire released lock");
         AttemptStore::open(&database.path).expect("lock released after drop");
     }
 
