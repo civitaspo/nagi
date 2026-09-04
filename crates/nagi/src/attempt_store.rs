@@ -117,8 +117,18 @@ impl AttemptBackend {
 pub enum AttemptState {
     /// The attempt has been durably created but not started.
     Created,
+    /// Workspace creation is durably pending; no create effect may be
+    /// repeated until a snapshot proves the workspace absent.
+    WorkspacePending,
     /// Workspace creation completed and the workspace reference is bound.
     WorkspaceReady,
+    /// Agent creation is durably pending; no start effect may be repeated
+    /// until a snapshot proves the named agent absent.
+    AgentPending,
+    /// Agent creation completed and both runtime references are bound.
+    AgentReady,
+    /// Prompt delivery is durably pending and therefore ambiguous.
+    PromptPending,
     /// The selected backend has been started.
     Running,
     /// A lifecycle observation has been recorded.
@@ -138,7 +148,11 @@ impl AttemptState {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Created => "created",
+            Self::WorkspacePending => "workspace_pending",
             Self::WorkspaceReady => "workspace_ready",
+            Self::AgentPending => "agent_pending",
+            Self::AgentReady => "agent_ready",
+            Self::PromptPending => "prompt_pending",
             Self::Running => "running",
             Self::Observed => "observed",
             Self::ReportReady => "report_ready",
@@ -151,7 +165,11 @@ impl AttemptState {
     fn parse(value: &str) -> Result<Self, AttemptStoreError> {
         match value {
             "created" => Ok(Self::Created),
+            "workspace_pending" => Ok(Self::WorkspacePending),
             "workspace_ready" => Ok(Self::WorkspaceReady),
+            "agent_pending" => Ok(Self::AgentPending),
+            "agent_ready" => Ok(Self::AgentReady),
+            "prompt_pending" => Ok(Self::PromptPending),
             "running" => Ok(Self::Running),
             "observed" => Ok(Self::Observed),
             "report_ready" => Ok(Self::ReportReady),
@@ -323,6 +341,44 @@ impl AttemptStore {
         Ok(record)
     }
 
+    /// Persists the workspace-create intent before the external effect. A
+    /// repeated intent is idempotent; reconciliation must decide whether the
+    /// effect can safely be issued.
+    pub fn mark_workspace_pending(
+        &mut self,
+        attempt_id: &str,
+        now_ms: i64,
+    ) -> Result<AttemptRecord, AttemptStoreError> {
+        validate_attempt_id(attempt_id)?;
+        validate_timestamp(now_ms)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| AttemptStoreError::Database)?;
+        let current = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::NotFound)?;
+        validate_update_timestamp(&current, now_ms)?;
+        if current.state == AttemptState::WorkspacePending {
+            transaction
+                .commit()
+                .map_err(|_| AttemptStoreError::Database)?;
+            return Ok(current);
+        }
+        if current.state != AttemptState::Created {
+            return Err(AttemptStoreError::InvalidTransition);
+        }
+        transition_without_refs(
+            &transaction,
+            attempt_id,
+            AttemptState::WorkspacePending,
+            now_ms,
+        )?;
+        let record = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::Database)?;
+        transaction
+            .commit()
+            .map_err(|_| AttemptStoreError::Database)?;
+        Ok(record)
+    }
+
     /// Binds the workspace produced by one create effect before any agent
     /// effect is issued. Repeating the exact binding is idempotent.
     pub fn mark_workspace_ready(
@@ -349,7 +405,10 @@ impl AttemptStore {
                 .map_err(|_| AttemptStoreError::Database)?;
             return Ok(current);
         }
-        if current.state != AttemptState::Created {
+        if !matches!(
+            current.state,
+            AttemptState::Created | AttemptState::WorkspacePending
+        ) {
             return Err(AttemptStoreError::InvalidTransition);
         }
         transaction
@@ -358,6 +417,153 @@ impl AttemptStore {
                 params![workspace_ref, now_ms, attempt_id],
             )
             .map_err(|_| AttemptStoreError::Database)?;
+        let record = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::Database)?;
+        transaction
+            .commit()
+            .map_err(|_| AttemptStoreError::Database)?;
+        Ok(record)
+    }
+
+    /// Persists the agent-start intent before the external effect.
+    pub fn mark_agent_pending(
+        &mut self,
+        attempt_id: &str,
+        now_ms: i64,
+    ) -> Result<AttemptRecord, AttemptStoreError> {
+        validate_attempt_id(attempt_id)?;
+        validate_timestamp(now_ms)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| AttemptStoreError::Database)?;
+        let current = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::NotFound)?;
+        validate_update_timestamp(&current, now_ms)?;
+        if current.state == AttemptState::AgentPending {
+            transaction
+                .commit()
+                .map_err(|_| AttemptStoreError::Database)?;
+            return Ok(current);
+        }
+        if current.state != AttemptState::WorkspaceReady {
+            return Err(AttemptStoreError::InvalidTransition);
+        }
+        transition_without_refs(&transaction, attempt_id, AttemptState::AgentPending, now_ms)?;
+        let record = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::Database)?;
+        transaction
+            .commit()
+            .map_err(|_| AttemptStoreError::Database)?;
+        Ok(record)
+    }
+
+    /// Binds an agent discovered or created during reconciliation.
+    pub fn mark_agent_ready(
+        &mut self,
+        attempt_id: &str,
+        workspace_ref: &str,
+        agent_ref: &str,
+        now_ms: i64,
+    ) -> Result<AttemptRecord, AttemptStoreError> {
+        validate_attempt_id(attempt_id)?;
+        validate_opaque_ref(workspace_ref)?;
+        validate_opaque_ref(agent_ref)?;
+        validate_timestamp(now_ms)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| AttemptStoreError::Database)?;
+        let current = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::NotFound)?;
+        validate_update_timestamp(&current, now_ms)?;
+        if current.state == AttemptState::AgentReady {
+            if current.workspace_ref.as_deref() != Some(workspace_ref)
+                || current.agent_ref.as_deref() != Some(agent_ref)
+            {
+                return Err(AttemptStoreError::DuplicateConflict);
+            }
+            transaction
+                .commit()
+                .map_err(|_| AttemptStoreError::Database)?;
+            return Ok(current);
+        }
+        if current.state != AttemptState::AgentPending {
+            return Err(AttemptStoreError::InvalidTransition);
+        }
+        if current.workspace_ref.as_deref() != Some(workspace_ref) {
+            return Err(AttemptStoreError::DuplicateConflict);
+        }
+        transaction
+            .execute(
+                "UPDATE attempts SET lifecycle = 'agent_ready', agent_ref = ?1, updated_at_ms = ?2 WHERE attempt_id = ?3",
+                params![agent_ref, now_ms, attempt_id],
+            )
+            .map_err(|_| AttemptStoreError::Database)?;
+        let record = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::Database)?;
+        transaction
+            .commit()
+            .map_err(|_| AttemptStoreError::Database)?;
+        Ok(record)
+    }
+
+    /// Persists prompt intent. The prompt is not retained; a pending state is
+    /// deliberately ambiguous and is never retried automatically.
+    pub fn mark_prompt_pending(
+        &mut self,
+        attempt_id: &str,
+        now_ms: i64,
+    ) -> Result<AttemptRecord, AttemptStoreError> {
+        validate_attempt_id(attempt_id)?;
+        validate_timestamp(now_ms)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| AttemptStoreError::Database)?;
+        let current = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::NotFound)?;
+        validate_update_timestamp(&current, now_ms)?;
+        if current.state == AttemptState::PromptPending {
+            transaction
+                .commit()
+                .map_err(|_| AttemptStoreError::Database)?;
+            return Ok(current);
+        }
+        if current.state != AttemptState::AgentReady {
+            return Err(AttemptStoreError::InvalidTransition);
+        }
+        transition_without_refs(
+            &transaction,
+            attempt_id,
+            AttemptState::PromptPending,
+            now_ms,
+        )?;
+        let record = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::Database)?;
+        transaction
+            .commit()
+            .map_err(|_| AttemptStoreError::Database)?;
+        Ok(record)
+    }
+
+    /// Confirms the prompt effect after the adapter reports success.
+    pub fn confirm_prompt(
+        &mut self,
+        attempt_id: &str,
+        now_ms: i64,
+    ) -> Result<AttemptRecord, AttemptStoreError> {
+        validate_attempt_id(attempt_id)?;
+        validate_timestamp(now_ms)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| AttemptStoreError::Database)?;
+        let current = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::NotFound)?;
+        validate_update_timestamp(&current, now_ms)?;
+        if current.state == AttemptState::Running {
+            transaction
+                .commit()
+                .map_err(|_| AttemptStoreError::Database)?;
+            return Ok(current);
+        }
+        if current.state != AttemptState::PromptPending {
+            return Err(AttemptStoreError::InvalidTransition);
+        }
+        transition_without_refs(&transaction, attempt_id, AttemptState::Running, now_ms)?;
         let record = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::Database)?;
         transaction
             .commit()
@@ -418,18 +624,6 @@ impl AttemptStore {
             .commit()
             .map_err(|_| AttemptStoreError::Database)?;
         Ok(record)
-    }
-
-    /// Records an interrupt intent before sending the one external key
-    /// effect. A repeated pending intent is idempotent and never authorizes a
-    /// second effect by itself.
-    pub fn mark_interrupt_pending(
-        &mut self,
-        attempt_id: &str,
-        now_ms: i64,
-    ) -> Result<AttemptRecord, AttemptStoreError> {
-        self.begin_interrupt_pending(attempt_id, now_ms)
-            .map(|(record, _)| record)
     }
 
     /// Records an interrupt intent and reports whether this call changed the
@@ -522,6 +716,52 @@ impl AttemptStore {
                 | AttemptState::InterruptPending
         ) {
             return Err(AttemptStoreError::InvalidTransition);
+        }
+        transaction
+            .execute(
+                "UPDATE attempts SET lifecycle = ?1, observation_revision = ?2, updated_at_ms = ?3 WHERE attempt_id = ?4",
+                params![state.as_str(), revision, now_ms, attempt_id],
+            )
+            .map_err(|_| AttemptStoreError::Database)?;
+        let record = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::Database)?;
+        transaction
+            .commit()
+            .map_err(|_| AttemptStoreError::Database)?;
+        Ok(record)
+    }
+
+    /// Resolves an interrupt intent from one fresh observation. An unchanged
+    /// revision is valid here because the interrupt itself is the durable
+    /// event; the stored revision remains unchanged rather than being
+    /// fabricated. Older revisions and differing same-revision states fail
+    /// closed.
+    pub fn reconcile_interrupt_observation(
+        &mut self,
+        attempt_id: &str,
+        state: AttemptState,
+        revision: u64,
+        now_ms: i64,
+    ) -> Result<AttemptRecord, AttemptStoreError> {
+        validate_attempt_id(attempt_id)?;
+        let revision = revision_to_sql(revision)?;
+        validate_timestamp(now_ms)?;
+        if !matches!(
+            state,
+            AttemptState::Observed | AttemptState::Blocked | AttemptState::Failed
+        ) {
+            return Err(AttemptStoreError::InvalidTransition);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| AttemptStoreError::Database)?;
+        let current = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::NotFound)?;
+        validate_update_timestamp(&current, now_ms)?;
+        if current.state != AttemptState::InterruptPending {
+            return Err(AttemptStoreError::InvalidTransition);
+        }
+        if revision < current.observation_revision as i64 {
+            return Err(AttemptStoreError::StaleRevision);
         }
         transaction
             .execute(
@@ -671,6 +911,21 @@ fn load_record(
         .transpose()
 }
 
+fn transition_without_refs(
+    transaction: &rusqlite::Transaction<'_>,
+    attempt_id: &str,
+    state: AttemptState,
+    now_ms: i64,
+) -> Result<(), AttemptStoreError> {
+    transaction
+        .execute(
+            "UPDATE attempts SET lifecycle = ?1, updated_at_ms = ?2 WHERE attempt_id = ?3",
+            params![state.as_str(), now_ms, attempt_id],
+        )
+        .map_err(|_| AttemptStoreError::Database)?;
+    Ok(())
+}
+
 fn decode_raw(raw: RawAttempt) -> Result<AttemptRecord, AttemptStoreError> {
     validate_attempt_id(&raw.attempt_id).map_err(|_| AttemptStoreError::Database)?;
     validate_issue_id(&raw.issue_id).map_err(|_| AttemptStoreError::Database)?;
@@ -712,8 +967,17 @@ fn decode_raw(raw: RawAttempt) -> Result<AttemptRecord, AttemptStoreError> {
     let refs_absent = raw.workspace_ref.is_none() && raw.agent_ref.is_none();
     let valid_lifecycle = match state {
         AttemptState::Created => refs_absent && observation_revision == 0 && report_json.is_none(),
+        AttemptState::WorkspacePending => {
+            refs_absent && observation_revision == 0 && report_json.is_none()
+        }
         AttemptState::WorkspaceReady => {
             workspace_only && observation_revision == 0 && report_json.is_none()
+        }
+        AttemptState::AgentPending => {
+            workspace_only && observation_revision == 0 && report_json.is_none()
+        }
+        AttemptState::AgentReady | AttemptState::PromptPending => {
+            refs_present && observation_revision == 0 && report_json.is_none()
         }
         AttemptState::Running => refs_present && observation_revision == 0 && report_json.is_none(),
         AttemptState::Observed | AttemptState::Blocked | AttemptState::Failed => {

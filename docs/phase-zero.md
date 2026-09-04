@@ -60,6 +60,11 @@ The spike covers:
   typed unsupported/deferred result; session restore remains part of the
   later observation and recovery gate. Stopping delegates to Herdr's
   workspace close operation and never kills a vendor process directly.
+  The checked contract starts the named Herdr server explicitly before socket
+  use (`scripts/contracts/herdr.sh:start_server`); production reconnect keeps
+  the same fail-closed behavior when that server/socket is absent. Automatic
+  server bootstrap is deferred until its bounded ownership and shutdown
+  contract is separately established.
   The named session and isolated `HOME` are one binding; the socket endpoint is
   derived as Herdr's session socket beneath that `HOME` rather than accepted
   as an independent path. The `workspace_created` response is accepted only
