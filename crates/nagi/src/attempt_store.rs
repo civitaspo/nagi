@@ -288,7 +288,7 @@ impl fmt::Debug for AttemptRecord {
 
 /// An explicitly selected durable SQLite attempt database.
 pub struct AttemptStore {
-    connection: Connection,
+    connection: Option<Connection>,
     path: PathBuf,
     identity: DatabaseIdentity,
     state_directory: PathBuf,
@@ -308,11 +308,13 @@ impl fmt::Debug for AttemptStore {
 
 impl Drop for AttemptStore {
     fn drop(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            let _ = connection.close();
+        }
         #[cfg(unix)]
         {
-            // macOS can retain a directory flock until the owning descriptor's
-            // close is processed; make the release explicit before fields
-            // are dropped so a following controller can proceed promptly.
+            // Close SQLite before releasing the state-directory flock. macOS
+            // can otherwise retain SQLite's directory-related lock state.
             unsafe {
                 libc::flock(self.lock_file.as_raw_fd(), libc::LOCK_UN);
             }
@@ -349,7 +351,7 @@ impl AttemptStore {
         }
         validate_sidecars(&path, identity)?;
         let store = Self {
-            connection,
+            connection: Some(connection),
             path,
             identity,
             state_directory,
@@ -358,6 +360,14 @@ impl AttemptStore {
         };
         store.validate_identity()?;
         Ok(store)
+    }
+
+    fn connection_ref(&self) -> Result<&Connection, AttemptStoreError> {
+        self.connection.as_ref().ok_or(AttemptStoreError::Database)
+    }
+
+    fn connection_mut(&mut self) -> Result<&mut Connection, AttemptStoreError> {
+        self.connection.as_mut().ok_or(AttemptStoreError::Database)
     }
 
     fn validate_identity(&self) -> Result<(), AttemptStoreError> {
@@ -386,7 +396,7 @@ impl AttemptStore {
         validate_issue_id(issue_id)?;
         validate_timestamp(now_ms)?;
         let transaction = self
-            .connection
+            .connection_mut()?
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| AttemptStoreError::Database)?;
         if let Some(existing) = load_record(&transaction, attempt_id)? {
@@ -441,7 +451,7 @@ impl AttemptStore {
         validate_opaque_ref(workspace_ref)?;
         validate_timestamp(now_ms)?;
         let transaction = self
-            .connection
+            .connection_mut()?
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| AttemptStoreError::Database)?;
         let current = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::NotFound)?;
@@ -503,7 +513,7 @@ impl AttemptStore {
         validate_opaque_ref(agent_ref)?;
         validate_timestamp(now_ms)?;
         let transaction = self
-            .connection
+            .connection_mut()?
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| AttemptStoreError::Database)?;
         let current = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::NotFound)?;
@@ -582,7 +592,7 @@ impl AttemptStore {
         validate_attempt_id(attempt_id)?;
         validate_timestamp(now_ms)?;
         let transaction = self
-            .connection
+            .connection_mut()?
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| AttemptStoreError::Database)?;
         let current = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::NotFound)?;
@@ -627,7 +637,7 @@ impl AttemptStore {
         validate_attempt_id(attempt_id)?;
         validate_timestamp(now_ms)?;
         let transaction = self
-            .connection
+            .connection_mut()?
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| AttemptStoreError::Database)?;
         let current = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::NotFound)?;
@@ -682,7 +692,7 @@ impl AttemptStore {
             return Err(AttemptStoreError::InvalidTransition);
         }
         let transaction = self
-            .connection
+            .connection_mut()?
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| AttemptStoreError::Database)?;
         let current = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::NotFound)?;
@@ -744,7 +754,7 @@ impl AttemptStore {
             return Err(AttemptStoreError::InvalidTransition);
         }
         let transaction = self
-            .connection
+            .connection_mut()?
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| AttemptStoreError::Database)?;
         let current = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::NotFound)?;
@@ -785,7 +795,7 @@ impl AttemptStore {
             .canonical_json()
             .map_err(|_| AttemptStoreError::InvalidReport)?;
         let transaction = self
-            .connection
+            .connection_mut()?
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| AttemptStoreError::Database)?;
         let current = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::NotFound)?;
@@ -837,7 +847,7 @@ impl AttemptStore {
     pub fn get(&self, attempt_id: &str) -> Result<Option<AttemptRecord>, AttemptStoreError> {
         self.validate_identity()?;
         validate_attempt_id(attempt_id)?;
-        load_record(&self.connection, attempt_id)
+        load_record(self.connection_ref()?, attempt_id)
     }
 
     /// Returns one bounded keyset page of nonterminal attempts. The optional
@@ -860,13 +870,13 @@ impl AttemptStore {
             None => None,
             Some(attempt_id) => {
                 validate_attempt_id(attempt_id)?;
-                let record = load_record(&self.connection, attempt_id)?
+                let record = load_record(self.connection_ref()?, attempt_id)?
                     .ok_or(AttemptStoreError::InvalidInput)?;
                 Some((record.created_at_ms(), attempt_id.to_owned()))
             }
         };
         let mut statement = self
-            .connection
+            .connection_ref()?
             .prepare(&format!(
                 "SELECT {SELECT_COLUMNS} FROM attempts WHERE lifecycle != 'failed' AND (?1 IS NULL OR created_at_ms > ?2 OR (created_at_ms = ?2 AND attempt_id > ?3)) ORDER BY created_at_ms, attempt_id LIMIT ?4"
             ))
@@ -905,7 +915,7 @@ impl AttemptStore {
         validate_attempt_id(attempt_id)?;
         validate_timestamp(now_ms)?;
         let transaction = self
-            .connection
+            .connection_mut()?
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| AttemptStoreError::Database)?;
         let current = load_record(&transaction, attempt_id)?.ok_or(AttemptStoreError::NotFound)?;
