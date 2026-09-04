@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/nagi/normalized-agent-report-v1.schema.json",
+  "title": "Nagi normalized agent report",
+  "description": "A bounded observation. It is not a Linear completion decision.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "attemptId",
+    "backend",
+    "agentSessionRef",
+    "outcome",
+    "validation",
+    "summary"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "attemptId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]*[A-Za-z0-9])?$"
+    },
+    "backend": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*(?:\\+[a-z0-9]+(?:-[a-z0-9]+)*)?$"
+    },
+    "agentSessionRef": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]*[A-Za-z0-9])?$"
+    },
+    "outcome": {
+      "enum": ["continue", "review", "blocked", "done", "failed"]
+    },
+    "validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": {
+          "enum": ["not_run", "passed", "failed"]
+        }
+      }
+    },
+    "commitRef": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "pullRequestRef": {
+      "type": "string",
+      "maxLength": 32,
+      "pattern": "^pr-[0-9]{1,10}$"
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^[^\\x00-\\x1F\\x7F\\\\{}\\[\\]<>`]+$"
+    }
+  }
+}

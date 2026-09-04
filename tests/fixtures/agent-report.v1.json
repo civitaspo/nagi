@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "attemptId": "attempt-synthetic-001",
+  "backend": "herdr+codex",
+  "agentSessionRef": "session-synthetic-001",
+  "outcome": "done",
+  "validation": {
+    "status": "passed"
+  },
+  "commitRef": "0123456789abcdef0123456789abcdef01234567",
+  "pullRequestRef": "pr-42",
+  "summary": "Synthetic report is ready for controller validation."
+}

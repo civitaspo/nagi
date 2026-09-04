@@ -83,7 +83,8 @@ silently installs hooks or rewrites agent configuration.
 
 ## Normalized agent report
 
-Backends return a normalized, redacted report to Nagi. The provisional shape is:
+Backends return a normalized, redacted report to Nagi. The strict version-1
+shape is defined by [`tests/agent-report/v1.schema.json`](../../tests/agent-report/v1.schema.json):
 
 ```json
 {
@@ -105,9 +106,10 @@ Backends return a normalized, redacted report to Nagi. The provisional shape is:
 `commitRef` and `pullRequestRef` are optional and are omitted when absent.
 Reports are bounded and redacted. They contain no raw terminal output,
 prompts, provider payloads, tokens, or private machine paths. The exact JSON
-Schema, field bounds, source validation, and negative-case corpus are defined
-and verified by the dedicated `test: define and verify the normalized agent
-report` PR, the third PR in the sequence.
+Schema, field bounds, source validation, and negative cases are enforced by
+the `nagi::agent_report` parser and its server-free contract tests. The parser
+accepts only full lowercase commit hashes and numeric `pr-N` references, and
+`done` remains an observation that never authorizes Linear completion.
 
 ## Phase 0 sequencing and related decisions
 
