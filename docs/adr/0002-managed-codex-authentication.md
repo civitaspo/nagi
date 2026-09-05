@@ -46,6 +46,14 @@ commands fail closed. Raw CLI output, URLs, query strings, device codes,
 tokens, provider/account/workspace identifiers, paths, and environment values
 are never Nagi logs, evidence, SQLite data, or error text.
 
+Because executable verification, the official CLI's Keychain lookup, and
+private-runtime cleanup may be slow, `auth codex status` emits at most nine
+fixed, secret-free progress lines to Nagi's stderr. The lines identify only the
+bounded local stages and contain no paths, credentials, provider data,
+usernames, machine details, or timings. The exact stdout state and
+`CodexError` boundary are unchanged. Login and logout retain the official
+foreground stream behavior and do not add this status trace.
+
 After a foreground login or logout returns successfully, Nagi invokes the same
 bounded exact status command in the same managed home and reports success only
 when it observes the expected `signed_in` or `signed_out` state. A foreground
