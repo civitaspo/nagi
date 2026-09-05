@@ -74,6 +74,30 @@ the macOS Keychain. The child `HOME` remains the validated deployment home so
 the normal login Keychain can be found; only `CODEX_HOME` selects Codex's
 managed namespace.
 
+Codex CLI `0.151.0` may append a project trust record after the operator
+confirms a repository, for example:
+
+```toml
+[projects."/synthetic/repository"]
+trust_level = "trusted"
+```
+
+Nagi validates `config.toml` through a bounded, typed TOML parser rather than
+requiring the whole file to remain byte-for-byte equal to the two fixed
+authentication lines. The parser
+accepts only those required keys and a bounded map of Codex project records;
+every record must contain exactly `trust_level = "trusted"`. Unknown keys or
+sections, duplicate keys, alternate trust values, malformed TOML, non-canonical
+or unsafe paths, symlinks, and oversized files fail closed. Project paths are
+validated as existing owner-safe canonical directories and are local-sensitive
+data; they never appear in Nagi output or evidence. Authentication status
+validates allowed records without requiring a particular repository. Work
+reattachment and effect commands (`status`, `interrupt`, and `collect`)
+additionally require a trusted record for their exact canonical selected
+repository before attaching to a Herdr agent. `work start` validates all
+existing records but permits the selected record to be absent so Codex can
+perform its first interactive confirmation and append it during that launch.
+
 Before each operation, Nagi opens the exact pinned source with `O_NOFOLLOW`,
 checks every source parent for current-user POSIX ownership, owner search
 permission, and no group/other write permission (ordinary non-writable modes
@@ -107,6 +131,15 @@ before resolving a path, reading local state, or spawning a process.
 - **PATH lookup, arbitrary executable/configuration flags, or environment
   overrides:** rejected because they could replace the reviewed binary or
   change authentication semantics.
+- **Adopting the complete Codex configuration schema or accepting a wildcard
+  project trust:** rejected because either choice would allow unrelated
+  settings or repositories to change the managed authentication/work boundary.
+- **Ignoring project trust records or silently accepting an unsafe work
+  binding:** rejected because Codex legitimately persists trust after an
+  interactive confirmation, while reattachment/effect work commands must
+  remain bound to the selected canonical repository. `work start` is the
+  deliberate exception for a missing record because it may be the operation
+  that obtains that confirmation.
 - **Recursive cleanup on logout:** rejected because the managed home may
   contain files Nagi does not own.
 
@@ -114,6 +147,8 @@ before resolving a path, reading local state, or spawning a process.
 
 The user can complete the official browser flow while Nagi keeps a narrow,
 coarse result boundary and preserves restart persistence in the Keychain. The
+bounded config parser keeps the allowed post-confirmation project trust state
+usable for status while keeping work tied to the selected repository. The
 provenance manifest and executable digest bind the runtime to the reviewed
 Codex release. The keyring's path-derived namespace is a 64-bit truncated
 digest, not an independent OS identity; same-UID processes and legacy
@@ -122,10 +157,12 @@ last private-leaf identity check are preflight/boundary checks; a same-UID
 actor may still replace a path between validation and the next filesystem
 operation, and a fatal crash may leave an exact private runtime directory.
 The POSIX checks do not inspect extended ACL grants, so cross-UID resistance
-through ACLs is unproven and deferred. Those limits are explicitly deferred to
-a later identity/ACL and crash-cleanup gate. No app bundle, provisioning
-profile, entitlement, packaged/bundled helper executable, daemon, or provider
-fallback is introduced here.
+through ACLs is unproven and deferred. A same-UID actor can also replace a
+validated project path or config file between filesystem operations; the
+bounded parser and canonical-path checks are not a race-free path proof. Those
+limits are explicitly deferred to a later identity/ACL and crash-cleanup gate.
+No app bundle, provisioning profile, entitlement, packaged/bundled helper
+executable, daemon, or provider fallback is introduced here.
 
 ## References
 

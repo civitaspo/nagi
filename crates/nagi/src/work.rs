@@ -192,6 +192,11 @@ impl WorkConfig {
         .map_err(|_| WorkError::Configuration)?;
         codex::validate_codex_executable_directory(&raw.codex_executable_dir)
             .map_err(|_| WorkError::Configuration)?;
+        // `work start` may be the operation that obtains the first Codex
+        // project-trust confirmation. Validate every existing record here,
+        // but bind reattachment/effect commands to the selected repository
+        // in `production_backend` after the initial launch has had a chance
+        // to append Codex's record.
         codex::validate_managed_codex_home(&raw.codex_home)
             .map_err(|_| WorkError::Configuration)?;
         Ok(Self {
@@ -563,7 +568,7 @@ pub fn run_start(config_path: &Path) -> Result<WorkStatus, WorkError> {
         CredentialManager::production_read(config.client_id.clone(), config.callback_port)
             .map_err(ReadContractError::Credential)?;
     let issue = read::fetch_issue_input(&mut manager, &config.binding)?;
-    let mut backend = production_backend(&config)?;
+    let mut backend = production_backend(&config, false)?;
     let record = start_with(&config, &issue, &mut store, &mut backend, now_ms()?)?;
     Ok(WorkStatus::from_record(&record))
 }
@@ -604,7 +609,7 @@ pub fn run_status(config_path: &Path, attempt_id: &str) -> Result<WorkStatus, Wo
             | AttemptState::Blocked
             | AttemptState::InterruptPending
     ) {
-        let mut backend = production_backend(&config)?;
+        let mut backend = production_backend(&config, true)?;
         status_with_config(
             Some(&config),
             issue.as_ref(),
@@ -650,7 +655,7 @@ pub fn run_interrupt(config_path: &Path, attempt_id: &str) -> Result<WorkStatus,
     let config = WorkConfig::load(config_path)?;
     validate_attempt_id(attempt_id)?;
     let mut store = AttemptStore::open(&config.attempt_db)?;
-    let mut backend = production_backend(&config)?;
+    let mut backend = production_backend(&config, true)?;
     let record = interrupt_with(&mut store, &mut backend, attempt_id, now_ms()?)?;
     Ok(WorkStatus::from_record(&record))
 }
@@ -664,7 +669,7 @@ pub fn run_collect(
     let config = WorkConfig::load(config_path)?;
     validate_attempt_id(attempt_id)?;
     let mut store = AttemptStore::open(&config.attempt_db)?;
-    let mut backend = production_backend(&config)?;
+    let mut backend = production_backend(&config, true)?;
     collect_with(&mut store, &mut backend, attempt_id, report_path, now_ms()?)
 }
 
@@ -690,9 +695,16 @@ pub fn render_collect(result: &WorkCollectResult) -> Result<String, WorkError> {
     serde_json::to_string(result).map_err(|_| WorkError::LocalRuntime)
 }
 
-fn production_backend(config: &WorkConfig) -> Result<ProductionHerdrCodexRunner, WorkError> {
+fn production_backend(
+    config: &WorkConfig,
+    require_repository_trust: bool,
+) -> Result<ProductionHerdrCodexRunner, WorkError> {
     codex::validate_codex_executable_directory(&config.codex_executable_dir)?;
-    codex::validate_managed_codex_home(&config.codex_home)?;
+    if require_repository_trust {
+        codex::validate_managed_codex_home_for_repository(&config.codex_home, &config.repository)?;
+    } else {
+        codex::validate_managed_codex_home(&config.codex_home)?;
+    }
     let runtime = HerdrRuntime::new(&config.herdr_session, &config.herdr_home)?;
     let process = HerdrProcessConfig::new(
         &config.herdr_executable,
