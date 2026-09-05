@@ -122,16 +122,28 @@ status_stdout="${contract_tmp}/status-stdout"
 status_stderr="${contract_tmp}/status-stderr"
 expected_signed_in="${contract_tmp}/expected-signed-in"
 expected_signed_out="${contract_tmp}/expected-signed-out"
+expected_status_progress="${contract_tmp}/expected-status-progress"
 : >"${status_stdout}"
 : >"${status_stderr}"
 printf 'signed_in\n' >"${expected_signed_in}"
 printf 'signed_out\n' >"${expected_signed_out}"
+printf '%s\n' \
+  'nagi auth codex: validating deployment environment' \
+  'nagi auth codex: verifying pinned Codex executable' \
+  'nagi auth codex: preparing managed Codex home' \
+  'nagi auth codex: validating managed Codex home' \
+  'nagi auth codex: preparing private Codex runtime' \
+  'nagi auth codex: waiting for Codex authentication status' \
+  'nagi auth codex: Codex authentication status command completed' \
+  'nagi auth codex: cleaning private Codex runtime' \
+  'nagi auth codex: Codex authentication status check complete' \
+  >"${expected_status_progress}"
 
 # An intentionally non-default parent CODEX_HOME proves the child cannot
 # inherit the caller's selector. Nagi replaces it with the managed deployment
 # location after clearing the environment; all command output remains private.
 if live_supervise_child_without_file_limit \
-  "${status_stdout}" "${status_stderr}" 65536 400 \
+  "${status_stdout}" "${status_stderr}" 65536 512 \
   /usr/bin/env -i \
   PATH=/usr/bin:/bin \
   HOME="${home_directory}" \
@@ -150,7 +162,7 @@ if ! /usr/bin/cmp -s "${status_stdout}" "${expected_signed_in}" \
   echo "Managed Codex authentication contract returned an unexpected status boundary." >&2
   exit 1
 fi
-if [[ -s "${status_stderr}" ]]; then
+if ! /usr/bin/cmp -s "${status_stderr}" "${expected_status_progress}"; then
   echo "Managed Codex authentication contract returned unexpected diagnostics." >&2
   exit 1
 fi

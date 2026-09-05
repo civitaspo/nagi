@@ -127,14 +127,25 @@ pub(crate) fn run(operation: CodexOperation) -> Result<CodexStatus, CodexError> 
 
     #[cfg(target_os = "macos")]
     {
+        let mut progress = io::stderr();
+        let progress_enabled = operation == CodexOperation::Status;
+        let mut progress_next = 0;
+        report_status_progress(&mut progress, &mut progress_next, progress_enabled);
         let home = deployment_home()?;
+
+        report_status_progress(&mut progress, &mut progress_next, progress_enabled);
         let mut source = open_verified_codex_executable(&home)?;
+
+        report_status_progress(&mut progress, &mut progress_next, progress_enabled);
         let managed_home = prepare_managed_home(&home)?;
         // Re-run the full managed-home gate immediately before invoking the
         // status/login/logout operation. This keeps the parser on the same
         // boundary as the command and accepts Codex's bounded trust metadata.
+        report_status_progress(&mut progress, &mut progress_next, progress_enabled);
         validate_managed_codex_home(&managed_home)?;
         let runtime_parent = managed_home.parent().ok_or(CodexError::Configuration)?;
+
+        report_status_progress(&mut progress, &mut progress_next, progress_enabled);
         let mut executable = PrivateCodexExecutable::from_verified_source(
             &mut source,
             runtime_parent,
@@ -154,9 +165,16 @@ pub(crate) fn run(operation: CodexOperation) -> Result<CodexStatus, CodexError> 
                 .map(|()| CodexStatus::SignedIn),
             CodexOperation::Logout => run_foreground_and_verify(&spec, CodexStatus::SignedOut)
                 .map(|()| CodexStatus::SignedOut),
-            CodexOperation::Status => run_status(&spec),
+            CodexOperation::Status => {
+                run_status_with_progress(&spec, &mut progress, &mut progress_next)
+            }
         };
-        finish_operation(result, executable.cleanup())
+        report_status_progress(&mut progress, &mut progress_next, progress_enabled);
+        let result = finish_operation(result, executable.cleanup());
+        if result.is_ok() {
+            report_status_progress(&mut progress, &mut progress_next, progress_enabled);
+        }
+        result
     }
 }
 
@@ -371,6 +389,18 @@ const STATUS_OUTPUT_LIMIT: usize = 64 * 1024;
 #[cfg(target_os = "macos")]
 const STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 #[cfg(target_os = "macos")]
+const STATUS_PROGRESS_MESSAGES: [&str; 9] = [
+    "nagi auth codex: validating deployment environment\n",
+    "nagi auth codex: verifying pinned Codex executable\n",
+    "nagi auth codex: preparing managed Codex home\n",
+    "nagi auth codex: validating managed Codex home\n",
+    "nagi auth codex: preparing private Codex runtime\n",
+    "nagi auth codex: waiting for Codex authentication status\n",
+    "nagi auth codex: Codex authentication status command completed\n",
+    "nagi auth codex: cleaning private Codex runtime\n",
+    "nagi auth codex: Codex authentication status check complete\n",
+];
+#[cfg(target_os = "macos")]
 const MAX_CODEX_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
 #[cfg(target_os = "macos")]
 const PRIVATE_RUNTIME_DIRECTORY_PREFIX: &str = ".nagi-codex-runtime-";
@@ -411,6 +441,25 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use std::process::{Command, ExitStatus, Stdio};
 #[cfg(target_os = "macos")]
 use zeroize::{Zeroize, Zeroizing};
+
+/// Emits one fixed status trace line without exposing local-sensitive data.
+///
+/// The status command can spend most of its time hashing the pinned executable
+/// and waiting for the official CLI's Keychain lookup. The progress lines make
+/// those waits observable while keeping all paths, credentials, provider
+/// output, and timing details out of stderr. I/O failures are ignored so a
+/// broken diagnostic stream cannot change the authentication result.
+#[cfg(target_os = "macos")]
+fn report_status_progress(writer: &mut dyn Write, next: &mut usize, enabled: bool) {
+    if !enabled {
+        return;
+    }
+    if let Some(message) = STATUS_PROGRESS_MESSAGES.get(*next) {
+        *next += 1;
+        let _ = writer.write_all(message.as_bytes());
+        let _ = writer.flush();
+    }
+}
 
 #[cfg(target_os = "macos")]
 fn deployment_home() -> Result<PathBuf, CodexError> {
@@ -1218,6 +1267,18 @@ fn run_foreground_and_verify(spec: &CommandSpec, expected: CodexStatus) -> Resul
 
 #[cfg(target_os = "macos")]
 fn run_status(spec: &CommandSpec) -> Result<CodexStatus, CodexError> {
+    let mut progress = io::sink();
+    let mut next = 0;
+    run_status_with_progress(spec, &mut progress, &mut next)
+}
+
+#[cfg(target_os = "macos")]
+fn run_status_with_progress(
+    spec: &CommandSpec,
+    progress: &mut dyn Write,
+    next: &mut usize,
+) -> Result<CodexStatus, CodexError> {
+    report_status_progress(progress, next, true);
     let captured = crate::process_supervisor::run_bounded_capture(
         spec.to_command()?,
         STATUS_TIMEOUT,
@@ -1229,6 +1290,7 @@ fn run_status(spec: &CommandSpec) -> Result<CodexStatus, CodexError> {
         crate::process_supervisor::CaptureError::TimedOut => CodexError::StatusTimedOut,
         crate::process_supervisor::CaptureError::OutputTooLarge => CodexError::StatusOutputTooLarge,
     })?;
+    report_status_progress(progress, next, true);
     classify_status(captured.status, &captured.stdout, &captured.stderr)
 }
 
@@ -1270,6 +1332,37 @@ mod tests {
     fn status_display_is_coarse_and_closed() {
         assert_eq!(CodexStatus::SignedIn.to_string(), "signed_in");
         assert_eq!(CodexStatus::SignedOut.to_string(), "signed_out");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn status_progress_is_fixed_bounded_and_secret_free() {
+        let mut output = Vec::new();
+        let mut next = 0;
+        for _ in STATUS_PROGRESS_MESSAGES {
+            report_status_progress(&mut output, &mut next, true);
+        }
+        // A future call site must not be able to turn a local-sensitive status
+        // trace into an unbounded stream.
+        report_status_progress(&mut output, &mut next, true);
+        assert_eq!(output, STATUS_PROGRESS_MESSAGES.concat().as_bytes());
+
+        let output_text = std::str::from_utf8(&output).expect("fixed progress is UTF-8");
+        for forbidden in [
+            "/", "token", "password", "username", "http", "https", "ms", "second",
+        ] {
+            assert!(
+                !output_text.contains(forbidden),
+                "progress leaked forbidden detail: {forbidden}"
+            );
+        }
+
+        let mut disabled = Vec::new();
+        let mut disabled_next = 0;
+        for _ in STATUS_PROGRESS_MESSAGES {
+            report_status_progress(&mut disabled, &mut disabled_next, false);
+        }
+        assert!(disabled.is_empty());
     }
 
     #[cfg(target_os = "macos")]
@@ -2006,6 +2099,35 @@ trust_level = "trusted"
             classify_status(success, b"", &[0xff, 0xfe]),
             Err(CodexError::StatusUnavailable)
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn status_progress_brackets_the_private_status_command() {
+        let root = test_root();
+        let executable = write_test_executable(
+            &root,
+            "fake-codex-progress",
+            b"#!/bin/sh\nprintf '%s\\n' 'Logged in using ChatGPT' >&2\n",
+        );
+        let spec = CommandSpec::new(
+            executable,
+            CodexOperation::Status,
+            &home_path(&root),
+            &root,
+            Vec::<(OsString, OsString)>::new(),
+        )
+        .expect("status command spec");
+        let mut progress = Vec::new();
+        // The outer operation reports the five setup stages before invoking
+        // this status-only command.
+        let mut progress_next = 5;
+        assert_eq!(
+            run_status_with_progress(&spec, &mut progress, &mut progress_next),
+            Ok(CodexStatus::SignedIn)
+        );
+        assert_eq!(progress, STATUS_PROGRESS_MESSAGES[5..7].concat().as_bytes());
+        remove_test_root(&root);
     }
 
     #[cfg(target_os = "macos")]
