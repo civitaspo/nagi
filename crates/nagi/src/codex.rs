@@ -8,7 +8,15 @@
 //! authorized status call may consult the managed Keychain namespace through
 //! the official CLI.
 
+#[cfg(target_os = "macos")]
+use serde::Deserialize;
+#[cfg(target_os = "macos")]
+use std::collections::BTreeMap;
 use std::fmt;
+#[cfg(target_os = "macos")]
+use std::fs;
+#[cfg(target_os = "macos")]
+use std::path::{Component, Path, PathBuf};
 
 /// The closed set of Codex authentication operations exposed by Nagi.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -122,6 +130,10 @@ pub(crate) fn run(operation: CodexOperation) -> Result<CodexStatus, CodexError> 
         let home = deployment_home()?;
         let mut source = open_verified_codex_executable(&home)?;
         let managed_home = prepare_managed_home(&home)?;
+        // Re-run the full managed-home gate immediately before invoking the
+        // status/login/logout operation. This keeps the parser on the same
+        // boundary as the command and accepts Codex's bounded trust metadata.
+        validate_managed_codex_home(&managed_home)?;
         let runtime_parent = managed_home.parent().ok_or(CodexError::Configuration)?;
         let mut executable = PrivateCodexExecutable::from_verified_source(
             &mut source,
@@ -175,6 +187,184 @@ const MANAGED_MARKER: &[u8] = b"nagi managed Codex home v1\n";
 const MANAGED_CONFIG: &[u8] =
     b"cli_auth_credentials_store = \"keyring\"\nforced_login_method = \"chatgpt\"\n";
 #[cfg(target_os = "macos")]
+const MAX_MANAGED_CONFIG_BYTES: u64 = 64 * 1024;
+#[cfg(target_os = "macos")]
+const MAX_PROJECT_TRUST_ENTRIES: usize = 128;
+#[cfg(target_os = "macos")]
+const MAX_PROJECT_TRUST_PATH_BYTES: usize = 4 * 1024;
+
+/// The only configuration document that Nagi accepts in its managed Codex
+/// home. Codex owns this file after login and may append project trust
+/// metadata, so the parser is deliberately narrower than Codex's complete
+/// configuration schema.
+#[cfg(target_os = "macos")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedConfigDocument {
+    cli_auth_credentials_store: String,
+    forced_login_method: String,
+    #[serde(default)]
+    projects: Option<BTreeMap<String, ManagedProjectDocument>>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedProjectDocument {
+    trust_level: String,
+}
+
+/// Validates the bounded managed configuration and, when supplied, requires
+/// one trusted entry for the exact selected repository. The returned data is
+/// intentionally empty: project paths are local-sensitive and must not leave
+/// this validation boundary.
+#[cfg(target_os = "macos")]
+fn validate_managed_config(
+    contents: &[u8],
+    expected_repository: Option<&Path>,
+) -> Result<(), CodexError> {
+    if contents.len() as u64 > MAX_MANAGED_CONFIG_BYTES {
+        return Err(CodexError::ManagedHomeUnsafe);
+    }
+    let text = std::str::from_utf8(contents).map_err(|_| CodexError::ManagedHomeUnsafe)?;
+    let document: ManagedConfigDocument =
+        toml::from_str(text).map_err(|_| CodexError::ManagedHomeUnsafe)?;
+    if document.cli_auth_credentials_store != "keyring" || document.forced_login_method != "chatgpt"
+    {
+        return Err(CodexError::ManagedHomeUnsafe);
+    }
+
+    let Some(projects) = document.projects else {
+        if expected_repository.is_some() {
+            return Err(CodexError::ManagedHomeUnsafe);
+        }
+        return Ok(());
+    };
+    if projects.is_empty() || projects.len() > MAX_PROJECT_TRUST_ENTRIES {
+        return Err(CodexError::ManagedHomeUnsafe);
+    }
+
+    let mut selected_repository_is_trusted = false;
+    for (path_text, project) in projects {
+        if project.trust_level != "trusted" {
+            return Err(CodexError::ManagedHomeUnsafe);
+        }
+        let path = PathBuf::from(path_text);
+        validate_project_trust_path_syntax(&path)?;
+        if expected_repository.is_some_and(|repository| path == repository) {
+            validate_project_trust_path(&path)?;
+            selected_repository_is_trusted = true;
+        }
+    }
+
+    if let Some(repository) = expected_repository {
+        validate_project_trust_path(repository)?;
+        if !selected_repository_is_trusted {
+            return Err(CodexError::ManagedHomeUnsafe);
+        }
+    }
+    Ok(())
+}
+
+/// Validates one Codex project-trust key as an exact canonical, owner-safe
+/// directory. Trust metadata must never silently follow a symlink or point at
+/// a path whose spelling resolves somewhere else.
+#[cfg(target_os = "macos")]
+fn validate_project_trust_path(path: &Path) -> Result<PathBuf, CodexError> {
+    validate_project_trust_path_syntax(path)?;
+
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(std::path::MAIN_SEPARATOR.to_string()),
+            Component::Normal(value) => current.push(value),
+            Component::CurDir | Component::ParentDir => {
+                return Err(CodexError::ManagedHomeUnsafe);
+            }
+        }
+        let metadata = fs::symlink_metadata(&current).map_err(|_| CodexError::ManagedHomeUnsafe)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(CodexError::ManagedHomeUnsafe);
+        }
+        if current != path {
+            validate_project_trust_ancestor(&metadata)?;
+        }
+    }
+
+    let metadata = fs::symlink_metadata(path).map_err(|_| CodexError::ManagedHomeUnsafe)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(CodexError::ManagedHomeUnsafe);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mode = metadata.permissions().mode();
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || mode & 0o500 != 0o500
+            || mode & 0o022 != 0
+            || mode & 0o7000 != 0
+        {
+            return Err(CodexError::ManagedHomeUnsafe);
+        }
+    }
+    let canonical = fs::canonicalize(path).map_err(|_| CodexError::ManagedHomeUnsafe)?;
+    if canonical != path {
+        return Err(CodexError::ManagedHomeUnsafe);
+    }
+    Ok(canonical)
+}
+
+/// Validates the project key without consulting the filesystem. Authentication
+/// status and logout must remain usable when Codex retains a trust record for a
+/// repository that has since moved or been removed; work binding performs the
+/// additional live path and ownership checks below.
+#[cfg(target_os = "macos")]
+fn validate_project_trust_path_syntax(path: &Path) -> Result<(), CodexError> {
+    let text = path.to_str().ok_or(CodexError::ManagedHomeUnsafe)?;
+    if !path.is_absolute()
+        || text.len() > MAX_PROJECT_TRUST_PATH_BYTES
+        || text.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(CodexError::ManagedHomeUnsafe);
+    }
+
+    let normalized =
+        path.components().try_fold(
+            PathBuf::new(),
+            |mut normalized, component| match component {
+                Component::CurDir | Component::ParentDir => Err(CodexError::ManagedHomeUnsafe),
+                Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                    normalized.push(component.as_os_str());
+                    Ok(normalized)
+                }
+            },
+        )?;
+    if normalized == Path::new(std::path::MAIN_SEPARATOR_STR)
+        || normalized != path
+        || normalized.to_str().ok_or(CodexError::ManagedHomeUnsafe)? != text
+    {
+        return Err(CodexError::ManagedHomeUnsafe);
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", unix))]
+fn validate_project_trust_ancestor(metadata: &fs::Metadata) -> Result<(), CodexError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let uid = metadata.uid();
+    let mode = metadata.permissions().mode();
+    let current_uid = unsafe { libc::geteuid() };
+    if (uid != current_uid && uid != 0)
+        || mode & 0o6000 != 0
+        || (mode & 0o022 != 0 && !(uid == 0 && mode & 0o1000 != 0))
+    {
+        return Err(CodexError::ManagedHomeUnsafe);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 const SAFE_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 #[cfg(target_os = "macos")]
 const STATUS_OUTPUT_LIMIT: usize = 64 * 1024;
@@ -212,17 +402,15 @@ use sha2::{Digest, Sha256};
 #[cfg(target_os = "macos")]
 use std::ffi::{OsStr, OsString};
 #[cfg(target_os = "macos")]
-use std::fs::{self, OpenOptions};
+use std::fs::OpenOptions;
 #[cfg(target_os = "macos")]
 use std::io::{self, Read, Seek, Write};
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 #[cfg(target_os = "macos")]
-use std::path::{Component, Path, PathBuf};
-#[cfg(target_os = "macos")]
 use std::process::{Command, ExitStatus, Stdio};
 #[cfg(target_os = "macos")]
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(target_os = "macos")]
 fn deployment_home() -> Result<PathBuf, CodexError> {
@@ -274,11 +462,30 @@ pub(crate) fn validate_codex_executable_directory(directory: &Path) -> Result<()
 /// modifying it.
 #[cfg(target_os = "macos")]
 pub(crate) fn validate_managed_codex_home(path: &Path) -> Result<(), CodexError> {
+    validate_managed_codex_home_inner(path, None)
+}
+
+/// Verifies an explicitly selected managed `CODEX_HOME` and binds its Codex
+/// trust metadata to one exact canonical repository. Work commands use this
+/// stricter form because Herdr will launch the vendor CLI in that repository.
+#[cfg(target_os = "macos")]
+pub(crate) fn validate_managed_codex_home_for_repository(
+    path: &Path,
+    repository: &Path,
+) -> Result<(), CodexError> {
+    validate_managed_codex_home_inner(path, Some(repository))
+}
+
+#[cfg(target_os = "macos")]
+fn validate_managed_codex_home_inner(
+    path: &Path,
+    expected_repository: Option<&Path>,
+) -> Result<(), CodexError> {
     validate_path_text(path).map_err(|_| CodexError::Configuration)?;
     validate_no_symlink_components(path).map_err(|_| CodexError::ManagedHomeUnsafe)?;
     validate_existing_directory(path, true).map_err(|_| CodexError::ManagedHomeUnsafe)?;
     verify_private_file(&path.join(MANAGED_MARKER_NAME), MANAGED_MARKER)?;
-    verify_private_file(&path.join(MANAGED_CONFIG_NAME), MANAGED_CONFIG)?;
+    verify_managed_config_file(&path.join(MANAGED_CONFIG_NAME), expected_repository)?;
     Ok(())
 }
 
@@ -680,7 +887,7 @@ fn create_or_verify_managed_home(path: &Path) -> Result<(), CodexError> {
             validate_directory_metadata(&metadata, true)
                 .map_err(|_| CodexError::ManagedHomeUnsafe)?;
             verify_private_file(&path.join(MANAGED_MARKER_NAME), MANAGED_MARKER)?;
-            verify_private_file(&path.join(MANAGED_CONFIG_NAME), MANAGED_CONFIG)?;
+            verify_managed_config_file(&path.join(MANAGED_CONFIG_NAME), None)?;
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             create_private_directory(path).map_err(|_| CodexError::ManagedHomeUnavailable)?;
@@ -719,6 +926,39 @@ fn create_private_file(path: &Path, contents: &[u8]) -> Result<(), CodexError> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
         .map_err(|_| CodexError::ManagedHomeUnavailable)?;
     verify_private_file(path, contents)
+}
+
+#[cfg(target_os = "macos")]
+fn verify_managed_config_file(
+    path: &Path,
+    expected_repository: Option<&Path>,
+) -> Result<(), CodexError> {
+    validate_path_text(path).map_err(|_| CodexError::ManagedHomeUnsafe)?;
+    validate_no_symlink_components(path).map_err(|_| CodexError::ManagedHomeUnsafe)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|_| CodexError::ManagedHomeUnsafe)?;
+    let metadata = file.metadata().map_err(|_| CodexError::ManagedHomeUnsafe)?;
+    let raw_mode = metadata.permissions().mode();
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.nlink() != 1
+        || raw_mode & 0o7000 != 0
+        || raw_mode & 0o777 != 0o600
+        || metadata.len() > MAX_MANAGED_CONFIG_BYTES
+    {
+        return Err(CodexError::ManagedHomeUnsafe);
+    }
+    let mut observed = Zeroizing::new(Vec::with_capacity(MAX_MANAGED_CONFIG_BYTES as usize));
+    file.take(MAX_MANAGED_CONFIG_BYTES.saturating_add(1))
+        .read_to_end(&mut observed)
+        .map_err(|_| CodexError::ManagedHomeUnsafe)?;
+    if observed.len() as u64 > MAX_MANAGED_CONFIG_BYTES {
+        return Err(CodexError::ManagedHomeUnsafe);
+    }
+    validate_managed_config(&observed, expected_repository)
 }
 
 #[cfg(target_os = "macos")]
@@ -1034,6 +1274,160 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn managed_config_accepts_only_fixed_auth_and_trusted_project_shape() {
+        assert_eq!(validate_managed_config(MANAGED_CONFIG, None), Ok(()));
+        for (index, contents) in [
+            br#"cli_auth_credentials_store = "file"
+forced_login_method = "chatgpt"
+"#
+            .as_slice(),
+            br#"cli_auth_credentials_store = "keyring"
+forced_login_method = "api_key"
+"#
+            .as_slice(),
+            br#"cli_auth_credentials_store = "keyring"
+forced_login_method = "chatgpt"
+unknown = true
+"#
+            .as_slice(),
+            br#"cli_auth_credentials_store = "keyring"
+forced_login_method = "chatgpt"
+[unknown]
+value = true
+"#
+            .as_slice(),
+            br#"cli_auth_credentials_store = "keyring"
+forced_login_method = "chatgpt"
+[projects."relative"]
+trust_level = "trusted"
+"#
+            .as_slice(),
+            br#"cli_auth_credentials_store = "keyring"
+forced_login_method = "chatgpt"
+[projects."/synthetic/../repository"]
+trust_level = "trusted"
+"#
+            .as_slice(),
+            br#"cli_auth_credentials_store = "keyring"
+forced_login_method = "chatgpt"
+[projects."/synthetic//repository"]
+trust_level = "trusted"
+"#
+            .as_slice(),
+            br#"cli_auth_credentials_store = "keyring"
+forced_login_method = "chatgpt"
+[projects."/synthetic/repository/"]
+trust_level = "trusted"
+"#
+            .as_slice(),
+            br#"cli_auth_credentials_store = "keyring"
+forced_login_method = "chatgpt"
+[projects."/synthetic/project"]
+trust_level = "untrusted"
+"#
+            .as_slice(),
+            br#"cli_auth_credentials_store = "keyring"
+forced_login_method = "chatgpt"
+[projects."/synthetic/project"]
+unknown = "trusted"
+"#
+            .as_slice(),
+            br#"cli_auth_credentials_store = "keyring"
+forced_login_method = "chatgpt"
+[projects."/synthetic/project"]
+trust_level = "trusted"
+[projects."/synthetic/project"]
+trust_level = "trusted"
+"#
+            .as_slice(),
+            br#"cli_auth_credentials_store = "keyring"
+forced_login_method = "chatgpt"
+cli_auth_credentials_store = "keyring"
+"#
+            .as_slice(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(
+                validate_managed_config(contents, None).is_err(),
+                "unexpectedly accepted invalid fixture {index}"
+            );
+        }
+
+        let mut oversized = MANAGED_CONFIG.to_vec();
+        oversized.resize(MAX_MANAGED_CONFIG_BYTES as usize + 1, b' ');
+        assert_eq!(
+            validate_managed_config(&oversized, None),
+            Err(CodexError::ManagedHomeUnsafe)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn auth_config_validation_accepts_a_stale_project_trust_record() {
+        let contents = br#"cli_auth_credentials_store = "keyring"
+forced_login_method = "chatgpt"
+
+[projects."/synthetic/stale-repository"]
+trust_level = "trusted"
+"#;
+        assert_eq!(validate_managed_config(contents, None), Ok(()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn managed_config_accepts_codex_project_trust_and_binds_work_repository() {
+        let root = test_root();
+        let repository = root.join("repository");
+        let other_repository = root.join("other-repository");
+        fs::create_dir(&repository).expect("repository");
+        fs::create_dir(&other_repository).expect("other repository");
+        let contents = format!(
+            "{}\n[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+            std::str::from_utf8(MANAGED_CONFIG).expect("base config"),
+            repository.display()
+        );
+        assert_eq!(validate_managed_config(contents.as_bytes(), None), Ok(()));
+        assert_eq!(
+            validate_managed_config(contents.as_bytes(), Some(&repository)),
+            Ok(())
+        );
+        assert_eq!(
+            validate_managed_config(contents.as_bytes(), Some(&other_repository)),
+            Err(CodexError::ManagedHomeUnsafe)
+        );
+        remove_test_root(&root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn managed_config_rejects_symlink_or_unsafe_project_paths() {
+        let root = test_root();
+        let repository = root.join("repository");
+        fs::create_dir(&repository).expect("repository");
+        let symlinked = root.join("symlinked");
+        symlink(&repository, &symlinked).expect("symlink");
+        let symlink_config = format!(
+            "{}\n[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+            std::str::from_utf8(MANAGED_CONFIG).expect("base config"),
+            symlinked.display()
+        );
+        assert!(validate_managed_config(symlink_config.as_bytes(), Some(&symlinked)).is_err());
+
+        fs::set_permissions(&repository, fs::Permissions::from_mode(0o702))
+            .expect("writable repository mode");
+        let unsafe_config = format!(
+            "{}\n[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+            std::str::from_utf8(MANAGED_CONFIG).expect("base config"),
+            repository.display()
+        );
+        assert!(validate_managed_config(unsafe_config.as_bytes(), Some(&repository)).is_err());
+        remove_test_root(&root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn cleanup_failure_is_visible_even_when_operation_also_fails() {
         assert_eq!(
             finish_operation(Ok(CodexStatus::SignedIn), Ok(())),
@@ -1117,6 +1511,16 @@ mod tests {
             fs::read(first.join("opaque-cache")).expect("preserved cache"),
             b"opaque test cache"
         );
+        let repository = root.join("repository");
+        fs::create_dir(&repository).expect("trusted repository");
+        let config = format!(
+            "{}\n[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+            std::str::from_utf8(MANAGED_CONFIG).expect("base config"),
+            repository.display()
+        );
+        fs::write(first.join(MANAGED_CONFIG_NAME), config).expect("Codex trust update");
+        let third = prepare_managed_home(&root).expect("restart after Codex trust update");
+        assert_eq!(third, first);
         remove_test_root(&root);
     }
 
@@ -1506,6 +1910,58 @@ mod tests {
                 assert!(!environment.contains_key(OsStr::new(name)), "{name}");
             }
         }
+        remove_test_root(&root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn auth_status_and_logout_remain_usable_with_stale_project_trust() {
+        let root = test_root();
+        let managed = prepare_managed_home(&root).expect("managed home");
+        fs::write(
+            managed.join(MANAGED_CONFIG_NAME),
+            br#"cli_auth_credentials_store = "keyring"
+forced_login_method = "chatgpt"
+
+[projects."/synthetic/stale-repository"]
+trust_level = "trusted"
+"#,
+        )
+        .expect("stale Codex trust update");
+        validate_managed_codex_home(&managed).expect("stale project does not block auth");
+
+        let executable = write_test_executable(
+            &root,
+            "fake-codex-status",
+            b"#!/bin/sh\nprintf '%s\\n' 'Logged in using ChatGPT' >&2\n",
+        );
+        let spec = CommandSpec::new(
+            executable,
+            CodexOperation::Status,
+            &managed,
+            &root,
+            Vec::<(OsString, OsString)>::new(),
+        )
+        .expect("status command spec");
+        assert_eq!(run_status(&spec), Ok(CodexStatus::SignedIn));
+
+        let executable = write_test_executable(
+            &root,
+            "fake-codex-logout-with-stale-project",
+            b"#!/bin/sh\nif [ \"$1\" = logout ]; then exit 0; fi\nif [ \"$1\" = login ] && [ \"$2\" = status ]; then printf '%s\\n' 'Not logged in' >&2; exit 1; fi\nexit 9\n",
+        );
+        let spec = CommandSpec::new(
+            executable,
+            CodexOperation::Logout,
+            &managed,
+            &root,
+            Vec::<(OsString, OsString)>::new(),
+        )
+        .expect("logout command spec");
+        assert_eq!(
+            run_foreground_and_verify(&spec, CodexStatus::SignedOut),
+            Ok(())
+        );
         remove_test_root(&root);
     }
 

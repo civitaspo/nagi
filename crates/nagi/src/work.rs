@@ -192,6 +192,11 @@ impl WorkConfig {
         .map_err(|_| WorkError::Configuration)?;
         codex::validate_codex_executable_directory(&raw.codex_executable_dir)
             .map_err(|_| WorkError::Configuration)?;
+        // `work start` may be the operation that obtains the first Codex
+        // project-trust confirmation. Validate every existing record here,
+        // but bind reattachment/effect commands to the selected repository
+        // in `production_backend` after the initial launch has had a chance
+        // to append Codex's record.
         codex::validate_managed_codex_home(&raw.codex_home)
             .map_err(|_| WorkError::Configuration)?;
         Ok(Self {
@@ -467,6 +472,12 @@ fn status_with_config<B: AgentBackend>(
     ) {
         return Ok(current);
     }
+    if let Some(config) = config {
+        // A pre-launch recovery may have just delivered the first prompt and
+        // let Codex append its trust record. Do not attach or observe until
+        // that record is now bound to the exact selected repository.
+        codex::validate_managed_codex_home_for_repository(&config.codex_home, &config.repository)?;
+    }
     reconcile_observation(store, backend, current, now_ms, None)
 }
 
@@ -563,7 +574,7 @@ pub fn run_start(config_path: &Path) -> Result<WorkStatus, WorkError> {
         CredentialManager::production_read(config.client_id.clone(), config.callback_port)
             .map_err(ReadContractError::Credential)?;
     let issue = read::fetch_issue_input(&mut manager, &config.binding)?;
-    let mut backend = production_backend(&config)?;
+    let mut backend = production_backend(&config, false)?;
     let record = start_with(&config, &issue, &mut store, &mut backend, now_ms()?)?;
     Ok(WorkStatus::from_record(&record))
 }
@@ -604,7 +615,8 @@ pub fn run_status(config_path: &Path, attempt_id: &str) -> Result<WorkStatus, Wo
             | AttemptState::Blocked
             | AttemptState::InterruptPending
     ) {
-        let mut backend = production_backend(&config)?;
+        let mut backend =
+            production_backend(&config, status_requires_repository_trust(current.state()))?;
         status_with_config(
             Some(&config),
             issue.as_ref(),
@@ -650,7 +662,7 @@ pub fn run_interrupt(config_path: &Path, attempt_id: &str) -> Result<WorkStatus,
     let config = WorkConfig::load(config_path)?;
     validate_attempt_id(attempt_id)?;
     let mut store = AttemptStore::open(&config.attempt_db)?;
-    let mut backend = production_backend(&config)?;
+    let mut backend = production_backend(&config, true)?;
     let record = interrupt_with(&mut store, &mut backend, attempt_id, now_ms()?)?;
     Ok(WorkStatus::from_record(&record))
 }
@@ -664,7 +676,7 @@ pub fn run_collect(
     let config = WorkConfig::load(config_path)?;
     validate_attempt_id(attempt_id)?;
     let mut store = AttemptStore::open(&config.attempt_db)?;
-    let mut backend = production_backend(&config)?;
+    let mut backend = production_backend(&config, true)?;
     collect_with(&mut store, &mut backend, attempt_id, report_path, now_ms()?)
 }
 
@@ -690,9 +702,16 @@ pub fn render_collect(result: &WorkCollectResult) -> Result<String, WorkError> {
     serde_json::to_string(result).map_err(|_| WorkError::LocalRuntime)
 }
 
-fn production_backend(config: &WorkConfig) -> Result<ProductionHerdrCodexRunner, WorkError> {
+fn production_backend(
+    config: &WorkConfig,
+    require_repository_trust: bool,
+) -> Result<ProductionHerdrCodexRunner, WorkError> {
     codex::validate_codex_executable_directory(&config.codex_executable_dir)?;
-    codex::validate_managed_codex_home(&config.codex_home)?;
+    if require_repository_trust {
+        codex::validate_managed_codex_home_for_repository(&config.codex_home, &config.repository)?;
+    } else {
+        codex::validate_managed_codex_home(&config.codex_home)?;
+    }
     let runtime = HerdrRuntime::new(&config.herdr_session, &config.herdr_home)?;
     let process = HerdrProcessConfig::new(
         &config.herdr_executable,
@@ -703,6 +722,16 @@ fn production_backend(config: &WorkConfig) -> Result<ProductionHerdrCodexRunner,
     .with_agent_executable_dir(&config.codex_executable_dir)?
     .with_codex_home(&config.codex_home)?;
     ProductionHerdrCodexRunner::connect(process).map_err(WorkError::from)
+}
+
+fn status_requires_repository_trust(state: AttemptState) -> bool {
+    !matches!(
+        state,
+        AttemptState::Created
+            | AttemptState::WorkspacePending
+            | AttemptState::WorkspaceReady
+            | AttemptState::AgentPending
+    )
 }
 
 fn reconcile_start_with<B: AgentBackend>(
@@ -790,6 +819,15 @@ fn reconcile_start_with<B: AgentBackend>(
             let Some(issue) = issue else {
                 return Ok(current);
             };
+            if let Some(config) = config {
+                // Agent startup is the point at which Codex can append the
+                // first project-trust record. Once an agent is ready, require
+                // that record before delivering a work prompt.
+                codex::validate_managed_codex_home_for_repository(
+                    &config.codex_home,
+                    &config.repository,
+                )?;
+            }
             let workspace_ref = current
                 .workspace_ref()
                 .ok_or(WorkError::Attempt(AttemptStoreError::Database))?;
@@ -1349,6 +1387,34 @@ mod tests {
             "token": "secret"
         });
         assert!(serde_json::from_value::<WorkConfigFile>(value).is_err());
+    }
+
+    #[test]
+    fn status_repository_trust_gate_allows_only_prelaunch_recovery() {
+        for state in [
+            AttemptState::Created,
+            AttemptState::WorkspacePending,
+            AttemptState::WorkspaceReady,
+            AttemptState::AgentPending,
+        ] {
+            assert!(
+                !status_requires_repository_trust(state),
+                "pre-launch state unexpectedly requires trust: {state:?}"
+            );
+        }
+        for state in [
+            AttemptState::PromptPending,
+            AttemptState::AgentReady,
+            AttemptState::Running,
+            AttemptState::Observed,
+            AttemptState::Blocked,
+            AttemptState::InterruptPending,
+        ] {
+            assert!(
+                status_requires_repository_trust(state),
+                "post-launch state unexpectedly permits missing trust: {state:?}"
+            );
+        }
     }
 
     #[test]
