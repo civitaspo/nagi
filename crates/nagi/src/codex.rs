@@ -9,7 +9,7 @@
 //! the official CLI.
 
 use serde::Deserialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -233,28 +233,22 @@ fn validate_managed_config(
         return Err(CodexError::ManagedHomeUnsafe);
     }
 
-    let mut project_paths = BTreeSet::new();
-    let mut trusted_projects = BTreeSet::new();
+    let mut selected_repository_is_trusted = false;
     for (path_text, project) in projects {
-        if !project_paths.insert(path_text.clone()) {
-            return Err(CodexError::ManagedHomeUnsafe);
-        }
         if project.trust_level != "trusted" {
             return Err(CodexError::ManagedHomeUnsafe);
         }
         let path = PathBuf::from(path_text);
         validate_project_trust_path_syntax(&path)?;
-        if expected_repository.is_some() {
-            let canonical = validate_project_trust_path(&path)?;
-            if !trusted_projects.insert(canonical) {
-                return Err(CodexError::ManagedHomeUnsafe);
-            }
+        if expected_repository.is_some_and(|repository| path == repository) {
+            validate_project_trust_path(&path)?;
+            selected_repository_is_trusted = true;
         }
     }
 
     if let Some(repository) = expected_repository {
-        let canonical_repository = validate_project_trust_path(repository)?;
-        if !trusted_projects.contains(&canonical_repository) {
+        validate_project_trust_path(repository)?;
+        if !selected_repository_is_trusted {
             return Err(CodexError::ManagedHomeUnsafe);
         }
     }
@@ -1338,6 +1332,14 @@ trust_level = "untrusted"
 forced_login_method = "chatgpt"
 [projects."/synthetic/project"]
 unknown = "trusted"
+"#
+            .as_slice(),
+            br#"cli_auth_credentials_store = "keyring"
+forced_login_method = "chatgpt"
+[projects."/synthetic/project"]
+trust_level = "trusted"
+[projects."/synthetic/project"]
+trust_level = "trusted"
 "#
             .as_slice(),
             br#"cli_auth_credentials_store = "keyring"

@@ -93,11 +93,12 @@ local-sensitive data and never appear in Nagi output or evidence. Auth-only
 status and logout validate the bounded path syntax without requiring historical
 repositories to remain present. Work reattachment and effect commands
 (`status`, `interrupt`, and `collect`) additionally require a trusted record
-for their exact canonical selected repository; those records and all other
-project entries are then checked as existing owner-safe, non-symlinked
-directories before attaching to a Herdr agent. `work start` validates the
-closed schema and permits the selected record to be absent so Codex can perform
-its first interactive confirmation and append it during that launch.
+for their exact canonical selected repository; only that selected path is then
+checked as an existing owner-safe, non-symlinked directory before attaching to
+a Herdr agent. Unrelated historical project entries remain syntax-checked but
+do not make a selected work repository stale or unsafe. `work start` validates
+the closed schema and permits the selected record to be absent so Codex can
+perform its first interactive confirmation and append it during that launch.
 
 Before each operation, Nagi opens the exact pinned source with `O_NOFOLLOW`,
 checks every source parent for current-user POSIX ownership, owner search
