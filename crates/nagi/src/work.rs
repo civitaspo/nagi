@@ -472,6 +472,12 @@ fn status_with_config<B: AgentBackend>(
     ) {
         return Ok(current);
     }
+    if let Some(config) = config {
+        // A pre-launch recovery may have just delivered the first prompt and
+        // let Codex append its trust record. Do not attach or observe until
+        // that record is now bound to the exact selected repository.
+        codex::validate_managed_codex_home_for_repository(&config.codex_home, &config.repository)?;
+    }
     reconcile_observation(store, backend, current, now_ms, None)
 }
 
@@ -609,7 +615,8 @@ pub fn run_status(config_path: &Path, attempt_id: &str) -> Result<WorkStatus, Wo
             | AttemptState::Blocked
             | AttemptState::InterruptPending
     ) {
-        let mut backend = production_backend(&config, true)?;
+        let mut backend =
+            production_backend(&config, status_requires_repository_trust(current.state()))?;
         status_with_config(
             Some(&config),
             issue.as_ref(),
@@ -717,6 +724,16 @@ fn production_backend(
     ProductionHerdrCodexRunner::connect(process).map_err(WorkError::from)
 }
 
+fn status_requires_repository_trust(state: AttemptState) -> bool {
+    !matches!(
+        state,
+        AttemptState::Created
+            | AttemptState::WorkspacePending
+            | AttemptState::WorkspaceReady
+            | AttemptState::AgentPending
+    )
+}
+
 fn reconcile_start_with<B: AgentBackend>(
     config: Option<&WorkConfig>,
     issue: Option<&IssueInput>,
@@ -802,6 +819,15 @@ fn reconcile_start_with<B: AgentBackend>(
             let Some(issue) = issue else {
                 return Ok(current);
             };
+            if let Some(config) = config {
+                // Agent startup is the point at which Codex can append the
+                // first project-trust record. Once an agent is ready, require
+                // that record before delivering a work prompt.
+                codex::validate_managed_codex_home_for_repository(
+                    &config.codex_home,
+                    &config.repository,
+                )?;
+            }
             let workspace_ref = current
                 .workspace_ref()
                 .ok_or(WorkError::Attempt(AttemptStoreError::Database))?;
@@ -1361,6 +1387,34 @@ mod tests {
             "token": "secret"
         });
         assert!(serde_json::from_value::<WorkConfigFile>(value).is_err());
+    }
+
+    #[test]
+    fn status_repository_trust_gate_allows_only_prelaunch_recovery() {
+        for state in [
+            AttemptState::Created,
+            AttemptState::WorkspacePending,
+            AttemptState::WorkspaceReady,
+            AttemptState::AgentPending,
+        ] {
+            assert!(
+                !status_requires_repository_trust(state),
+                "pre-launch state unexpectedly requires trust: {state:?}"
+            );
+        }
+        for state in [
+            AttemptState::PromptPending,
+            AttemptState::AgentReady,
+            AttemptState::Running,
+            AttemptState::Observed,
+            AttemptState::Blocked,
+            AttemptState::InterruptPending,
+        ] {
+            assert!(
+                status_requires_repository_trust(state),
+                "post-launch state unexpectedly permits missing trust: {state:?}"
+            );
+        }
     }
 
     #[test]

@@ -88,15 +88,16 @@ authentication lines. The parser
 accepts only those required keys and a bounded map of Codex project records;
 every record must contain exactly `trust_level = "trusted"`. Unknown keys or
 sections, duplicate keys, alternate trust values, malformed TOML, non-canonical
-or unsafe paths, symlinks, and oversized files fail closed. Project paths are
-validated as existing owner-safe canonical directories and are local-sensitive
-data; they never appear in Nagi output or evidence. Authentication status
-validates allowed records without requiring a particular repository. Work
-reattachment and effect commands (`status`, `interrupt`, and `collect`)
-additionally require a trusted record for their exact canonical selected
-repository before attaching to a Herdr agent. `work start` validates all
-existing records but permits the selected record to be absent so Codex can
-perform its first interactive confirmation and append it during that launch.
+or unsafe path syntax, and oversized files fail closed. Project paths are
+local-sensitive data and never appear in Nagi output or evidence. Auth-only
+status and logout validate the bounded path syntax without requiring historical
+repositories to remain present. Work reattachment and effect commands
+(`status`, `interrupt`, and `collect`) additionally require a trusted record
+for their exact canonical selected repository; those records and all other
+project entries are then checked as existing owner-safe, non-symlinked
+directories before attaching to a Herdr agent. `work start` validates the
+closed schema and permits the selected record to be absent so Codex can perform
+its first interactive confirmation and append it during that launch.
 
 Before each operation, Nagi opens the exact pinned source with `O_NOFOLLOW`,
 checks every source parent for current-user POSIX ownership, owner search

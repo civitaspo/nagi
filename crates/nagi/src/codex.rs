@@ -215,7 +215,6 @@ fn validate_managed_config(
     if contents.len() as u64 > MAX_MANAGED_CONFIG_BYTES {
         return Err(CodexError::ManagedHomeUnsafe);
     }
-    validate_managed_config_shape(contents)?;
     let text = std::str::from_utf8(contents).map_err(|_| CodexError::ManagedHomeUnsafe)?;
     let document: ManagedConfigDocument =
         toml::from_str(text).map_err(|_| CodexError::ManagedHomeUnsafe)?;
@@ -234,15 +233,22 @@ fn validate_managed_config(
         return Err(CodexError::ManagedHomeUnsafe);
     }
 
+    let mut project_paths = BTreeSet::new();
     let mut trusted_projects = BTreeSet::new();
     for (path_text, project) in projects {
+        if !project_paths.insert(path_text.clone()) {
+            return Err(CodexError::ManagedHomeUnsafe);
+        }
         if project.trust_level != "trusted" {
             return Err(CodexError::ManagedHomeUnsafe);
         }
         let path = PathBuf::from(path_text);
-        let canonical = validate_project_trust_path(&path)?;
-        if !trusted_projects.insert(canonical) {
-            return Err(CodexError::ManagedHomeUnsafe);
+        validate_project_trust_path_syntax(&path)?;
+        if expected_repository.is_some() {
+            let canonical = validate_project_trust_path(&path)?;
+            if !trusted_projects.insert(canonical) {
+                return Err(CodexError::ManagedHomeUnsafe);
+            }
         }
     }
 
@@ -255,66 +261,11 @@ fn validate_managed_config(
     Ok(())
 }
 
-/// Restricts the serialized form to the two Nagi-owned lines followed only by
-/// Codex's project-table records. TOML's data model is intentionally more
-/// expressive than the managed file contract (for example, it also permits
-/// inline tables and dotted keys), so accepting the parsed data alone would
-/// widen the boundary beyond the form Codex emits here.
-fn validate_managed_config_shape(contents: &[u8]) -> Result<(), CodexError> {
-    if !contents.starts_with(MANAGED_CONFIG) {
-        return Err(CodexError::ManagedHomeUnsafe);
-    }
-    let suffix = &contents[MANAGED_CONFIG.len()..];
-    if suffix.is_empty() {
-        return Ok(());
-    }
-    // Codex appends a blank line before the first project table. The base
-    // config already ends in a newline, so the suffix starts with one more.
-    if !suffix.starts_with(b"\n") {
-        return Err(CodexError::ManagedHomeUnsafe);
-    }
-
-    let mut saw_project = false;
-    let mut needs_trust_value = false;
-    for line in suffix.split(|byte| *byte == b'\n') {
-        if line.is_empty() {
-            if needs_trust_value {
-                return Err(CodexError::ManagedHomeUnsafe);
-            }
-            continue;
-        }
-        if line.starts_with(b"[projects.\"") && line.ends_with(b"\"]") {
-            if needs_trust_value {
-                return Err(CodexError::ManagedHomeUnsafe);
-            }
-            saw_project = true;
-            needs_trust_value = true;
-        } else if line == b"trust_level = \"trusted\"" && needs_trust_value {
-            needs_trust_value = false;
-        } else {
-            return Err(CodexError::ManagedHomeUnsafe);
-        }
-    }
-    if !saw_project || needs_trust_value {
-        return Err(CodexError::ManagedHomeUnsafe);
-    }
-    Ok(())
-}
-
 /// Validates one Codex project-trust key as an exact canonical, owner-safe
 /// directory. Trust metadata must never silently follow a symlink or point at
 /// a path whose spelling resolves somewhere else.
 fn validate_project_trust_path(path: &Path) -> Result<PathBuf, CodexError> {
-    let text = path.to_str().ok_or(CodexError::ManagedHomeUnsafe)?;
-    if !path.is_absolute()
-        || text.len() > MAX_PROJECT_TRUST_PATH_BYTES
-        || text.bytes().any(|byte| byte.is_ascii_control())
-        || path
-            .components()
-            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
-    {
-        return Err(CodexError::ManagedHomeUnsafe);
-    }
+    validate_project_trust_path_syntax(path)?;
 
     let mut current = PathBuf::new();
     for component in path.components() {
@@ -356,6 +307,51 @@ fn validate_project_trust_path(path: &Path) -> Result<PathBuf, CodexError> {
         return Err(CodexError::ManagedHomeUnsafe);
     }
     Ok(canonical)
+}
+
+/// Validates the project key without consulting the filesystem. Authentication
+/// status and logout must remain usable when Codex retains a trust record for a
+/// repository that has since moved or been removed; work binding performs the
+/// additional live path and ownership checks below.
+fn validate_project_trust_path_syntax(path: &Path) -> Result<(), CodexError> {
+    let text = path.to_str().ok_or(CodexError::ManagedHomeUnsafe)?;
+    if !path.is_absolute()
+        || text.len() > MAX_PROJECT_TRUST_PATH_BYTES
+        || text.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(CodexError::ManagedHomeUnsafe);
+    }
+
+    let mut normalized = PathBuf::new();
+    let mut saw_root = false;
+    let mut saw_normal = false;
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) if !saw_root && !saw_normal => {
+                normalized.push(prefix.as_os_str());
+            }
+            Component::RootDir if !saw_root => {
+                normalized.push(std::path::MAIN_SEPARATOR.to_string());
+                saw_root = true;
+            }
+            Component::Normal(value) if saw_root || cfg!(windows) => {
+                normalized.push(value);
+                saw_normal = true;
+            }
+            Component::Prefix(_)
+            | Component::RootDir
+            | Component::CurDir
+            | Component::ParentDir => return Err(CodexError::ManagedHomeUnsafe),
+            Component::Normal(_) => return Err(CodexError::ManagedHomeUnsafe),
+        }
+    }
+    if !saw_normal
+        || normalized != path
+        || normalized.to_str().ok_or(CodexError::ManagedHomeUnsafe)? != text
+    {
+        return Err(CodexError::ManagedHomeUnsafe);
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1288,7 +1284,7 @@ mod tests {
     #[test]
     fn managed_config_accepts_only_fixed_auth_and_trusted_project_shape() {
         assert_eq!(validate_managed_config(MANAGED_CONFIG, None), Ok(()));
-        for contents in [
+        for (index, contents) in [
             br#"cli_auth_credentials_store = "file"
 forced_login_method = "chatgpt"
 "#
@@ -1316,6 +1312,24 @@ trust_level = "trusted"
             .as_slice(),
             br#"cli_auth_credentials_store = "keyring"
 forced_login_method = "chatgpt"
+[projects."/synthetic/../repository"]
+trust_level = "trusted"
+"#
+            .as_slice(),
+            br#"cli_auth_credentials_store = "keyring"
+forced_login_method = "chatgpt"
+[projects."/synthetic//repository"]
+trust_level = "trusted"
+"#
+            .as_slice(),
+            br#"cli_auth_credentials_store = "keyring"
+forced_login_method = "chatgpt"
+[projects."/synthetic/repository/"]
+trust_level = "trusted"
+"#
+            .as_slice(),
+            br#"cli_auth_credentials_store = "keyring"
+forced_login_method = "chatgpt"
 [projects."/synthetic/project"]
 trust_level = "untrusted"
 "#
@@ -1331,32 +1345,14 @@ forced_login_method = "chatgpt"
 cli_auth_credentials_store = "keyring"
 "#
             .as_slice(),
-            br#"cli_auth_credentials_store = "keyring"
-forced_login_method = "chatgpt"
-
-projects = { "/synthetic/project" = { trust_level = "trusted" } }
-"#
-            .as_slice(),
-            br#"cli_auth_credentials_store = "keyring"
-forced_login_method = "chatgpt"
-
-[projects]
-"/synthetic/project" = { trust_level = "trusted" }
-"#
-            .as_slice(),
-            br#"cli_auth_credentials_store = "keyring"
-forced_login_method = "chatgpt"
-
-[projects."/synthetic/project"]
-trust_level = "trusted" # not Codex's emitted shape
-"#
-            .as_slice(),
-            br#"forced_login_method = "chatgpt"
-cli_auth_credentials_store = "keyring"
-"#
-            .as_slice(),
-        ] {
-            assert!(validate_managed_config(contents, None).is_err());
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(
+                validate_managed_config(contents, None).is_err(),
+                "unexpectedly accepted invalid fixture {index}"
+            );
         }
 
         let mut oversized = MANAGED_CONFIG.to_vec();
@@ -1365,6 +1361,17 @@ cli_auth_credentials_store = "keyring"
             validate_managed_config(&oversized, None),
             Err(CodexError::ManagedHomeUnsafe)
         );
+    }
+
+    #[test]
+    fn auth_config_validation_accepts_a_stale_project_trust_record() {
+        let contents = br#"cli_auth_credentials_store = "keyring"
+forced_login_method = "chatgpt"
+
+[projects."/synthetic/stale-repository"]
+trust_level = "trusted"
+"#;
+        assert_eq!(validate_managed_config(contents, None), Ok(()));
     }
 
     #[cfg(target_os = "macos")]
@@ -1405,7 +1412,7 @@ cli_auth_credentials_store = "keyring"
             std::str::from_utf8(MANAGED_CONFIG).expect("base config"),
             symlinked.display()
         );
-        assert!(validate_managed_config(symlink_config.as_bytes(), None).is_err());
+        assert!(validate_managed_config(symlink_config.as_bytes(), Some(&symlinked)).is_err());
 
         fs::set_permissions(&repository, fs::Permissions::from_mode(0o702))
             .expect("writable repository mode");
@@ -1414,7 +1421,7 @@ cli_auth_credentials_store = "keyring"
             std::str::from_utf8(MANAGED_CONFIG).expect("base config"),
             repository.display()
         );
-        assert!(validate_managed_config(unsafe_config.as_bytes(), None).is_err());
+        assert!(validate_managed_config(unsafe_config.as_bytes(), Some(&repository)).is_err());
         remove_test_root(&root);
     }
 
@@ -1907,18 +1914,20 @@ cli_auth_credentials_store = "keyring"
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn status_remains_usable_after_codex_appends_allowed_project_trust() {
+    fn auth_status_and_logout_remain_usable_with_stale_project_trust() {
         let root = test_root();
         let managed = prepare_managed_home(&root).expect("managed home");
-        let repository = root.join("repository");
-        fs::create_dir(&repository).expect("repository");
-        let config = format!(
-            "{}\n[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
-            std::str::from_utf8(MANAGED_CONFIG).expect("base config"),
-            repository.display()
-        );
-        fs::write(managed.join(MANAGED_CONFIG_NAME), config).expect("Codex trust update");
-        validate_managed_codex_home(&managed).expect("allowed managed home");
+        fs::write(
+            managed.join(MANAGED_CONFIG_NAME),
+            br#"cli_auth_credentials_store = "keyring"
+forced_login_method = "chatgpt"
+
+[projects."/synthetic/stale-repository"]
+trust_level = "trusted"
+"#,
+        )
+        .expect("stale Codex trust update");
+        validate_managed_codex_home(&managed).expect("stale project does not block auth");
 
         let executable = write_test_executable(
             &root,
@@ -1934,6 +1943,24 @@ cli_auth_credentials_store = "keyring"
         )
         .expect("status command spec");
         assert_eq!(run_status(&spec), Ok(CodexStatus::SignedIn));
+
+        let executable = write_test_executable(
+            &root,
+            "fake-codex-logout-with-stale-project",
+            b"#!/bin/sh\nif [ \"$1\" = logout ]; then exit 0; fi\nif [ \"$1\" = login ] && [ \"$2\" = status ]; then printf '%s\\n' 'Not logged in' >&2; exit 1; fi\nexit 9\n",
+        );
+        let spec = CommandSpec::new(
+            executable,
+            CodexOperation::Logout,
+            &managed,
+            &root,
+            Vec::<(OsString, OsString)>::new(),
+        )
+        .expect("logout command spec");
+        assert_eq!(
+            run_foreground_and_verify(&spec, CodexStatus::SignedOut),
+            Ok(())
+        );
         remove_test_root(&root);
     }
 
