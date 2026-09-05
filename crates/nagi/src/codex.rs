@@ -8,10 +8,14 @@
 //! authorized status call may consult the managed Keychain namespace through
 //! the official CLI.
 
+#[cfg(target_os = "macos")]
 use serde::Deserialize;
+#[cfg(target_os = "macos")]
 use std::collections::BTreeMap;
 use std::fmt;
+#[cfg(target_os = "macos")]
 use std::fs;
+#[cfg(target_os = "macos")]
 use std::path::{Component, Path, PathBuf};
 
 /// The closed set of Codex authentication operations exposed by Nagi.
@@ -179,16 +183,21 @@ const MANAGED_MARKER_NAME: &str = ".nagi-managed-v1";
 const MANAGED_CONFIG_NAME: &str = "config.toml";
 #[cfg(target_os = "macos")]
 const MANAGED_MARKER: &[u8] = b"nagi managed Codex home v1\n";
+#[cfg(target_os = "macos")]
 const MANAGED_CONFIG: &[u8] =
     b"cli_auth_credentials_store = \"keyring\"\nforced_login_method = \"chatgpt\"\n";
+#[cfg(target_os = "macos")]
 const MAX_MANAGED_CONFIG_BYTES: u64 = 64 * 1024;
+#[cfg(target_os = "macos")]
 const MAX_PROJECT_TRUST_ENTRIES: usize = 128;
+#[cfg(target_os = "macos")]
 const MAX_PROJECT_TRUST_PATH_BYTES: usize = 4 * 1024;
 
 /// The only configuration document that Nagi accepts in its managed Codex
 /// home. Codex owns this file after login and may append project trust
 /// metadata, so the parser is deliberately narrower than Codex's complete
 /// configuration schema.
+#[cfg(target_os = "macos")]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ManagedConfigDocument {
@@ -198,6 +207,7 @@ struct ManagedConfigDocument {
     projects: Option<BTreeMap<String, ManagedProjectDocument>>,
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ManagedProjectDocument {
@@ -208,6 +218,7 @@ struct ManagedProjectDocument {
 /// one trusted entry for the exact selected repository. The returned data is
 /// intentionally empty: project paths are local-sensitive and must not leave
 /// this validation boundary.
+#[cfg(target_os = "macos")]
 fn validate_managed_config(
     contents: &[u8],
     expected_repository: Option<&Path>,
@@ -258,6 +269,7 @@ fn validate_managed_config(
 /// Validates one Codex project-trust key as an exact canonical, owner-safe
 /// directory. Trust metadata must never silently follow a symlink or point at
 /// a path whose spelling resolves somewhere else.
+#[cfg(target_os = "macos")]
 fn validate_project_trust_path(path: &Path) -> Result<PathBuf, CodexError> {
     validate_project_trust_path_syntax(path)?;
 
@@ -307,6 +319,7 @@ fn validate_project_trust_path(path: &Path) -> Result<PathBuf, CodexError> {
 /// status and logout must remain usable when Codex retains a trust record for a
 /// repository that has since moved or been removed; work binding performs the
 /// additional live path and ownership checks below.
+#[cfg(target_os = "macos")]
 fn validate_project_trust_path_syntax(path: &Path) -> Result<(), CodexError> {
     let text = path.to_str().ok_or(CodexError::ManagedHomeUnsafe)?;
     if !path.is_absolute()
@@ -316,30 +329,18 @@ fn validate_project_trust_path_syntax(path: &Path) -> Result<(), CodexError> {
         return Err(CodexError::ManagedHomeUnsafe);
     }
 
-    let mut normalized = PathBuf::new();
-    let mut saw_root = false;
-    let mut saw_normal = false;
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) if !saw_root && !saw_normal => {
-                normalized.push(prefix.as_os_str());
-            }
-            Component::RootDir if !saw_root => {
-                normalized.push(std::path::MAIN_SEPARATOR.to_string());
-                saw_root = true;
-            }
-            Component::Normal(value) if saw_root || cfg!(windows) => {
-                normalized.push(value);
-                saw_normal = true;
-            }
-            Component::Prefix(_)
-            | Component::RootDir
-            | Component::CurDir
-            | Component::ParentDir => return Err(CodexError::ManagedHomeUnsafe),
-            Component::Normal(_) => return Err(CodexError::ManagedHomeUnsafe),
-        }
-    }
-    if !saw_normal
+    let normalized =
+        path.components().try_fold(
+            PathBuf::new(),
+            |mut normalized, component| match component {
+                Component::CurDir | Component::ParentDir => Err(CodexError::ManagedHomeUnsafe),
+                Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                    normalized.push(component.as_os_str());
+                    Ok(normalized)
+                }
+            },
+        )?;
+    if normalized == Path::new(std::path::MAIN_SEPARATOR_STR)
         || normalized != path
         || normalized.to_str().ok_or(CodexError::ManagedHomeUnsafe)? != text
     {
@@ -348,7 +349,7 @@ fn validate_project_trust_path_syntax(path: &Path) -> Result<(), CodexError> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(all(target_os = "macos", unix))]
 fn validate_project_trust_ancestor(metadata: &fs::Metadata) -> Result<(), CodexError> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let uid = metadata.uid();
@@ -363,7 +364,7 @@ fn validate_project_trust_ancestor(metadata: &fs::Metadata) -> Result<(), CodexE
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(all(target_os = "macos", not(unix)))]
 fn validate_project_trust_ancestor(_metadata: &fs::Metadata) -> Result<(), CodexError> {
     Ok(())
 }
@@ -1275,6 +1276,7 @@ mod tests {
         assert_eq!(CodexStatus::SignedOut.to_string(), "signed_out");
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn managed_config_accepts_only_fixed_auth_and_trusted_project_shape() {
         assert_eq!(validate_managed_config(MANAGED_CONFIG, None), Ok(()));
@@ -1365,6 +1367,7 @@ cli_auth_credentials_store = "keyring"
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn auth_config_validation_accepts_a_stale_project_trust_record() {
         let contents = br#"cli_auth_credentials_store = "keyring"
