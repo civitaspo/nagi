@@ -127,23 +127,25 @@ pub(crate) fn run(operation: CodexOperation) -> Result<CodexStatus, CodexError> 
 
     #[cfg(target_os = "macos")]
     {
-        let mut progress = ProgressReporter::new(io::stderr(), operation == CodexOperation::Status);
-        progress.report(StatusProgress::ValidatingDeploymentEnvironment);
+        let mut progress = io::stderr();
+        let progress_enabled = operation == CodexOperation::Status;
+        let mut progress_next = 0;
+        report_status_progress(&mut progress, &mut progress_next, progress_enabled);
         let home = deployment_home()?;
 
-        progress.report(StatusProgress::VerifyingPinnedExecutable);
+        report_status_progress(&mut progress, &mut progress_next, progress_enabled);
         let mut source = open_verified_codex_executable(&home)?;
 
-        progress.report(StatusProgress::PreparingManagedHome);
+        report_status_progress(&mut progress, &mut progress_next, progress_enabled);
         let managed_home = prepare_managed_home(&home)?;
         // Re-run the full managed-home gate immediately before invoking the
         // status/login/logout operation. This keeps the parser on the same
         // boundary as the command and accepts Codex's bounded trust metadata.
-        progress.report(StatusProgress::ValidatingManagedHome);
+        report_status_progress(&mut progress, &mut progress_next, progress_enabled);
         validate_managed_codex_home(&managed_home)?;
         let runtime_parent = managed_home.parent().ok_or(CodexError::Configuration)?;
 
-        progress.report(StatusProgress::PreparingPrivateRuntime);
+        report_status_progress(&mut progress, &mut progress_next, progress_enabled);
         let mut executable = PrivateCodexExecutable::from_verified_source(
             &mut source,
             runtime_parent,
@@ -163,12 +165,14 @@ pub(crate) fn run(operation: CodexOperation) -> Result<CodexStatus, CodexError> 
                 .map(|()| CodexStatus::SignedIn),
             CodexOperation::Logout => run_foreground_and_verify(&spec, CodexStatus::SignedOut)
                 .map(|()| CodexStatus::SignedOut),
-            CodexOperation::Status => run_status_with_progress(&spec, &mut progress),
+            CodexOperation::Status => {
+                run_status_with_progress(&spec, &mut progress, &mut progress_next)
+            }
         };
-        progress.report(StatusProgress::CleaningPrivateRuntime);
+        report_status_progress(&mut progress, &mut progress_next, progress_enabled);
         let result = finish_operation(result, executable.cleanup());
         if result.is_ok() {
-            progress.report(StatusProgress::StatusCheckCompleted);
+            report_status_progress(&mut progress, &mut progress_next, progress_enabled);
         }
         result
     }
@@ -385,7 +389,17 @@ const STATUS_OUTPUT_LIMIT: usize = 64 * 1024;
 #[cfg(target_os = "macos")]
 const STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 #[cfg(target_os = "macos")]
-const MAX_STATUS_PROGRESS_LINES: usize = 9;
+const STATUS_PROGRESS_MESSAGES: [&str; 9] = [
+    "nagi auth codex: validating deployment environment\n",
+    "nagi auth codex: verifying pinned Codex executable\n",
+    "nagi auth codex: preparing managed Codex home\n",
+    "nagi auth codex: validating managed Codex home\n",
+    "nagi auth codex: preparing private Codex runtime\n",
+    "nagi auth codex: waiting for Codex authentication status\n",
+    "nagi auth codex: Codex authentication status command completed\n",
+    "nagi auth codex: cleaning private Codex runtime\n",
+    "nagi auth codex: Codex authentication status check complete\n",
+];
 #[cfg(target_os = "macos")]
 const MAX_CODEX_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
 #[cfg(target_os = "macos")]
@@ -429,51 +443,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(target_os = "macos")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum StatusProgress {
-    ValidatingDeploymentEnvironment,
-    VerifyingPinnedExecutable,
-    PreparingManagedHome,
-    ValidatingManagedHome,
-    PreparingPrivateRuntime,
-    WaitingForStatus,
-    StatusCommandCompleted,
-    CleaningPrivateRuntime,
-    StatusCheckCompleted,
-}
-
-#[cfg(target_os = "macos")]
-impl StatusProgress {
-    const fn message(self) -> &'static str {
-        match self {
-            Self::ValidatingDeploymentEnvironment => "validating deployment environment",
-            Self::VerifyingPinnedExecutable => "verifying pinned Codex executable",
-            Self::PreparingManagedHome => "preparing managed Codex home",
-            Self::ValidatingManagedHome => "validating managed Codex home",
-            Self::PreparingPrivateRuntime => "preparing private Codex runtime",
-            Self::WaitingForStatus => "waiting for Codex authentication status",
-            Self::StatusCommandCompleted => "Codex authentication status command completed",
-            Self::CleaningPrivateRuntime => "cleaning private Codex runtime",
-            Self::StatusCheckCompleted => "Codex authentication status check complete",
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-#[cfg(test)]
-const STATUS_PROGRESS_STEPS: [StatusProgress; MAX_STATUS_PROGRESS_LINES] = [
-    StatusProgress::ValidatingDeploymentEnvironment,
-    StatusProgress::VerifyingPinnedExecutable,
-    StatusProgress::PreparingManagedHome,
-    StatusProgress::ValidatingManagedHome,
-    StatusProgress::PreparingPrivateRuntime,
-    StatusProgress::WaitingForStatus,
-    StatusProgress::StatusCommandCompleted,
-    StatusProgress::CleaningPrivateRuntime,
-    StatusProgress::StatusCheckCompleted,
-];
-
-/// Emits a fixed, bounded status trace without exposing local-sensitive data.
+/// Emits one fixed status trace line without exposing local-sensitive data.
 ///
 /// The status command can spend most of its time hashing the pinned executable
 /// and waiting for the official CLI's Keychain lookup. The progress lines make
@@ -481,34 +451,14 @@ const STATUS_PROGRESS_STEPS: [StatusProgress; MAX_STATUS_PROGRESS_LINES] = [
 /// output, and timing details out of stderr. I/O failures are ignored so a
 /// broken diagnostic stream cannot change the authentication result.
 #[cfg(target_os = "macos")]
-struct ProgressReporter<W: Write> {
-    writer: W,
-    enabled: bool,
-    emitted: usize,
-}
-
-#[cfg(target_os = "macos")]
-impl<W: Write> ProgressReporter<W> {
-    fn new(writer: W, enabled: bool) -> Self {
-        Self {
-            writer,
-            enabled,
-            emitted: 0,
-        }
+fn report_status_progress(writer: &mut dyn Write, next: &mut usize, enabled: bool) {
+    if !enabled {
+        return;
     }
-
-    fn report(&mut self, progress: StatusProgress) {
-        if !self.enabled || self.emitted >= MAX_STATUS_PROGRESS_LINES {
-            return;
-        }
-        self.emitted += 1;
-        let _ = writeln!(self.writer, "nagi auth codex: {}", progress.message());
-        let _ = self.writer.flush();
-    }
-
-    #[cfg(test)]
-    fn into_inner(self) -> W {
-        self.writer
+    if let Some(message) = STATUS_PROGRESS_MESSAGES.get(*next) {
+        *next += 1;
+        let _ = writer.write_all(message.as_bytes());
+        let _ = writer.flush();
     }
 }
 
@@ -1318,16 +1268,18 @@ fn run_foreground_and_verify(spec: &CommandSpec, expected: CodexStatus) -> Resul
 
 #[cfg(target_os = "macos")]
 fn run_status(spec: &CommandSpec) -> Result<CodexStatus, CodexError> {
-    let mut progress = ProgressReporter::new(io::sink(), false);
-    run_status_with_progress(spec, &mut progress)
+    let mut progress = io::sink();
+    let mut next = 0;
+    run_status_with_progress(spec, &mut progress, &mut next)
 }
 
 #[cfg(target_os = "macos")]
-fn run_status_with_progress<W: Write>(
+fn run_status_with_progress(
     spec: &CommandSpec,
-    progress: &mut ProgressReporter<W>,
+    progress: &mut dyn Write,
+    next: &mut usize,
 ) -> Result<CodexStatus, CodexError> {
-    progress.report(StatusProgress::WaitingForStatus);
+    report_status_progress(progress, next, true);
     let captured = crate::process_supervisor::run_bounded_capture(
         spec.to_command()?,
         STATUS_TIMEOUT,
@@ -1339,7 +1291,7 @@ fn run_status_with_progress<W: Write>(
         crate::process_supervisor::CaptureError::TimedOut => CodexError::StatusTimedOut,
         crate::process_supervisor::CaptureError::OutputTooLarge => CodexError::StatusOutputTooLarge,
     })?;
-    progress.report(StatusProgress::StatusCommandCompleted);
+    report_status_progress(progress, next, true);
     classify_status(captured.status, &captured.stdout, &captured.stderr)
 }
 
@@ -1386,26 +1338,15 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn status_progress_is_fixed_bounded_and_secret_free() {
-        let mut progress = ProgressReporter::new(Vec::new(), true);
-        for step in STATUS_PROGRESS_STEPS {
-            progress.report(step);
+        let mut output = Vec::new();
+        let mut next = 0;
+        for _ in STATUS_PROGRESS_MESSAGES {
+            report_status_progress(&mut output, &mut next, true);
         }
         // A future call site must not be able to turn a local-sensitive status
         // trace into an unbounded stream.
-        progress.report(StatusProgress::StatusCheckCompleted);
-        let output = progress.into_inner();
-        let expected = concat!(
-            "nagi auth codex: validating deployment environment\n",
-            "nagi auth codex: verifying pinned Codex executable\n",
-            "nagi auth codex: preparing managed Codex home\n",
-            "nagi auth codex: validating managed Codex home\n",
-            "nagi auth codex: preparing private Codex runtime\n",
-            "nagi auth codex: waiting for Codex authentication status\n",
-            "nagi auth codex: Codex authentication status command completed\n",
-            "nagi auth codex: cleaning private Codex runtime\n",
-            "nagi auth codex: Codex authentication status check complete\n",
-        );
-        assert_eq!(output, expected.as_bytes());
+        report_status_progress(&mut output, &mut next, true);
+        assert_eq!(output, STATUS_PROGRESS_MESSAGES.concat().as_bytes());
 
         let output_text = std::str::from_utf8(&output).expect("fixed progress is UTF-8");
         for forbidden in [
@@ -1417,11 +1358,12 @@ mod tests {
             );
         }
 
-        let mut disabled = ProgressReporter::new(Vec::new(), false);
-        for step in STATUS_PROGRESS_STEPS {
-            disabled.report(step);
+        let mut disabled = Vec::new();
+        let mut disabled_next = 0;
+        for _ in STATUS_PROGRESS_MESSAGES {
+            report_status_progress(&mut disabled, &mut disabled_next, false);
         }
-        assert!(disabled.into_inner().is_empty());
+        assert!(disabled.is_empty());
     }
 
     #[cfg(target_os = "macos")]
@@ -2177,19 +2119,15 @@ trust_level = "trusted"
             Vec::<(OsString, OsString)>::new(),
         )
         .expect("status command spec");
-        let mut progress = ProgressReporter::new(Vec::new(), true);
+        let mut progress = Vec::new();
+        // The outer operation reports the five setup stages before invoking
+        // this status-only command.
+        let mut progress_next = 5;
         assert_eq!(
-            run_status_with_progress(&spec, &mut progress),
+            run_status_with_progress(&spec, &mut progress, &mut progress_next),
             Ok(CodexStatus::SignedIn)
         );
-        assert_eq!(
-            progress.into_inner(),
-            concat!(
-                "nagi auth codex: waiting for Codex authentication status\n",
-                "nagi auth codex: Codex authentication status command completed\n",
-            )
-            .as_bytes()
-        );
+        assert_eq!(progress, STATUS_PROGRESS_MESSAGES[5..7].concat().as_bytes());
         remove_test_root(&root);
     }
 
