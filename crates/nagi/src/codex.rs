@@ -442,7 +442,6 @@ use std::process::{Command, ExitStatus, Stdio};
 #[cfg(target_os = "macos")]
 use zeroize::{Zeroize, Zeroizing};
 
-#[cfg(target_os = "macos")]
 /// Emits one fixed status trace line without exposing local-sensitive data.
 ///
 /// The status command can spend most of its time hashing the pinned executable
