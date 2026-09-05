@@ -364,10 +364,6 @@ fn validate_project_trust_ancestor(metadata: &fs::Metadata) -> Result<(), CodexE
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", not(unix)))]
-fn validate_project_trust_ancestor(_metadata: &fs::Metadata) -> Result<(), CodexError> {
-    Ok(())
-}
 #[cfg(target_os = "macos")]
 const SAFE_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 #[cfg(target_os = "macos")]
