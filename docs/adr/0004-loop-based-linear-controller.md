@@ -74,8 +74,9 @@ transition table. A loop names:
   mechanically, and the labels and state that Nagi applies.
 - optionally, the workspace: a shared scratch directory or a Git worktree of
   one configured repository, and whether a rework attempt reuses the previous
-  workspace. Reuse is off by default. Git worktrees are accepted only after it
-  is known how Herdr reports a vendor trust dialog in a new worktree.
+  workspace. Reuse is off by default. Git worktrees are accepted only once
+  Nagi can tell a vendor trust dialog in a new worktree from an agent that is
+  ready for input.
 
 Labels and states are written by name and resolved to IDs at startup, and
 Nagi refuses to start if any loop is invalid. Startup checks that lock labels
@@ -110,20 +111,21 @@ make identical label swaps that the read-back cannot tell apart.
 
 After a crash, each open attempt continues from where it stopped once the
 issue has been read again. An attempt that stopped while its prompt was being
-sent fails as ambiguous rather than risk a second prompt. Until Nagi sends the
-outcome update, any read that finds the lock label absent makes the attempt
-lost: Nagi interrupts the agent once if it is working, leaves the workspace
-for a person, and writes nothing more to Linear.
+sent fails as ambiguous rather than risk a second prompt. Any read that finds
+the lock label absent without the outcome's labels makes the attempt lost:
+Nagi interrupts the agent once if it is working, leaves the workspace for a
+person, and writes nothing more to Linear.
 
 ### Outcomes and reports
 
 The agent writes one JSON report, schema version 2, in an attempt-specific
-directory under its working directory. In a Git worktree, Nagi excludes that
-directory from Git so the agent does not commit it by accident. The report
-holds the attempt ID, a decision naming one outcome, labels chosen from the
-options that the instruction lists, pull request URLs, a bounded summary, or a
-blocked reason. The runtime returns the report's bytes without reading them,
-and one parser validates them. A report is input, not proof.
+directory under its working directory. In a Git worktree, Nagi adds that
+directory to the repository's shared `info/exclude` so the agent does not
+commit it by accident. The report holds the attempt ID, a decision naming one
+outcome, labels chosen from the options that the instruction lists, pull
+request URLs, a bounded summary, or a blocked reason. The runtime returns the
+report's bytes without reading them, and one parser validates them. A report
+is input, not proof.
 
 Nagi checks the chosen outcome's requirements, then sends one `issueUpdate`
 that removes the lock label, adds the outcome's labels, and sets its state. It
@@ -194,8 +196,7 @@ only `addedLabelIds`, `removedLabelIds`, and `stateId`, and `commentCreate`.
 Nagi confirms every write by reading the issue, never by the response, and
 never resends blindly. After a lost response or a crash it reads first. An
 outcome update that did not land while the lock label is still present is
-sent once more, and a second miss fails the attempt; a lock label gone
-without the outcome's labels makes the attempt lost. Each comment carries a
+sent once more, and a second miss fails the attempt. Each comment carries a
 marker with the attempt and step, and Nagi looks for that marker before it
 sends a comment again.
 

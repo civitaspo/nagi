@@ -37,8 +37,8 @@ version created.
 
 ## Consequences
 
-- Nagi no longer checks which Codex executable an agent runs or which account
-  it signs in with.
+- Nagi no longer checks which Codex executable an agent runs or how that
+  executable signs in.
 
 ## Rejected alternatives
 
