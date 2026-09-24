@@ -1,5 +1,9 @@
 # Contract test harness
 
+> [ADR-0004](adr/0004-loop-based-linear-controller.md) retires the Temporal,
+> live-provider, and managed Codex contracts described here. Deletion-only
+> pull requests remove them.
+
 The Phase 0 harness has deliberate layers:
 
 - `mise run test` and `mise run contract:hermetic` run credential-free Rust tests against the committed synthetic fixture and redacted evidence schema. They are suitable for local development and CI.

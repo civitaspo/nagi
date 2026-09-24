@@ -20,21 +20,18 @@ Herdr workspace / pane runtime
 Codex CLI      Claude Code      Cursor Agent CLI
 ```
 
-Nagi owns Linear reads and writes, claims, outcome checks, and attempt state.
-Agents never receive Linear credentials; they write a report file that Nagi
-validates. Herdr owns workspaces, panes, PTYs, and vendor launch. Herdr and
-the vendor CLIs are external operator-installed dependencies, and Nagi does
-not reimplement vendor TUIs or protocols.
+Nagi is the only Linear writer; agents write a report file that Nagi
+validates. Herdr and the vendor CLIs are external operator-installed
+dependencies. See [ADR-0004](docs/adr/0004-loop-based-linear-controller.md)
+for the design.
 
 ## Status
 
-The loop controller in
-[ADR-0004](docs/adr/0004-loop-based-linear-controller.md) is being built.
-Deletion-only pull requests remove the Phase 0 and Phase 1 code first: the
-single-issue `work` commands, the Temporal contracts, and managed Codex
-authentication. A claim store later replaces the attempt store. Until those
-changes land, the old commands remain in the binary but are not the project's
-direction.
+The loop controller is being built. Deletion-only pull requests first remove
+the single-issue `work` commands, hook recovery, the Temporal contracts, and
+managed Codex authentication, and a claim store later replaces the attempt
+store. Until those changes land, the old commands remain in the binary but
+are not the project's direction.
 
 ## Project documentation
 
@@ -45,8 +42,8 @@ direction.
 - [ADR-0002: Managed Codex authentication](docs/adr/0002-managed-codex-authentication.md) (superseded)
 - [ADR-0003: Herdr agent-runtime boundary](docs/adr/0003-herdr-agent-runtime-boundary.md) (partly superseded)
 - [Phase 0 contract spike](docs/phase-zero.md) (historical)
-- [Contract test harness](docs/contract-testing.md)
-- [Linear OAuth boundary](docs/linear-oauth.md)
+- [Contract test harness](docs/contract-testing.md) (Phase 0)
+- [Linear OAuth boundary](docs/linear-oauth.md) (current read-only code)
 - [Securefix](docs/securefix.md)
 
 ## License
