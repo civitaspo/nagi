@@ -29,15 +29,16 @@ Nagi stops managing Codex authentication:
 - When the Herdr adapter moves to the ADR-0004 runtime trait, it stops passing
   `CODEX_HOME` and a Codex executable directory to Herdr.
 
-Operators install and sign in to vendor CLIs themselves. Nagi does not read,
+Operators install vendor CLIs and sign in to them in the environment that
+starts the Herdr server. Nagi does not read,
 copy, or print vendor credentials, does not manage vendor home directories,
 and does not rewrite agent configuration. Nagi does not delete a managed home
 that an earlier version created.
 
 ## Consequences
 
-- Before the first attempt, the operator signs in to each vendor CLI in the
-  environment that starts the Herdr server.
+- Nagi no longer checks which Codex executable an agent runs or which account
+  it signs in with.
 
 ## Rejected alternatives
 

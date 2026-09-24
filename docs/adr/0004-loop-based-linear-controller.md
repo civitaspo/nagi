@@ -64,8 +64,9 @@ transition table. A loop names:
   outcome labels, and completed, canceled, and duplicate states.
 - its lock: the lock label that replaces the loop's entry label, the state set
   when the claim is taken, and a wall-clock timeout that starts at the claim.
-- the agent profile to run, either fixed or taken from the issue's label in a
-  named group, so that a triage loop can choose the profile a later loop runs.
+- the agent profile to run, either fixed or taken from the issue's workspace
+  label, a label in a named group, so that a triage loop can choose the
+  profile a later loop runs.
 - the instruction: a prompt template with a closed set of variables. Issue
   text is untrusted data and is rendered in a single pass.
 - the expected state: a closed set of outcomes. Each outcome has a name, a
@@ -73,7 +74,8 @@ transition table. A loop names:
   mechanically, and the labels and state that Nagi applies.
 - optionally, the workspace: a shared scratch directory or a Git worktree of
   one configured repository, and whether a rework attempt reuses the previous
-  workspace. Reuse is off by default.
+  workspace. Reuse is off by default. Git worktrees are accepted only after it
+  is known how Herdr reports a vendor trust dialog in a new worktree.
 
 Labels and states are written by name and resolved to IDs at startup, and
 Nagi refuses to start if any loop is invalid. Startup checks that lock labels
@@ -117,7 +119,7 @@ for a person, and writes nothing more to Linear.
 
 The agent writes one JSON report, schema version 2, in an attempt-specific
 directory under its working directory. In a Git worktree, Nagi excludes that
-directory from Git so the agent cannot commit it. The report holds the
+directory from Git so the agent does not commit it by accident. The report holds the
 attempt ID, a decision naming one outcome, labels chosen from the options that
 the instruction lists, pull request URLs, a bounded summary, or a blocked
 reason. The runtime returns the report's bytes without reading them, and one
@@ -190,11 +192,12 @@ response must grant exactly that set.
 Nagi sends two fixed mutations: `issueUpdate`, with an input type that has
 only `addedLabelIds`, `removedLabelIds`, and `stateId`, and `commentCreate`.
 Nagi confirms every write by reading the issue, never by the response, and
-never resends blindly. After a lost response or a crash it reads first: a
-claim that did not land makes the attempt lost, and an outcome update that
-did not land is sent once more. Each comment carries a marker with the
-attempt and step, and Nagi looks for that marker before it sends a comment
-again.
+never resends blindly. After a lost response or a crash it reads first. An
+outcome update that did not land while the lock label is still present is
+sent once more, and a second miss fails the attempt; a lock label gone
+without the outcome's labels makes the attempt lost. Each comment carries a
+marker with the attempt and step, and Nagi looks for that marker before it
+sends a comment again.
 
 Nagi gives agents no Linear credential and no Linear access. Agents inherit
 the environment of the operator's Herdr server and the vendor CLIs' own
@@ -210,8 +213,7 @@ report bodies, and Herdr IDs never enter it.
 
 - ADR-0001: decision item 4, which fixes read-only scopes that cannot be
   widened, and the closing paragraph that keeps the adapter read-only until
-  new gates exist. Linear writes are now limited to the two mutations above,
-  under the fixed `read,write` scope.
+  new gates exist. Linear writes are now limited to the two mutations above.
 - ADR-0003:
   - the Temporal direction and the statement that it is unchanged;
   - retry, GitHub PR and CI state, and the durable attempt state as that ADR
@@ -239,8 +241,6 @@ report bodies, and Herdr IDs never enter it.
 - Status remains a guess. An approval prompt that looks idle is caught only by
   the timeout, and a vendor trust dialog that looks idle could receive a
   prompt. The operator trusts the scratch directory in each vendor CLI once.
-  Repository checkouts are enabled only after it is known how Herdr reports
-  a vendor trust dialog in a new worktree.
 
 ## Rejected alternatives
 
