@@ -112,16 +112,17 @@ make identical label swaps that the read-back cannot tell apart.
 After a crash, each open attempt continues from where it stopped once the
 issue has been read again. An attempt that stopped while its prompt was being
 sent fails as ambiguous rather than risk a second prompt. Any read that finds
-the lock label absent without the outcome's labels makes the attempt lost:
-Nagi interrupts the agent once if it is working, leaves the workspace for a
-person, and writes nothing more to Linear.
+the lock label absent makes the attempt lost, unless Nagi has sent the outcome
+update and the issue shows that outcome's labels and state. For a lost
+attempt, Nagi interrupts the agent once if it is working, leaves the
+workspace for a person, and writes nothing more to Linear.
 
 ### Outcomes and reports
 
 The agent writes one JSON report, schema version 2, in an attempt-specific
-directory under its working directory. In a Git worktree, Nagi adds that
-directory to the repository's shared `info/exclude` so the agent does not
-commit it by accident. The report holds the attempt ID, a decision naming one
+directory under its working directory. In a Git worktree, Nagi adds one fixed
+pattern for these directories to the repository's shared `info/exclude`, so
+the agent does not commit a report by accident. The report holds the attempt ID, a decision naming one
 outcome, labels chosen from the options that the instruction lists, pull
 request URLs, a bounded summary, or a blocked reason. The runtime returns the
 report's bytes without reading them, and one parser validates them. A report
