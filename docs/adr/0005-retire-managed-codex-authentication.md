@@ -15,12 +15,9 @@ corrective ADR to change or remove it. This is that ADR.
 
 Under [ADR-0004](0004-loop-based-linear-controller.md), the operator runs the
 Herdr server in their own home directory, and every agent inherits that
-server's environment and the vendor CLI's own sign-in. Nagi could still hand
-Codex a managed home by passing `CODEX_HOME` to `herdr workspace create
---env`. That would help only Codex, since the loop controller also runs
-Claude Code and Cursor Agent CLI, and it would keep Nagi responsible for a
-vendor home, its sign-in, and its project trust records. The operator's own
-sign-in is enough for a single-operator host.
+server's environment and the vendor CLI's own sign-in. The loop controller
+also runs Claude Code and Cursor Agent CLI, which have no counterpart to this
+boundary. The operator's own sign-in is enough for a single-operator host.
 
 ## Decision
 
@@ -39,14 +36,13 @@ that an earlier version created.
 
 ## Consequences
 
-- One pinned vendor executable, one provenance record, and one opt-in
-  contract go away.
-- A Codex trust prompt in a new working directory appears in the Herdr pane
-  for the operator to approve.
+- Before the first attempt, the operator signs in to each vendor CLI in the
+  environment that starts the Herdr server.
 
 ## Rejected alternatives
 
 - **Keep the dormant boundary:** it keeps a pinned executable, provenance, and
   a contract that no code path uses.
-- **Pass a managed `CODEX_HOME` per workspace:** it covers one vendor out of
-  three and keeps Nagi in charge of that vendor's sign-in and trust records.
+- **Pass a managed `CODEX_HOME` per workspace through `herdr workspace create
+  --env`:** it covers one vendor out of three and keeps Nagi in charge of that
+  vendor's sign-in and trust records.

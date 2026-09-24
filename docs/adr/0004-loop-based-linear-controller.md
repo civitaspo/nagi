@@ -97,8 +97,7 @@ Without compare-and-swap, a claim has three layers:
 The read after the update has three results. If the lock label is present,
 the entry label is gone, and the state matches, the claim holds. If the lock
 label is present but something else differs, Nagi treats the write as its own
-and fails the attempt. If the lock label is absent, the attempt is lost and
-Nagi writes nothing more.
+and fails the attempt. If the lock label is absent, the attempt is lost.
 
 This detects lost updates after the fact and survives crashes. It does not
 exclude another writer atomically in the moment around the update, and it
@@ -107,37 +106,37 @@ labels, and people only remove them or restore the entry label. Run one Nagi
 instance per Linear team. Two instances with separate state directories would
 make identical label swaps that the read-back cannot tell apart.
 
-Nagi never resends an `issueUpdate` whose response was lost; it reads the
-issue to learn what happened. After a crash, each open attempt continues from
-where it stopped once the issue has been read again. An attempt that stopped
-while its prompt was being sent fails as ambiguous rather than risk a second
-prompt. If the lock label disappears while an attempt runs, the attempt is
-lost and Nagi leaves the issue alone.
+After a crash, each open attempt continues from where it stopped once the
+issue has been read again. An attempt that stopped while its prompt was being
+sent fails as ambiguous rather than risk a second prompt. Until Nagi sends the
+outcome update, any read that finds the lock label absent makes the attempt
+lost: Nagi interrupts the agent once if it is working, leaves the workspace
+for a person, and writes nothing more to Linear.
 
 ### Outcomes and reports
 
 The agent writes one JSON report, schema version 2, in an attempt-specific
-directory under its working directory. The report holds the attempt ID, a
-decision naming one outcome, labels chosen from the options that the
-instruction lists, pull request URLs, a bounded summary, or a blocked reason.
-The runtime returns the report's bytes without reading them, and one parser
-validates them. A report is input, not proof.
+directory under its working directory. In a Git worktree, Nagi excludes that
+directory from Git so the agent cannot commit it. The report holds the
+attempt ID, a decision naming one outcome, labels chosen from the options that
+the instruction lists, pull request URLs, a bounded summary, or a blocked
+reason. The runtime returns the report's bytes without reading them, and one
+parser validates them. A report is input, not proof.
 
 Nagi checks the chosen outcome's requirements, then sends one `issueUpdate`
 that removes the lock label, adds the outcome's labels, and sets its state. It
 confirms the result by reading the issue, writes a handoff comment, and marks
-the attempt done. After a crash, that read also tells Nagi whether the update
-still needs to be sent. The agent chooses by outcome name and listed option;
-Nagi maps those to label and state IDs. Nagi never writes a completed state,
-an issue title, or an issue description.
+the attempt done. The agent chooses by outcome name and listed option; Nagi
+maps those to label and state IDs. Nagi never writes a completed state, an
+issue title, or an issue description.
 
 ### Failures
 
-There is no automatic retry. Every failure other than the transient ones
-below adds a configured attention label outside every loop's label group and
-writes a failure comment; the lock label stays if it is still there. Loops
-cannot change this handling. A person starts a new attempt by removing the
-attention label and returning the issue to the entry label.
+There is no automatic retry. Every attempt failure other than the transient
+and fatal cases below adds a configured attention label outside every loop's
+label group and writes a failure comment; the lock label stays if it is still
+there. Loops cannot change this handling. A person starts a new attempt by
+removing the attention label and returning the issue to the entry label.
 
 Transient errors end the tick without using up the attempt: Linear rate
 limits, an absent Herdr socket, and errors before a request is sent. A Herdr
@@ -162,12 +161,13 @@ stop         close the workspace after a done attempt without reuse
 Herdr is the only runtime for now, with a fake for tests.
 
 - Each attempt has a key derived from the loop and the issue, plus the
-  attempt when the loop does not reuse workspaces. Herdr workspace labels and
-  agent names derive from the key, so Nagi stores no Herdr IDs, finds its
-  workspaces again after a restart, and finds the previous workspace on
-  rework.
-- Nagi sends a prompt only when Herdr reports the agent as idle, and sends it
-  through the socket, so a prompt never appears in a command-line argument.
+  attempt when the loop does not reuse workspaces. The names Nagi gives its
+  Herdr workspaces and agents derive from the key, so Nagi stores no Herdr IDs,
+  finds its workspaces again after a restart, and finds the previous workspace
+  on rework.
+- Nagi sends a prompt only when Herdr reports the agent ready for input
+  (`idle` or `done`), and sends it through the socket, so a prompt never
+  appears in a command-line argument.
 - An agent profile's vendor name is a string that Nagi checks against Herdr's
   echo of it, not a closed enum.
 - Herdr runs in the operator's home directory under a named session that the
@@ -184,10 +184,17 @@ sub-issues and moves the parent.
 
 The OAuth boundary keeps `actor=app`, PKCE S256, no client secret, and no PAT
 or user-actor fallback. The requested scope widens from `read` to
-`read,write`. Nagi sends two fixed mutations: `issueUpdate`, with an input
-type that has only `addedLabelIds`, `removedLabelIds`, and `stateId`, and
-`commentCreate`. Nagi confirms every write by reading the issue, not by the
-response.
+`read,write`. The scope is fixed rather than configurable, and the token
+response must grant exactly that set.
+
+Nagi sends two fixed mutations: `issueUpdate`, with an input type that has
+only `addedLabelIds`, `removedLabelIds`, and `stateId`, and `commentCreate`.
+Nagi confirms every write by reading the issue, never by the response, and
+never resends blindly. After a lost response or a crash it reads first: a
+claim that did not land makes the attempt lost, and an outcome update that
+did not land is sent once more. Each comment carries a marker with the
+attempt and step, and Nagi looks for that marker before it sends a comment
+again.
 
 Nagi gives agents no Linear credential and no Linear access. Agents inherit
 the environment of the operator's Herdr server and the vendor CLIs' own
@@ -203,7 +210,8 @@ report bodies, and Herdr IDs never enter it.
 
 - ADR-0001: decision item 4, which fixes read-only scopes that cannot be
   widened, and the closing paragraph that keeps the adapter read-only until
-  new gates exist. Linear writes are now limited to the two mutations above.
+  new gates exist. Linear writes are now limited to the two mutations above,
+  under the fixed `read,write` scope.
 - ADR-0003:
   - the Temporal direction and the statement that it is unchanged;
   - retry, GitHub PR and CI state, and the durable attempt state as that ADR
@@ -215,9 +223,6 @@ report bodies, and Herdr IDs never enter it.
   - the unpinned Herdr version and the isolated home;
   - the Codex App Server note and the P0-12 preservation clause;
   - the statement that `scope=read` remains.
-
-  [ADR-0005](0005-retire-managed-codex-authentication.md) replaces its P0-11
-  paragraph.
 - The Phase 0 gate table in `docs/phase-zero.md` becomes historical.
 
 ## Consequences
@@ -231,15 +236,11 @@ report bodies, and Herdr IDs never enter it.
 - Nagi needs write access to Linear, and operators must log in again after
   the scope change.
 - Ticks run only while the operator's Mac and Herdr server are running.
-- A claim is only as strong as the convention that nothing else adds lock
-  labels. Running another automation on the same issues breaks it.
-- The single-writer rule depends on the operator keeping Linear access out of
-  the agents' environment.
 - Status remains a guess. An approval prompt that looks idle is caught only by
   the timeout, and a vendor trust dialog that looks idle could receive a
-  prompt. The operator trusts the scratch directory once; Git worktrees rely
-  on Herdr's repository trust option, which is checked when repository
-  checkouts are added.
+  prompt. The operator trusts the scratch directory in each vendor CLI once.
+  Repository checkouts are enabled only after it is known how Herdr reports
+  a vendor trust dialog in a new worktree.
 
 ## Rejected alternatives
 

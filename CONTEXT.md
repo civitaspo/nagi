@@ -87,7 +87,3 @@ _Avoid_: environment, sandbox, target
 **Workspace label**:
 A label in the group a loop reads its agent profile from. Each label's name is an agent profile name.
 _Avoid_: environment label, routing label, runtime label
-
-**Sub-issue**:
-A Linear sub-issue that carries one workspace's share of a larger issue. Every loop treats it as an ordinary issue.
-_Avoid_: subtask, split, fan-out
