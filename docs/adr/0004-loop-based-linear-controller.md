@@ -122,11 +122,11 @@ workspace for a person, and writes nothing more to Linear.
 The agent writes one JSON report, schema version 2, in an attempt-specific
 directory under its working directory. In a Git worktree, Nagi adds one fixed
 pattern for these directories to the repository's shared `info/exclude`, so
-the agent does not commit a report by accident. The report holds the attempt ID, a decision naming one
-outcome, labels chosen from the options that the instruction lists, pull
-request URLs, a bounded summary, or a blocked reason. The runtime returns the
-report's bytes without reading them, and one parser validates them. A report
-is input, not proof.
+the agent does not commit a report by accident. The report holds the attempt
+ID, a decision naming one outcome, labels chosen from the options that the
+instruction lists, pull request URLs, a bounded summary, or a blocked reason.
+The runtime returns the report's bytes without reading them, and one parser
+validates them. A report is input, not proof.
 
 Nagi checks the chosen outcome's requirements, then sends one `issueUpdate`
 that removes the lock label, adds the outcome's labels, and sets its state. It
