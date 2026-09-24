@@ -1,5 +1,10 @@
 # Phase 0: Contract Spike
 
+> **Historical.** [ADR-0004](adr/0004-loop-based-linear-controller.md)
+> supersedes this plan. It records the Phase 0 contract spike as it was
+> planned. The Temporal, `work` command, and managed Codex parts are being
+> removed, and the gate table and evidence schema no longer gate new work.
+
 Phase 0 is a time-boxed contract spike. It validates the external and
 security-sensitive contracts needed by Nagi before implementation begins. It
 is not a partial production deployment. The authoritative agent-runtime

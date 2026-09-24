@@ -2,39 +2,45 @@
 
 ## Project scope
 
-Nagi is a local-first work execution system for Linear, Codex CLI, and Cursor
-Agent CLI. The repository is currently in its foundation phase; implementation
-changes belong in focused pull requests.
+Nagi is a local-first loop controller that takes Linear issues, runs AI coding
+agents on them in Herdr, and writes the results back to Linear. The design is
+[ADR-0004](docs/adr/0004-loop-based-linear-controller.md) and the vocabulary is
+[CONTEXT.md](CONTEXT.md). Implementation changes belong in focused pull
+requests.
 
 ## Agent runtime boundary
 
-- The authoritative architecture is Linear ↔ standalone Nagi controller,
-  SQLite, and Temporal ↔ Herdr CLI or Unix socket API ↔ Herdr workspace, pane,
-  and session runtime ↔ Codex CLI or Cursor Agent CLI. See
+- The authoritative architecture is Linear ↔ standalone Nagi loop controller
+  and SQLite claims ↔ Herdr CLI and Unix socket ↔ Herdr workspace and pane ↔
+  Codex CLI, Claude Code, or Cursor Agent CLI. See
+  [ADR-0004](docs/adr/0004-loop-based-linear-controller.md), which supersedes
+  the Temporal, hooks, and eight-operation parts of
   [ADR-0003](docs/adr/0003-herdr-agent-runtime-boundary.md).
-- Nagi owns Linear state, claims, retry, reconciliation, acceptance and result
-  validation, GitHub PR/CI state, and durable attempt state. Herdr owns
-  workspaces, panes, PTYs, vendor launch, session restore, and operator
-  interaction. Nagi must not reimplement vendor TUIs or protocols.
-- The backend boundary is `workspace_create`, `agent_start`, `prompt`,
-  `observe`, `interrupt`, `resume`, `collect_report`, and `stop`. Implement
-  `herdr+codex` first, then `herdr+cursor-agent`; Cursor means Cursor Agent
-  CLI, never the desktop application.
-- Treat Herdr lifecycle as observation only. Use the CLI for ordinary
-  orchestration and the socket API for snapshots, subscriptions, and long-lived
-  tracking. `idle`, `done`, and `blocked` never directly imply Linear `Done`.
-- Hooks may report session start/restore/exit, supported semantic lifecycle,
-  stable session references, and validated reports. They must not own
-  credentials, scheduling, claims, retries, acceptance, completion decisions,
-  or durable controller state. Validate source IDs, monotonic sequences, TTLs,
-  attempt IDs, duplicate/out-of-order events, and unknown states. Installation
-  must be explicit and reversible; never silently rewrite agent configuration.
-- Herdr and vendor CLIs are external operator-installed runtime dependencies,
-  not bundled helpers. Keep the production artifact as one standalone Nagi
-  executable and do not pin a Herdr version before its contract PR.
-- Codex App Server is an optional future high-fidelity backend, not a mandatory
-  Phase 0 gate. Preserve the unmerged P0-12 work, but do not merge or resume
-  it as Phase 0 or run its old provider contract.
+- Nagi owns Linear reads and writes, claims, reconciliation, outcome checks,
+  and attempt state. Herdr owns workspaces, panes, PTYs, and vendor launch.
+  Nagi must not reimplement vendor TUIs or protocols.
+- Nagi is the only Linear writer. Agents never receive a Linear token, MCP
+  server, or GraphQL access; they write a report file that one Nagi parser
+  validates. Nagi never writes a completed state, an issue title, or an issue
+  description.
+- The runtime boundary is `begin_tick`, `start`, `prompt`, `observe`,
+  `interrupt`, and `stop`. Herdr is the only runtime for now; adding a cloud
+  runtime, a secret source, or another multiplexer needs a new decision.
+  Cursor means Cursor Agent CLI, never the desktop application.
+- Treat Herdr lifecycle as observation only. `idle`, `done`, and `blocked`
+  never imply Linear `Done`.
+- Do not retry automatically. A failed attempt keeps its lock label, gains the
+  attention label, and gets a failure comment.
+- Never silently rewrite agent configuration. Herdr and vendor CLIs are
+  external operator-installed runtime dependencies, not bundled helpers; keep
+  the production artifact as one standalone Nagi executable.
+- Until their pull requests land, some sections below still describe the old
+  design. The Temporal, `work` command, hook recovery, and managed Codex
+  paragraphs describe code that deletion-only pull requests remove; do not
+  extend them, and remove each paragraph with its code. The
+  Linear OAuth paragraphs keep `scope=read` until the Linear write change
+  widens it to `read,write`. The Herdr contract paragraph keeps its `0.8.2`
+  pin and isolated `HOME` until the Herdr pin update.
 
 ## Contribution rules
 

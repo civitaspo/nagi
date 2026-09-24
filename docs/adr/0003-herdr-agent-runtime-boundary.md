@@ -1,6 +1,7 @@
 # ADR-0003: Use Herdr as the Agent Runtime Boundary
 
-- Status: Accepted for Phase 0 architecture
+- Status: Accepted for Phase 0 architecture; partly superseded by
+  [ADR-0004](0004-loop-based-linear-controller.md)
 - Scope: Agent workspaces, sessions, lifecycle observation, and backend adapters
 
 ## Context
