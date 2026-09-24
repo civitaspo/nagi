@@ -30,10 +30,10 @@ Nagi stops managing Codex authentication:
   `CODEX_HOME` and a Codex executable directory to Herdr.
 
 Operators install vendor CLIs and sign in to them in the environment that
-starts the Herdr server. Nagi does not read,
-copy, or print vendor credentials, does not manage vendor home directories,
-and does not rewrite agent configuration. Nagi does not delete a managed home
-that an earlier version created.
+starts the Herdr server. Nagi does not read, copy, or print vendor
+credentials, does not manage vendor home directories, and does not rewrite
+agent configuration. Nagi does not delete a managed home that an earlier
+version created.
 
 ## Consequences
 
