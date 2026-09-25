@@ -1,6 +1,6 @@
 # ADR-0002: Delegate Codex Authentication Through an Isolated Managed Home
 
-- Status: Accepted implementation; conditional/dormant under ADR-0003
+- Status: Superseded by [ADR-0005](0005-retire-managed-codex-authentication.md)
 - Scope: Managed Codex CLI authentication
 
 ## Context

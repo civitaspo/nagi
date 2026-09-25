@@ -2,75 +2,48 @@
 
 [![CI](https://github.com/civitaspo/nagi/actions/workflows/pull_request.yml/badge.svg)](https://github.com/civitaspo/nagi/actions/workflows/pull_request.yml)
 
-Nagi is a local-first work execution system for Linear, Codex CLI, and
-Cursor Agent CLI.
+Nagi is a local-first controller that turns Linear issues into work for AI
+coding agents running in Herdr, and writes the results back to Linear.
 
-Nagi is designed for a single operator on a local macOS host. It polls Linear,
-stores controller state in SQLite, coordinates durable work with Temporal, and
-delegates workspace and agent sessions to the external Herdr runtime.
-
-The runtime boundary is:
-
-```text
-Linear
-  ↕
-standalone Nagi controller / SQLite / Temporal
-  ↕ Herdr CLI or Unix socket API
-Herdr workspace / pane / session runtime
-  ↙                         ↘
-Codex CLI             Cursor Agent CLI
-```
-
-Nagi owns Linear state, claims, retry, reconciliation, acceptance and result
-validation, GitHub PR/CI state, and durable attempt state. Herdr owns
-workspaces, panes, PTYs, vendor launch, session restore, and operator
-interaction. Herdr and the vendor CLIs are external operator-installed
-dependencies; they are not bundled helpers, and Nagi does not reimplement
-vendor TUIs or protocols. Codex App Server is an optional future high-fidelity
-backend, not a Phase 0 gate.
-
-## Single-issue work
-
-On macOS, the first usable work slice accepts one owner-only JSON configuration
-and one exact Linear issue UUID:
+Nagi runs on a single operator's macOS host. On each tick it fetches the
+issues that each configured loop may take, claims them by swapping a label,
+starts the loop's agent in a Herdr pane, and applies the labels, state, and
+comment for the outcome that the agent reports.
 
 ```text
-nagi work start --config CONFIG
-nagi work status --config CONFIG --attempt ATTEMPT
-nagi work list --config CONFIG [--after ATTEMPT]
-nagi work resolve --config CONFIG --attempt ATTEMPT --confirm-absent
-nagi work resolve --config CONFIG --attempt ATTEMPT --confirm-delivered
-nagi work interrupt --config CONFIG --attempt ATTEMPT
-nagi work collect --config CONFIG --attempt ATTEMPT --report REPORT
+Linear (labels, states, comments)
+  ↕ GraphQL, actor=app                        Nagi is the only writer
+standalone Nagi loop controller / SQLite claims
+  ↕ Herdr CLI and Unix socket
+Herdr workspace / pane runtime
+  ↙               ↓               ↘
+Codex CLI      Claude Code      Cursor Agent CLI
 ```
 
-The configuration supplies all local paths explicitly, including the canonical
-Git worktree, Herdr private runtime, attempt database, verified Codex CLI
-directory, and managed `CODEX_HOME`. Nagi reads one issue in memory, delegates
-workspace and vendor process ownership to Herdr, and prints only bounded status
-or report metadata. Herdr lifecycle is observational; no command changes
-Linear state or installs hooks/configuration.
+Nagi is the only Linear writer; agents write a report file that Nagi
+validates. Herdr and the vendor CLIs are external operator-installed
+dependencies. See [ADR-0004](docs/adr/0004-loop-based-linear-controller.md)
+for the design.
 
-`work list` is keyset-paginated and prints only bounded local attempt metadata.
-For `work list` and `work resolve`, the recovery configuration may contain only
-the `attempt_db` locator; other known full-runtime fields are ignored, while
-unknown names still fail closed.
-Work commands serialize through a nonblocking lock on the owner-only state
-directory containing the validated SQLite database; no adjacent lock file is
-created. This coordinates Nagi processes using the same validated database
-identity, while a same-UID path replacement after validation remains a
-documented residual risk. If a workspace, agent, or prompt effect is
-ambiguous, `work status` never retries it when a snapshot is absent; use the
-explicit `work resolve` confirmation before the next newly authorized effect.
+## Status
+
+The loop controller is being built. Deletion-only pull requests first remove
+the single-issue `work` commands, hook recovery, the Temporal contracts, and
+managed Codex authentication, and a claim store later replaces the attempt
+store. Until those changes land, the old commands remain in the binary but
+are not the project's direction.
 
 ## Project documentation
 
-- [Phase 0 contract spike](docs/phase-zero.md)
-- [Contract test harness](docs/contract-testing.md)
+- [Glossary](CONTEXT.md)
+- [ADR-0004: Loop-based Linear controller on Herdr](docs/adr/0004-loop-based-linear-controller.md)
+- [ADR-0005: Retire managed Codex authentication](docs/adr/0005-retire-managed-codex-authentication.md)
 - [ADR-0001: Private Linear OAuth app with PKCE](docs/adr/0001-linear-oauth-pkce.md)
-- [ADR-0002: Managed Codex authentication](docs/adr/0002-managed-codex-authentication.md)
-- [ADR-0003: Herdr agent-runtime boundary](docs/adr/0003-herdr-agent-runtime-boundary.md)
-- [Linear OAuth boundary](docs/linear-oauth.md)
+- [ADR-0002: Managed Codex authentication](docs/adr/0002-managed-codex-authentication.md) (superseded)
+- [ADR-0003: Herdr agent-runtime boundary](docs/adr/0003-herdr-agent-runtime-boundary.md) (partly superseded)
+- [Phase 0 contract spike](docs/phase-zero.md) (historical)
+- [Contract test harness](docs/contract-testing.md) (Phase 0)
+- [Linear OAuth boundary](docs/linear-oauth.md) (current read-only code)
 - [Securefix](docs/securefix.md)
 
 ## License

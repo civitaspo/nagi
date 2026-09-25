@@ -1,5 +1,9 @@
 # Linear OAuth boundary
 
+> This page describes the current read-only implementation.
+> [ADR-0004](adr/0004-loop-based-linear-controller.md) widens the scope to
+> `read,write`; this page changes with that pull request.
+
 The P0-03 implementation centers on the library operation
 `nagi::linear::oauth::authorize_production`. It prepares a Linear
 authorization-code request, waits for one local callback, performs one token

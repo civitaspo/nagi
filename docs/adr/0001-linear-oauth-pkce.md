@@ -1,6 +1,6 @@
 # ADR-0001: Use a Private Linear OAuth App with PKCE
 
-- Status: Accepted for Phase 0
+- Status: Accepted for Phase 0; decision item 4 and the read-only paragraph are superseded by [ADR-0004](0004-loop-based-linear-controller.md)
 - Scope: Linear authentication and actor identity
 
 ## Context
